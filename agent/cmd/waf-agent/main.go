@@ -20,7 +20,6 @@ import (
 	"github.com/exemt/placitum-node/agent/internal/audit"
 	"github.com/exemt/placitum-node/agent/internal/conf"
 	"github.com/exemt/placitum-node/agent/internal/desired"
-	"github.com/exemt/placitum-node/agent/internal/flow"
 	"github.com/exemt/placitum-node/agent/internal/handoff"
 	"github.com/exemt/placitum-node/agent/internal/id"
 	"github.com/exemt/placitum-node/agent/internal/nginxlog"
@@ -28,6 +27,7 @@ import (
 	"github.com/exemt/placitum-node/agent/internal/pulse"
 	"github.com/exemt/placitum-node/agent/internal/retain"
 	"github.com/exemt/placitum-node/agent/internal/rps"
+	"github.com/exemt/placitum-shared/flow"
 	"github.com/exemt/placitum-shared/logkit"
 	"github.com/exemt/placitum-shared/loglevel"
 )

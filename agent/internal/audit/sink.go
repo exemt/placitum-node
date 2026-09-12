@@ -28,7 +28,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/exemt/placitum-node/agent/internal/flow"
+	"github.com/exemt/placitum-shared/flow"
 )
 
 // KindBatch -- вид сообщения-пачки. Соседствует с Kind по потоку и субъекту:

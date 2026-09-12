@@ -7,9 +7,9 @@ import (
 
 	"github.com/nats-io/nats.go"
 
-	"github.com/exemt/placitum-node/agent/internal/flow"
-	"github.com/exemt/placitum-node/agent/internal/host"
 	"github.com/exemt/placitum-node/agent/internal/rps"
+	"github.com/exemt/placitum-shared/flow"
+	"github.com/exemt/placitum-shared/host"
 )
 
 // AgentConf — какую настройку агента нода применила: ревизия, её хеш и исход.
@@ -80,7 +80,7 @@ func Build(
 		Kind:     "agent",
 		ID:       agentID,
 		NodeID:   nodeID,
-		Hostname: snap.Hostname,
+		Hostname: host.Hostname(),
 		At:       time.Now().UTC().Format(time.RFC3339Nano),
 		RPS:      rate,
 		Codes:    status,

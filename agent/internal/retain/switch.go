@@ -22,7 +22,7 @@ import (
 	"sync/atomic"
 
 	"github.com/exemt/placitum-node/agent/internal/audit"
-	"github.com/exemt/placitum-node/agent/internal/flow"
+	"github.com/exemt/placitum-shared/flow"
 )
 
 type Switch struct {
