@@ -1,0 +1,263 @@
+{
+  "uid": "waf-load",
+  "title": "WAF: нагрузочный стенд",
+  "tags": ["waf", "load"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "run",
+        "label": "Прогон",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(k6_http_reqs_total, run_id)",
+        "refresh": 2,
+        "includeAll": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Генератор",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Интенсивность по ветвям",
+      "description": "Заданная интенсивность против фактической. Расхождение означает, что генератор не успевает, и остальные числа прогона недействительны.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (branch) (rate(k6_http_reqs_total{run_id=~\"$run\"}[30s]))",
+          "legendFormat": "{{branch}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(k6_dropped_iterations_total{run_id=~\"$run\"}[30s]))",
+          "legendFormat": "пропущено итераций"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "p99 запроса: waf on против waf off",
+      "description": "Только флавор normal: ветви со специально заданной паузой инспектора сюда не входят, иначе измерялась бы заданная нами пауза. Разница между линиями и есть добавленная задержка.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "fillOpacity": 0 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (branch) (k6_http_req_duration_p99{run_id=~\"$run\", flavor=\"normal\", phase=\"measure\"})",
+          "legendFormat": "p99 {{branch}}"
+        },
+        {
+          "refId": "B",
+          "expr": "max by (branch) (k6_http_req_duration_p50{run_id=~\"$run\", flavor=\"normal\", phase=\"measure\"})",
+          "legendFormat": "p50 {{branch}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Коды ответов по флаворам",
+      "description": "Каждый флавор обязан давать заранее известный код. Расхождение считает счётчик unexpected_status.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (flavor) (rate(k6_http_reqs_total{run_id=~\"$run\"}[30s]))",
+          "legendFormat": "{{flavor}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(k6_unexpected_status_total{run_id=~\"$run\"}[30s]))",
+          "legendFormat": "неожидаемых"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Латентность инспектора из X-WAF-Debug",
+      "description": "Время ожидания вердикта, измеренное самим модулем. Собирается только с маршрута /debug/, куда идут единицы процентов трафика.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(k6_waf_inspector_ms_p99{run_id=~\"$run\"})",
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "B",
+          "expr": "max(k6_waf_inspector_ms_p50{run_id=~\"$run\"})",
+          "legendFormat": "p50"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Балансировщик и узлы",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Сессии по узлам",
+      "description": "Расхождение между узлами означает, что балансировка неравномерна и средние по стенду ничего не значат.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "haproxy_server_current_sessions{proxy=\"be_edges\"}",
+          "legendFormat": "{{server}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Очередь и отказы балансировщика",
+      "description": "Ненулевая очередь означает, что узлы упёрлись в maxconn: дальше растёт задержка, а не пропускная способность.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "haproxy_backend_current_queue{proxy=\"be_edges\"}",
+          "legendFormat": "очередь"
+        },
+        {
+          "refId": "B",
+          "expr": "rate(haproxy_backend_connection_errors_total{proxy=\"be_edges\"}[30s])",
+          "legendFormat": "ошибки соединения"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(haproxy_frontend_request_errors_total{proxy=\"fe_load\"}[30s])",
+          "legendFormat": "ошибки запросов"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Коды ответов на балансировщике",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (code) (rate(haproxy_backend_http_responses_total{proxy=\"be_edges\"}[30s]))",
+          "legendFormat": "{{code}}"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Шина",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Сообщений в секунду",
+      "description": "На один запрос приходится одно сообщение на инспектора и один ответ. Расхождение с интенсивностью запросов означает, что часть запросов до шины не доходит.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 27 },
+      "targets": [
+        { "refId": "A", "expr": "rate(gnatsd_varz_in_msgs[30s])", "legendFormat": "принято" },
+        { "refId": "B", "expr": "rate(gnatsd_varz_out_msgs[30s])", "legendFormat": "отправлено" }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Медленные потребители и соединения",
+      "description": "Ненулевые медленные потребители означают, что инспектор не разбирает очередь. Дальше растёт задержка вердикта, а причина не в модуле.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 27 },
+      "targets": [
+        { "refId": "A", "expr": "gnatsd_varz_slow_consumers", "legendFormat": "медленные потребители" },
+        { "refId": "B", "expr": "gnatsd_varz_connections", "legendFormat": "соединений" },
+        { "refId": "C", "expr": "gnatsd_varz_subscriptions", "legendFormat": "подписок" }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Полоса шины",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 27 },
+      "fieldConfig": { "defaults": { "unit": "Bps" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(gnatsd_varz_in_bytes[30s])", "legendFormat": "принято" },
+        { "refId": "B", "expr": "rate(gnatsd_varz_out_bytes[30s])", "legendFormat": "отправлено" }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Ресурсы",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "CPU по контейнерам",
+      "description": "Насыщение генератора означает, что измерен генератор. Это первое, что нужно проверить у любого неожиданного результата.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"wafload.*\"}[30s]))",
+          "legendFormat": "{{name}}"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "RSS по контейнерам",
+      "description": "Критерий сценария soak: у узлов nginx линия обязана быть плоской после прогрева.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (name) (container_memory_rss{name=~\"wafload.*\"})",
+          "legendFormat": "{{name}}"
+        }
+      ]
+    }
+  ]
+}

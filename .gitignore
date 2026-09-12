@@ -1,0 +1,10 @@
+# Сборка модуля и локальные бинари агента.
+/module/objs/
+/agent/waf-agent
+/agent/waf-retain-bench
+
+# Результаты прогонов нагрузки.
+/tests/load/results/
+
+# Личное окружение.
+.env

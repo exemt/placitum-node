@@ -1,0 +1,33 @@
+# Сбор на время прогона. Ретенция шесть часов: хранилище здесь -- буфер между
+# прогоном и его разбором, а не архив.
+#
+# Метрики генератора приезжают не скрейпом, а remote-write из k6, поэтому job
+# для него нет: сервер запущен с --web.enable-remote-write-receiver.
+
+global:
+  scrape_interval:     5s
+  evaluation_interval: 5s
+  external_labels:
+    rig: waf-load
+
+scrape_configs:
+
+  # Сессии, очереди, коды ответов и время отклика по каждому узлу отдельно --
+  # единственный источник, который видит узлы поимённо.
+  - job_name: haproxy
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['haproxy:8404']
+
+  - job_name: nats
+    static_configs:
+      - targets: ['nats-exporter:7777']
+
+  # CPU и RSS по контейнерам: источник данных для критерия RSS в сценарии soak.
+  - job_name: cadvisor
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['127.0.0.1:9090']

@@ -1,0 +1,9 @@
+INFO {"server_id":"x","max_payload":1048576}
+PING
+MSG _INBOX.waf.fuzz.1.2.v.00000000deadbeef.00 1 12
+{"v":2,"x":1}
+HMSG _INBOX.waf.fuzz.1.2.v.00000000deadbeef.01 1 14 14
+NATS/1.0 503
+
++OK
+-ERR bad

@@ -1,0 +1,1 @@
+{"v":2,"verdict":"allow","headers":{"set":{"X-WAF-User":"alice"}},"sessions":[{"source":"corp","kind":"own","user":"alice","id":"k7f3","verified":true,"issued":1757232000,"expires":1757260800,"groups":["ops","dev"]},{"source":"shop","kind":"app","user":"alice@x","id":"sha256:ab12","verified":true}]}

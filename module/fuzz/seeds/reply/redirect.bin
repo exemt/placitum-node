@@ -1,0 +1,1 @@
+{"v":2,"verdict":"redirect","redirect":{"url":"https://example.com/challenge","status":302},"headers":{"set":{"X-A":"1"},"unset":["X-B"]},"cookies":[{"name":"s","value":"v","path":"/","max_age":60}]}

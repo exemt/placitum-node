@@ -1,0 +1,259 @@
+# Нагрузочный стенд: генератор -> HAProxy -> N узлов nginx с модулем -> origin,
+# вердикт по каждому запросу через NATS у инспектора адреса.
+#
+# Стенд намеренно отдельный от deploy/: там окружение для отладки, где логи идут
+# в stdout, error_log стоит на info, а worker_connections равен 1024. Под
+# нагрузкой каждое из этих значений искажает результат.
+#
+#     cd nginx/tests/load
+#     ./scripts/run.ps1 -Scenario smoke
+#
+# Наружу публикуются только порты управления. Путь нагрузки целиком внутри
+# docker-сети: проброс порта в Windows идёт через прокси WSL2 и является жёстким
+# потолком по пропускной способности, см. README.md#что-портит-результат.
+
+name: wafload
+
+x-stop: &stop
+  stop_grace_period: 5s
+
+services:
+
+  # ---------------------------------------------------------------- шина ----
+
+  nats:
+    <<: *stop
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats/nats-server.conf"]
+    volumes:
+      - ./nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    ports:
+      - "${PORT_NATS_MON:-18222}:8222"  # /varz, /connz, /subsz -- scripts/inside
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8222/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # ---------------------------------------------------------- инспектор ----
+
+  # Один инспектор по смыслу конфигурации (одно имя, один subject), но
+  # масштабируемый репликами: подписка идёт queue group, и NATS раскладывает
+  # сообщения между экземплярами сам. ip -- самый дешёвый из четырёх: без
+  # тела и без CRS, чтобы замер не упирался в инспектора.
+  #
+  # WAF_IP_LOG=error обязателен: на info инспектор пишет строку на каждое
+  # сообщение, и на десяти тысячах в секунду это доминирующая статья расходов.
+  # Единственное место прогона, которому нужен чужой компонент. Путь или git-URL
+  # задаёт PLC_SRC_IP -- как в sources.env установки; умолчание годится, когда
+  # рядом лежит платформа.
+  inspector:
+    <<: *stop
+    build:
+      context: ${PLC_SRC_IP:-../../../inspectors/ip}
+      dockerfile: deploy/Dockerfile
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_IP_SUBJECT: waf.req.ip
+      WAF_IP_NAME: ip
+      WAF_IP_LOG: "${INSPECTOR_LOG:-error}"
+      WAF_IP_VERSIONS: "2"
+    volumes:
+      # Данные и профили -- из того же дерева; при сборке из git монтирования
+      # снимают, инспектор поднимается на том, что лежит в образе.
+      - ${PLC_SRC_IP:-../../../inspectors/ip}/data:/app/data:ro
+      - ${PLC_SRC_IP:-../../../inspectors/ip}/profiles:/app/profiles:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  # -------------------------------------------------------------- origin ----
+
+  # Приложение за WAF. Обязано быть заведомо быстрее всего остального, иначе
+  # измеряется оно. return в rewrite-фазе отдаёт ответ без обращения к диску и
+  # без вызова content-фазы, тело запроса при этом отбрасывается.
+  origin:
+    <<: *stop
+    image: nginx:1.28-alpine
+    volumes:
+      - ./origin/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  # ---------------------------------------------------------------- edge ----
+
+  # Узел nginx с модулем. Масштабируется: docker compose up --scale edge=N.
+  # Порт наружу не публикуется именно поэтому -- у N реплик он был бы один.
+  #
+  # Конфигурация собирается envsubst из шаблона: список подставляемых имён задан
+  # явно, иначе envsubst съел бы $request_time и остальные переменные nginx.
+  edge:
+    <<: *stop
+    build:
+      context: ../../module
+      target: runtime
+      args:
+        NGINX_VERSION: "${NGINX_VERSION:-1.28.0}"
+    volumes:
+      - ./edge/nginx.load.conf.template:/etc/nginx/nginx.conf.template:ro
+    environment:
+      EDGE_WORKERS: "${EDGE_WORKERS:-4}"
+      EDGE_ACCESS_LOG: "${EDGE_ACCESS_LOG:-off}"
+      EDGE_ERROR_LOG_LEVEL: "${EDGE_ERROR_LOG_LEVEL:-warn}"
+      WAF_MAX_INFLIGHT: "${WAF_MAX_INFLIGHT:-4096}"
+      WAF_DEADLINE: "${WAF_DEADLINE:-200ms}"
+      WAF_ON_TIMEOUT: "${WAF_ON_TIMEOUT:-deny}"
+      WAF_ON_ABSENT: "${WAF_ON_ABSENT:-deny}"
+      WAF_ON_BUS_ERROR: "${WAF_ON_BUS_ERROR:-deny}"
+      WAF_INSPECTOR_TIMEOUT: "${WAF_INSPECTOR_TIMEOUT:-200ms}"
+      WAF_SCORE_DENY: "${WAF_SCORE_DENY:-100}"
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        export WAF_NODE_ID="edge-$$(hostname)"
+        envsubst '$$WAF_NODE_ID $$EDGE_WORKERS $$EDGE_ACCESS_LOG $$EDGE_ERROR_LOG_LEVEL $$WAF_MAX_INFLIGHT $$WAF_DEADLINE $$WAF_ON_TIMEOUT $$WAF_ON_ABSENT $$WAF_ON_BUS_ERROR $$WAF_INSPECTOR_TIMEOUT $$WAF_SCORE_DENY' \
+            < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+        nginx -t
+        exec nginx -g 'daemon off;'
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+    depends_on:
+      nats:
+        condition: service_healthy
+      origin:
+        condition: service_healthy
+      inspector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # ------------------------------------------------------------- haproxy ----
+
+  # server-template + resolvers на встроенный DNS docker: число узлов меняется
+  # флагом --scale, конфигурация балансировщика при этом не трогается.
+  haproxy:
+    <<: *stop
+    image: haproxy:3.0-alpine
+    volumes:
+      - ./lb/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${PORT_LB:-18080}:8080"       # ручные проверки; нагрузка идёт внутри сети
+      - "${PORT_LB_STATS:-18404}:8404" # страница статистики и /metrics
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+    depends_on:
+      edge:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8404/healthz"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  # ----------------------------------------------------------- генератор ----
+
+  # Профиль gen: контейнер не поднимается вместе со стендом, а запускается
+  # разово через docker compose run. Так прогон завершается кодом k6, и его
+  # можно использовать как шаг CI.
+  k6:
+    image: grafana/k6:latest
+    profiles: ["gen"]
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+    environment:
+      TARGET: "${TARGET:-http://haproxy:8080}"
+      SCENARIO: "${SCENARIO:-smoke}"
+      RATE: "${RATE:-2000}"
+      DURATION: "${DURATION:-2m}"
+      WARMUP: "${WARMUP:-30s}"
+      CORPUS_SEED: "${CORPUS_SEED:-20260813}"
+      CORPUS_SIZE: "${CORPUS_SIZE:-20000}"
+      BODY_PROFILE: "${BODY_PROFILE:-mixed}"
+      CONTROL_RATIO: "${CONTROL_RATIO:-0.10}"
+      ATTACK_RATIO: "${ATTACK_RATIO:-0.05}"
+      SCORE_RATIO: "${SCORE_RATIO:-0.05}"
+      REDIRECT_RATIO: "${REDIRECT_RATIO:-0.01}"
+      SLOW_RATIO: "${SLOW_RATIO:-0.02}"
+      DEBUG_RATIO: "${DEBUG_RATIO:-0.01}"
+      ABORT_RATIO: "${ABORT_RATIO:-0}"
+      SLOW_DELAY_OK: "${SLOW_DELAY_OK:-50}"
+      SLOW_DELAY_TIMEOUT: "${SLOW_DELAY_TIMEOUT:-400}"
+      WAF_DEADLINE_MS: "${WAF_DEADLINE_MS:-200}"
+      WAF_ON_TIMEOUT: "${WAF_ON_TIMEOUT:-deny}"
+      WAF_SCORE_DENY: "${WAF_SCORE_DENY:-100}"
+      RUN_ID: "${RUN_ID:-manual}"
+      K6_PROMETHEUS_RW_SERVER_URL: "${K6_PROMETHEUS_RW_SERVER_URL:-}"
+      K6_PROMETHEUS_RW_TREND_STATS: "p(50),p(95),p(99),max"
+
+  # ------------------------------------------------------ обсервабилити ----
+  #
+  # Профиль obs. В прогонах на потолок выключается: сам стек заметен на фоне и
+  # отбирает ядра у генератора.
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["obs"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-remote-write-receiver
+      - --enable-feature=native-histograms
+    volumes:
+      - ./obs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "${PORT_PROM:-19090}:9090"
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    profiles: ["obs"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./obs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./obs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${PORT_GRAFANA:-13000}:3000"
+    depends_on:
+      - prometheus
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.17.3
+    profiles: ["obs"]
+    command: ["-varz", "-connz", "-subz", "-routez", "http://nats:8222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  # cAdvisor даёт RSS и CPU по контейнерам -- источник данных для критерия RSS
+  # в сценарии soak. На Docker Desktop он капризен; если не поднимается,
+  # scripts/stats собирает то же самое через docker stats.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    profiles: ["obs"]
+    privileged: true
+    command: ["--housekeeping_interval=5s", "--docker_only=true"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro

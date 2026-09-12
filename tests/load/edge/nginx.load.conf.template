@@ -1,0 +1,145 @@
+# Узел nginx с модулем под нагрузкой. Шаблон: значения ${...} подставляет
+# envsubst при старте контейнера по явному списку имён, поэтому переменные
+# самого nginx ($request_time и прочие) остаются нетронутыми.
+#
+# Отличия от deploy/nginx/nginx.conf, все намеренные:
+#   - access_log по умолчанию выключен, error_log на warn;
+#   - worker_connections 65536 вместо 1024;
+#   - фиксированное число воркеров вместо auto;
+#   - маршруты сгруппированы по роли в замере, а не по проверяемому поведению.
+#
+# Содержимое отдаёт origin через proxy_pass, а не return: директива return
+# принадлежит rewrite-модулю и срабатывает ДО access-фазы, поэтому в location с
+# return обработчик модуля не вызывается вовсе и маршрут измерял бы пустоту.
+
+load_module modules/ngx_http_waf_module.so;
+
+worker_processes      ${EDGE_WORKERS};
+worker_rlimit_nofile  200000;
+
+events {
+    worker_connections  65536;
+    multi_accept        on;
+}
+
+http {
+    access_log  ${EDGE_ACCESS_LOG};
+    error_log   /dev/stderr  ${EDGE_ERROR_LOG_LEVEL};
+
+    # Компактный формат для случаев, когда лог всё-таки нужен для атрибуции.
+    # $request_time включает время приёма тела, поэтому для крупных тел это
+    # оценка сверху, а не измерение -- см. observability.md.
+    log_format load '$request_time $upstream_response_time $status '
+                    '$request_length $body_bytes_sent $uri';
+
+    keepalive_timeout   65;
+    keepalive_requests  1000000;
+
+    # Тела до 128 KB не уезжают во временный файл. Без этого профиль mixed
+    # измеряет диск: буфер по умолчанию вдвое меньше страницы памяти.
+    client_body_buffer_size  128k;
+    client_max_body_size     8m;
+
+    server_tokens  off;
+
+    upstream origin {
+        server origin:8080  max_fails=0;
+        keepalive            512;
+        keepalive_requests   1000000;
+        keepalive_timeout    60s;
+    }
+
+    # ------------------------------------------------------------- waf ----
+
+    waf_node_id       ${WAF_NODE_ID};
+    waf_max_inflight  ${WAF_MAX_INFLIGHT};
+
+    waf_bus nats://nats:4222 name=${WAF_NODE_ID};
+    waf_agent_socket /run/waf/verdict.sock;
+
+    # Один инспектор: ровно та конфигурация, о которой идёт речь в задаче.
+    # Второй добавляется строкой, но тогда сообщений на шине становится вдвое
+    # больше при той же интенсивности -- см. README.md#нагрузка-на-шину.
+    waf_inspector ip subject=waf.req.ip;
+
+    waf_deny_response  blocked  status=403;
+
+    # Куда инспектору разрешено уводить клиента. Цель приезжает с провода, и без
+    # этой строки редирект отбраковывался бы вместе с ответом -- то есть флавор
+    # redirect в генераторе измерял бы политику таймаута, а не сборку Location.
+    waf_redirect_allow /waf/captcha;
+
+    waf_deadline  request ${WAF_DEADLINE};
+    waf_exception request timeout ${WAF_ON_TIMEOUT};
+    waf_exception request absent  ${WAF_ON_ABSENT};
+    waf_exception request bus     ${WAF_ON_BUS_ERROR};
+
+    # Порог. ip отвечает allow или deny, счёта нет: отказ приходит вердиктом,
+    # а не суммой. Константа остаётся -- модуль её читает на каждом запросе.
+    waf_score_deny request ${WAF_SCORE_DENY} response=blocked;
+
+    waf_cookie_defaults secure=off http_only=on same_site=Lax;
+
+    server {
+        listen  8080  backlog=65535  reuseport;
+
+        proxy_http_version  1.1;
+        proxy_set_header    Connection "";
+        proxy_set_header    Host $host;
+        proxy_buffering     on;
+
+        # Основная измеряемая ветка. realip -- чтобы генератор задавал
+        # адрес заголовком: 203.0.113.10 в blocklist, остальное -- allow.
+        location /api/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf on;
+            waf_inspect request ip wave=0 timeout=${WAF_INSPECTOR_TIMEOUT};
+            proxy_pass http://origin;
+        }
+
+        # Контрольная ветка. Обязательна: итоговое число прогона -- разница
+        # квантилей между ней и /api/ при одинаковой интенсивности. Всё, кроме
+        # модуля, у них общее, включая проксирование к origin.
+        location /nowaf/ {
+            waf off;
+            proxy_pass http://origin;
+        }
+
+        # Та же ветка, что /api/, плюс X-WAF-Debug с rid, вердиктом, счётом и
+        # латентностью по инспекторам. Отдельным маршрутом, а не на всём
+        # трафике: заголовок собирается на каждый ответ, и его цена вошла бы в
+        # основной замер. Генератор шлёт сюда единицы процентов.
+        location /debug/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf on;
+            waf_inspect request ip wave=0 timeout=${WAF_INSPECTOR_TIMEOUT};
+            waf_debug_header on;
+            proxy_pass http://origin;
+        }
+
+        # Цель редиректа, разрешённая waf_redirect_allow. Модуль выключен:
+        # страница обязана открываться и тогда, когда инспектор недоступен,
+        # иначе отправленный на неё клиент попадёт в цикл.
+        location = /waf/captcha {
+            waf off;
+            return 200 "captcha\n";
+        }
+
+        # Соединения, запросы, распределение по состояниям чтения и записи.
+        # Единственный способ увидеть внутреннее состояние nginx, пока у модуля
+        # нет своих счётчиков; снимается scripts/inside.
+        location = /nginx_status {
+            waf off;
+            stub_status;
+        }
+
+        location = /healthz {
+            waf off;
+            return 200 "ok\n";
+        }
+    }
+}

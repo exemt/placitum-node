@@ -1,0 +1,15 @@
+{
+  "error": "denied",
+  "status": <!--# echo var="waf_deny_status" default="403" -->,
+  "message": "Your request has been flagged and blocked. If you believe this is an error, contact support with the event ID.",
+<!--# if expr="$waf_deny_scope" -->
+  "scope": "<!--# echo var='waf_deny_scope' default='' -->",
+<!--# endif -->
+<!--# if expr="$waf_deny_subject" -->
+  "subject": "<!--# echo var='waf_deny_subject' default='' -->",
+<!--# endif -->
+<!--# if expr="$waf_deny_retry" -->
+  "retry_after": <!--# echo var="waf_deny_retry" default="0" -->,
+<!--# endif -->
+  "ray": "<!--# echo var='waf_deny_ray' default='' -->"
+}

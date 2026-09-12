@@ -1,0 +1,1 @@
+{"v":2,"verdict":"allow","actions":[{"do":"threshold","to":"ip","apply":"ip","delta":10,"code":"X"}],"continue":{"subject":"waf.req.modsec.i1","ttl":5000},"rewrite":{"body":{"key":"fuzz:00000000deadbeef:rsp:rw","size":10},"on_error":"deny"}}

@@ -1,0 +1,905 @@
+/*
+ * Счётчики частоты локального слоя.
+ *
+ * Алгоритм -- протекающая корзина (leaky bucket), ровно то же, что в
+ * ngx_http_limit_req_module: избыток хранится в тысячных запроса, стекает со
+ * скоростью rate и сравнивается с burst. Своя реализация нужна не из-за алгоритма, а из-за того, что счётчик
+ * считает не запросы, а обращения к шине (count=waves), и живёт в общей зоне
+ * вместе с остальным локальным слоем.
+ *
+ * Дерево одно на все правила: подпись правила входит в ключ, поэтому счётчики
+ * разных правил не смешиваются, а разметка зоны не зависит от того, сколько
+ * правил объявлено. Одинаково объявленные правила разных маршрутов делят один
+ * счётчик намеренно -- это один и тот же лимит, записанный дважды.
+ *
+ * Вытеснение -- LRU, как у limit_req: зона конечна, а число ключей нет, и
+ * отказ в обслуживании при исчерпании зоны был бы худшим из исходов.
+ *
+ * Спецификация: docs/directives/list/list.md (waf_local_rate).
+ */
+
+#include "ngx_http_waf.h"
+#include "local/ngx_http_waf_local.h"
+
+
+/* Предел длины ключа: столько помещается в u_char длины узла дерева. */
+#define NGX_HTTP_WAF_RATE_KEY_MAX   255
+
+
+/*
+ * Узел дерева счётчиков. Раскладка -- приём limit_req: структура начинается с
+ * поля color, то есть накладывается на хвост ngx_rbtree_node_t, и один узел
+ * выделяется одним куском вместе с ключом.
+ */
+typedef struct {
+    u_char             color;
+    u_char             len;
+    ngx_queue_t        queue;
+    ngx_msec_t         last;
+    ngx_uint_t         excess;      /* в тысячных запроса                    */
+    uint32_t           sig;         /* подпись правила                       */
+    u_char             data[1];
+} ngx_http_waf_rate_node_t;
+
+
+/*
+ * Как обращение относится к корзине.
+ *
+ * PEEK -- только посмотреть накопленное: решение принимается по тому, что уже
+ * набралось. Так работает count=waves на входе запроса -- волн ещё не было.
+ *
+ * GATE -- начислить, если проходит. Отвергнутое обращение в корзину не идёт,
+ * иначе клиент, продолжающий стучаться, сам себе продлевает блокировку; здесь и
+ * только здесь поведение совпадает со штатным limit_req.
+ *
+ * DEBT -- начислить обязательно: волна уже опубликована, шина уже заплатила, и
+ * не записать это значит не заметить превышения вовсе. Долг ограничен всплеском
+ * плюс секунда частоты -- шторм волн стоит ключу не больше секунды блокировки
+ * сверх всплеска, а не часов.
+ */
+typedef enum {
+    NGX_HTTP_WAF_RATE_PEEK = 0,
+    NGX_HTTP_WAF_RATE_GATE,
+    NGX_HTTP_WAF_RATE_DEBT
+} ngx_http_waf_rate_mode_e;
+
+
+static ngx_int_t ngx_http_waf_rate_account(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, ngx_uint_t mode,
+    ngx_uint_t *excess);
+static ngx_http_waf_rate_node_t *ngx_http_waf_rate_lookup(
+    ngx_http_waf_shm_t *shm, ngx_http_waf_rate_rule_t *rule, ngx_str_t *key,
+    uint32_t hash);
+static ngx_int_t ngx_http_waf_rate_insert(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, uint32_t hash,
+    ngx_uint_t excess);
+static void ngx_http_waf_rate_expire(ngx_http_waf_shm_t *shm, ngx_uint_t force);
+static ngx_int_t ngx_http_waf_rate_key(ngx_http_waf_ctx_t *ctx,
+    ngx_http_waf_rate_rule_t *rule, ngx_str_t *raw, ngx_str_t *key,
+    u_char *hex);
+
+
+static ngx_str_t  ngx_http_waf_rate_rule_name = ngx_string("LOCAL_RATE");
+
+
+/* --- директива ------------------------------------------------------------ */
+
+char *
+ngx_http_waf_local_rate(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_waf_loc_conf_t  *wlcf = conf;
+
+    ngx_str_t                          *args, name, value, list_name;
+    ngx_uint_t                          i;
+    ngx_http_waf_rate_rule_t           *rule;
+
+    args = cf->args->elts;
+
+    /*
+     * "none" -- снять родительские лимиты. То же, что у waf_local_check:
+     * наследование замена, и отсутствие строки означает не "лимитов нет", а
+     * "лимиты сверху". Зона для выключения не нужна.
+     */
+    if (cf->args->nelts == 2
+        && args[1].len == 4 && ngx_strncmp(args[1].data, "none", 4) == 0)
+    {
+        if (wlcf->local_rates != NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: waf_local_rate none cannot mix with "
+                               "limits on the same level");
+            return NGX_CONF_ERROR;
+        }
+
+        wlcf->local_rates = ngx_array_create(cf->pool, 1,
+                                          sizeof(ngx_http_waf_rate_rule_t));
+        if (wlcf->local_rates == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        return NGX_CONF_OK;
+    }
+
+    if (ngx_http_waf_shm_required(cf, "waf_local_rate") != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (wlcf->local_rates == NULL) {
+        wlcf->local_rates = ngx_array_create(cf->pool, 2,
+                                          sizeof(ngx_http_waf_rate_rule_t));
+        if (wlcf->local_rates == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (wlcf->local_rates->nelts == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: waf_local_rate none cannot mix with "
+                           "limits on the same level");
+        return NGX_CONF_ERROR;
+    }
+
+    rule = ngx_array_push(wlcf->local_rates);
+    if (rule == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(rule, sizeof(ngx_http_waf_rate_rule_t));
+
+    rule->count  = NGX_HTTP_WAF_RATE_REQUESTS;
+    rule->action = NGX_HTTP_WAF_POLICY_BLOCK;
+    ngx_str_null(&list_name);
+
+    /*
+     * Ключ -- одно значение: множество ($waf_request_args.*) означало бы, что
+     * запрос считается сразу в несколько счётчиков, и rate= перестал бы значить
+     * написанное. Поэтому all здесь запрещён.
+     */
+    if (ngx_http_waf_operand_compile(cf, &args[1], &rule->key, 0,
+                                     "waf_local_rate") != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
+    for (i = 2; i < cf->args->nelts; i++) {
+
+        if (args[i].len == 2 && ngx_strncmp(args[i].data, "if", 2) == 0) {
+
+            if (ngx_http_waf_cond_parse(cf, &i, &rule->conds,
+                                        "waf_local_rate") != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (ngx_http_waf_split(&args[i], &name, &value) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: invalid option \"%V\" in waf_local_rate",
+                               &args[i]);
+            return NGX_CONF_ERROR;
+        }
+
+        if (name.len == 4 && ngx_strncmp(name.data, "rate", 4) == 0) {
+            ngx_int_t   n;
+            ngx_uint_t  scale;
+            ngx_str_t   digits = value;
+
+            /*
+             * Единица обязательна: "rate=100" -- это не значение по умолчанию, а
+             * неоднозначность, и толковать её в пользу секунд означало бы в
+             * шестьдесят раз более жёсткий лимит, чем имелось в виду.
+             */
+            if (digits.len > 3
+                && ngx_strncmp(digits.data + digits.len - 3, "r/s", 3) == 0)
+            {
+                scale = 1;
+
+            } else if (digits.len > 3
+                       && ngx_strncmp(digits.data + digits.len - 3, "r/m", 3)
+                          == 0)
+            {
+                scale = 60;
+
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: rate \"%V\" must end with r/s or r/m",
+                                   &value);
+                return NGX_CONF_ERROR;
+            }
+
+            digits.len -= 3;
+
+            n = ngx_atoi(digits.data, digits.len);
+
+            if (n == NGX_ERROR || n <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: invalid rate \"%V\"", &value);
+                return NGX_CONF_ERROR;
+            }
+
+            rule->rate = (ngx_uint_t) n * 1000 / scale;
+
+            if (rule->rate == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: rate \"%V\" rounds down to zero",
+                                   &value);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (name.len == 5 && ngx_strncmp(name.data, "burst", 5) == 0) {
+            ngx_int_t  n = ngx_atoi(value.data, value.len);
+
+            if (n == NGX_ERROR || n < 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: invalid burst \"%V\"", &value);
+                return NGX_CONF_ERROR;
+            }
+
+            rule->burst = (ngx_uint_t) n * 1000;
+            continue;
+        }
+
+        if (name.len == 5 && ngx_strncmp(name.data, "count", 5) == 0) {
+
+            if (value.len == 8
+                && ngx_strncmp(value.data, "requests", 8) == 0)
+            {
+                rule->count = NGX_HTTP_WAF_RATE_REQUESTS;
+
+            } else if (value.len == 5
+                       && ngx_strncmp(value.data, "waves", 5) == 0)
+            {
+                rule->count = NGX_HTTP_WAF_RATE_WAVES;
+
+            } else if (value.len == 6
+                       && ngx_strncmp(value.data, "frames", 6) == 0)
+            {
+                rule->count = NGX_HTTP_WAF_RATE_FRAMES;
+
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: count must be requests, waves or "
+                                   "frames");
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (name.len == 8 && ngx_strncmp(name.data, "response", 8) == 0) {
+            rule->response = value;
+            continue;
+        }
+
+        if (name.len == 4 && ngx_strncmp(name.data, "hash", 4) == 0) {
+
+            if (value.len == 3 && ngx_strncmp(value.data, "md5", 3) == 0) {
+                rule->hash = NGX_HTTP_WAF_DS_HASH_MD5;
+
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: waf_local_rate hash must be md5");
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (name.len == 4 && ngx_strncmp(name.data, "list", 4) == 0) {
+            list_name = value;
+            continue;
+        }
+
+        if (name.len == 3 && ngx_strncmp(name.data, "ttl", 3) == 0) {
+            ngx_int_t  n = ngx_parse_time(&value, 1);
+
+            if (n == NGX_ERROR || n <= 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: invalid list ttl \"%V\"", &value);
+                return NGX_CONF_ERROR;
+            }
+
+            rule->list_ttl = (ngx_uint_t) n;
+            continue;
+        }
+
+        if (name.len == 6 && ngx_strncmp(name.data, "action", 6) == 0) {
+
+            if (value.len == 5 && ngx_strncmp(value.data, "block", 5) == 0) {
+                rule->action = NGX_HTTP_WAF_POLICY_BLOCK;
+
+            } else if (value.len == 4
+                       && ngx_strncmp(value.data, "pass", 4) == 0)
+            {
+                rule->action = NGX_HTTP_WAF_POLICY_PASS;
+
+            } else {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: action must be block or pass");
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: unknown option \"%V\" in waf_local_rate",
+                           &name);
+        return NGX_CONF_ERROR;
+    }
+
+    if (rule->rate == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: waf_local_rate requires rate=");
+        return NGX_CONF_ERROR;
+    }
+
+    /*
+     * Имя записи каталога проверяется здесь, а не при отказе: несуществующая
+     * запись означала бы отказ без страницы, причём выясняющийся под нагрузкой,
+     * то есть ровно тогда, когда лимит сработал.
+     */
+    if (rule->response.len != 0) {
+        ngx_http_waf_main_conf_t  *wmcf;
+
+        wmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_waf_module);
+
+        if (ngx_http_waf_deny_response_find(wmcf, &rule->response) == NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: waf_deny_response \"%V\" is not declared",
+                               &rule->response);
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    if (list_name.len != 0) {
+        ngx_http_waf_main_conf_t  *wmcf;
+
+        wmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_waf_module);
+        rule->list = ngx_http_waf_dataset_find(wmcf, &list_name);
+
+        if (rule->list == NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: dataset \"%V\" is not declared; "
+                               "waf_local_dataset must come first",
+                               &list_name);
+            return NGX_CONF_ERROR;
+        }
+
+        if (rule->list->mode != NGX_HTTP_WAF_DS_MODE_ACTIVE) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: waf_local_rate list= \"%V\" must be "
+                               "an active dataset", &list_name);
+            return NGX_CONF_ERROR;
+        }
+
+        if (rule->list_ttl == 0) {
+            rule->list_ttl = rule->list->ttl;
+        }
+
+        if (rule->list_ttl == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: waf_local_rate list= requires ttl= "
+                               "on the rule or the dataset");
+            return NGX_CONF_ERROR;
+        }
+
+        if (rule->action == NGX_HTTP_WAF_POLICY_PASS) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: list= is meaningless with action=pass");
+            return NGX_CONF_ERROR;
+        }
+
+    } else if (rule->list_ttl != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: ttl= requires list=");
+        return NGX_CONF_ERROR;
+    }
+
+    /*
+     * Подпись правила -- то, чем счётчики одного правила отделены от чужих.
+     * В неё входит всё, что меняет смысл счёта, и не входит расположение
+     * директивы: правило, объявленное одинаково на двух маршрутах, -- это один
+     * лимит.
+     */
+    rule->sig = ngx_crc32_long(rule->key.text.data, rule->key.text.len);
+    rule->sig = ngx_murmur_hash2((u_char *) &rule->rate, sizeof(ngx_uint_t))
+                    ^ rule->sig
+                    ^ ngx_murmur_hash2((u_char *) &rule->burst,
+                                       sizeof(ngx_uint_t))
+                    ^ (uint32_t) rule->count
+                    ^ ((uint32_t) rule->hash << 8);
+
+    return NGX_CONF_OK;
+}
+
+
+/* --- проверка ------------------------------------------------------------- */
+
+ngx_int_t
+ngx_http_waf_rate_check(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule_name,
+    ngx_str_t *response)
+{
+    u_char                    hex[NGX_HTTP_WAF_MD5_HEX_LEN];
+    ngx_str_t                 raw, key;
+    ngx_uint_t                i, excess, frame;
+    ngx_http_waf_shm_t       *shm;
+    ngx_http_waf_loc_conf_t  *wlcf;
+    ngx_http_waf_rate_rule_t *rules;
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    if (wlcf->local_rates == NULL) {
+        return NGX_OK;
+    }
+
+    shm = ngx_http_waf_shm();
+
+    if (shm == NULL) {
+        return NGX_OK;
+    }
+
+    rules = wlcf->local_rates->elts;
+    frame = ngx_http_waf_phase_is_frame(ctx->phase);
+
+    for (i = 0; i < wlcf->local_rates->nelts; i++) {
+
+        /*
+         * Единица счёта выбирает фазу: кадры считает только count=frames, а
+         * запросы и волны на кадрах не считаются -- рукопожатие уже
+         * посчитано на своей фазе.
+         */
+        if (frame ? rules[i].count != NGX_HTTP_WAF_RATE_FRAMES
+                  : rules[i].count == NGX_HTTP_WAF_RATE_FRAMES)
+        {
+            continue;
+        }
+
+        if (ngx_http_waf_cond_test(ctx, rules[i].conds) != NGX_OK) {
+            continue;                  /* if не сошёлся: лимит не про этот
+                                          запрос */
+        }
+
+        if (ngx_http_waf_rate_key(ctx, &rules[i], &raw, &key, hex) != NGX_OK) {
+            continue;
+        }
+
+        /*
+         * При count=waves на входе запроса ничего не начисляется: считаются
+         * обращения к шине, а они ещё не состоялись. Решение принимается по
+         * уже накопленному избытку -- то есть по тому, сколько волн этот ключ
+         * породил до сих пор.
+         */
+        if (ngx_http_waf_rate_account(shm, &rules[i], &key,
+                                      rules[i].count
+                                          == NGX_HTTP_WAF_RATE_WAVES
+                                              ? NGX_HTTP_WAF_RATE_PEEK
+                                              : NGX_HTTP_WAF_RATE_GATE,
+                                      &excess)
+            == NGX_OK)
+        {
+            continue;
+        }
+
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "waf: local rate limit exceeded for key \"%V\" "
+                      "(rule \"%V\", excess %ui.%03ui), action %s, ray %*s",
+                      &key, &rules[i].key.text, excess / 1000, excess % 1000,
+                      rules[i].action == NGX_HTTP_WAF_POLICY_PASS
+                          ? "pass" : "block",
+                      (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
+
+        if (rules[i].action == NGX_HTTP_WAF_POLICY_BLOCK) {
+            *rule_name = ngx_http_waf_rate_rule_name;
+            *response  = rules[i].response;
+
+            if (rules[i].list != NULL) {
+                /*
+                 * В набор уезжает сырой ключ, не ключ корзины: хеширует ли
+                 * его набор, решает сам набор, и hash=md5 у правила на это
+                 * не влияет.
+                 */
+                (void) ngx_http_waf_dataset_put(ctx, rules[i].list, &raw,
+                                                rules[i].list_ttl,
+                                                &ngx_http_waf_rate_rule_name);
+
+                /*
+                 * Единственный срок, который локальный слой знает точно:
+                 * ключ уехал в набор на ttl= секунд, и раньше этого ответ не
+                 * изменится. Страница отказа печатает его клиентом
+                 * ($waf_deny_retry, docs/deny-pages.md).
+                 *
+                 * У правила без list= срока нет: избыток тает сам, и «когда»
+                 * зависит от того, продолжает ли клиент стучать.
+                 */
+                ctx->local_retry = rules[i].list_ttl;
+            }
+
+            return NGX_DECLINED;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+void
+ngx_http_waf_rate_charge_wave(ngx_http_waf_ctx_t *ctx)
+{
+    u_char                     hex[NGX_HTTP_WAF_MD5_HEX_LEN];
+    ngx_str_t                  raw, key;
+    ngx_uint_t                 i, excess;
+    ngx_http_waf_shm_t        *shm;
+    ngx_http_waf_loc_conf_t   *wlcf;
+    ngx_http_waf_rate_rule_t  *rules;
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    if (wlcf->local_rates == NULL) {
+        return;
+    }
+
+    shm = ngx_http_waf_shm();
+
+    if (shm == NULL) {
+        return;
+    }
+
+    rules = wlcf->local_rates->elts;
+
+    for (i = 0; i < wlcf->local_rates->nelts; i++) {
+
+        if (rules[i].count != NGX_HTTP_WAF_RATE_WAVES) {
+            continue;
+        }
+
+        if (ngx_http_waf_cond_test(ctx, rules[i].conds) != NGX_OK) {
+            continue;
+        }
+
+        if (ngx_http_waf_rate_key(ctx, &rules[i], &raw, &key, hex) != NGX_OK) {
+            continue;
+        }
+
+        /*
+         * Исход здесь не проверяется: волна уже публикуется, и обрывать запрос
+         * на середине фазы было бы хуже, чем пропустить его целиком. Превышение
+         * скажется на следующем запросе этого ключа -- он и есть тот, кого надо
+         * отсечь.
+         */
+        (void) ngx_http_waf_rate_account(shm, &rules[i], &key,
+                                         NGX_HTTP_WAF_RATE_DEBT, &excess);
+    }
+}
+
+
+/*
+ * Ключ корзины. raw -- значение как пришло, key -- то, по чему ведётся корзина:
+ * при hash=md5 это hex в буфере hex вызывающего, иначе то же raw. Сырое
+ * значение отдаётся отдельно, потому что в набор автобана уезжает оно.
+ */
+static ngx_int_t
+ngx_http_waf_rate_key(ngx_http_waf_ctx_t *ctx, ngx_http_waf_rate_rule_t *rule,
+    ngx_str_t *raw, ngx_str_t *key, u_char *hex)
+{
+    if (ngx_http_waf_operand_single(ctx, &rule->key, raw) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (raw->len == 0) {
+        return NGX_ERROR;              /* переменная пуста: правило не про этот
+                                          запрос */
+    }
+
+    if (rule->hash == NGX_HTTP_WAF_DS_HASH_MD5) {
+        ngx_http_waf_md5_hex(raw, hex);
+        key->data = hex;
+        key->len = NGX_HTTP_WAF_MD5_HEX_LEN;
+        return NGX_OK;
+    }
+
+    *key = *raw;
+
+    if (key->len > NGX_HTTP_WAF_RATE_KEY_MAX) {
+        ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
+                      "waf: local rate key \"%V\" is longer than %d bytes, "
+                      "rule \"%V\" skipped; hash=md5 lifts the limit", key,
+                      NGX_HTTP_WAF_RATE_KEY_MAX, &rule->key.text);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * Начисление и проверка. NGX_OK -- в пределах, NGX_DECLINED -- превышено.
+ * Состояние корзины обновляется при любом режиме, в том числе при PEEK: стекание
+ * -- функция времени, а не обращений.
+ */
+static ngx_int_t
+ngx_http_waf_rate_account(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, ngx_uint_t mode,
+    ngx_uint_t *excess)
+{
+    uint32_t                   hash;
+    ngx_int_t                  ms, value, decayed, limit;
+    ngx_msec_t                 now;
+    ngx_http_waf_rate_node_t  *rn;
+
+    hash = ngx_crc32_short(key->data, key->len) ^ rule->sig;
+    now  = ngx_current_msec;
+
+    ngx_shmtx_lock(&shm->shpool->mutex);
+
+    rn = ngx_http_waf_rate_lookup(shm, rule, key, hash);
+
+    if (rn == NULL) {
+        /*
+         * Первое обращение по ключу избытка не создаёт: корзина начинает
+         * наполняться со следующего, а стекание считается от момента создания
+         * узла. Иначе burst=0 отвергал бы вообще всё, включая единственный
+         * запрос в час, -- и это ровно то место, где реализация корзины обычно
+         * расходится со штатным limit_req.
+         */
+        *excess = 0;
+
+        if (mode != NGX_HTTP_WAF_RATE_PEEK) {
+            (void) ngx_http_waf_rate_insert(shm, rule, key, hash,
+                                            mode == NGX_HTTP_WAF_RATE_DEBT
+                                                ? 1000 : 0);
+        }
+
+        ngx_shmtx_unlock(&shm->shpool->mutex);
+
+        return NGX_OK;
+    }
+
+    ms      = (ngx_int_t) (now - rn->last);
+    decayed = (ngx_int_t) rn->excess - (ngx_int_t) rule->rate * ms / 1000;
+
+    if (decayed < 0) {
+        decayed = 0;
+    }
+
+    value   = decayed
+              + (ngx_int_t) (mode == NGX_HTTP_WAF_RATE_PEEK ? 0 : 1000);
+    *excess = (ngx_uint_t) value;
+
+    rn->last = now;
+
+    ngx_queue_remove(&rn->queue);
+    ngx_queue_insert_head(&shm->rate_lru, &rn->queue);
+
+    if (value <= (ngx_int_t) rule->burst) {
+        rn->excess = (ngx_uint_t) value;
+
+        ngx_shmtx_unlock(&shm->shpool->mutex);
+
+        return NGX_OK;
+    }
+
+    if (mode == NGX_HTTP_WAF_RATE_DEBT) {
+        /*
+         * Долг записывается и за пределом всплеска -- иначе корзина упирается в
+         * всплеск, накопленное никогда его не превышает, и проверка по
+         * накопленному не срабатывает вовсе. Верхняя граница -- секунда частоты
+         * сверх всплеска.
+         */
+        limit = (ngx_int_t) (rule->burst + rule->rate);
+
+        rn->excess = (ngx_uint_t) (value > limit ? limit : value);
+
+    } else {
+        rn->excess = (ngx_uint_t) decayed;
+    }
+
+    ngx_shmtx_unlock(&shm->shpool->mutex);
+
+    return NGX_DECLINED;
+}
+
+
+static ngx_http_waf_rate_node_t *
+ngx_http_waf_rate_lookup(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, uint32_t hash)
+{
+    ngx_int_t                  rc;
+    ngx_rbtree_node_t         *node, *sentinel;
+    ngx_http_waf_rate_node_t  *rn;
+
+    node     = shm->rate.root;
+    sentinel = shm->rate.sentinel;
+
+    while (node != sentinel) {
+
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        rn = (ngx_http_waf_rate_node_t *) &node->color;
+
+        /*
+         * Совпадение хеша -- ещё не совпадение ключа. Подпись правила проверяется
+         * первой: у разных правил один и тот же ключ встречается постоянно.
+         */
+        if (rn->sig == rule->sig) {
+            rc = ngx_memn2cmp(key->data, rn->data, key->len,
+                              (size_t) rn->len);
+            if (rc == 0) {
+                return rn;
+            }
+
+        } else {
+            rc = (rn->sig < rule->sig) ? -1 : 1;
+        }
+
+        node = (rc < 0) ? node->left : node->right;
+    }
+
+    return NULL;
+}
+
+
+static ngx_int_t
+ngx_http_waf_rate_insert(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, uint32_t hash,
+    ngx_uint_t excess)
+{
+    size_t                     size;
+    ngx_rbtree_node_t         *node;
+    ngx_http_waf_rate_node_t  *rn;
+
+    size = offsetof(ngx_rbtree_node_t, color)
+           + offsetof(ngx_http_waf_rate_node_t, data)
+           + key->len;
+
+    ngx_http_waf_rate_expire(shm, 0);
+
+    node = ngx_slab_alloc_locked(shm->shpool, size);
+
+    if (node == NULL) {
+        /*
+         * Зона кончилась. Освобождаем самый старый ключ независимо от того,
+         * стёк ли его избыток: потерять счётчик редкого клиента лучше, чем
+         * перестать считать вообще.
+         */
+        ngx_http_waf_rate_expire(shm, 1);
+
+        node = ngx_slab_alloc_locked(shm->shpool, size);
+
+        if (node == NULL) {
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                          "waf: local rate zone is exhausted, "
+                          "key \"%V\" is not counted", key);
+            return NGX_ERROR;
+        }
+    }
+
+    node->key = hash;
+
+    rn = (ngx_http_waf_rate_node_t *) &node->color;
+
+    rn->len    = (u_char) key->len;
+    rn->sig    = rule->sig;
+    rn->excess = excess;
+    rn->last   = ngx_current_msec;
+
+    ngx_memcpy(rn->data, key->data, key->len);
+
+    ngx_rbtree_insert(&shm->rate, node);
+    ngx_queue_insert_head(&shm->rate_lru, &rn->queue);
+
+    return NGX_OK;
+}
+
+
+/*
+ * Освобождение мест в зоне. Без force удаляются только ключи, чей избыток уже
+ * стёк до нуля, то есть счёт которых ничего не значит; с force -- самый старый
+ * ключ, каким бы он ни был.
+ */
+static void
+ngx_http_waf_rate_expire(ngx_http_waf_shm_t *shm, ngx_uint_t force)
+{
+    ngx_int_t                  ms, excess;
+    ngx_uint_t                 n;
+    ngx_queue_t               *q;
+    ngx_msec_t                 now;
+    ngx_rbtree_node_t         *node;
+    ngx_http_waf_rate_node_t  *rn;
+
+    now = ngx_current_msec;
+
+    for (n = 0; n < 2; n++) {
+
+        if (ngx_queue_empty(&shm->rate_lru)) {
+            return;
+        }
+
+        q  = ngx_queue_last(&shm->rate_lru);
+        rn = ngx_queue_data(q, ngx_http_waf_rate_node_t, queue);
+
+        if (!force) {
+            ms     = (ngx_int_t) (now - rn->last);
+            excess = (ngx_int_t) rn->excess - 1000 * ms / 1000;
+
+            /*
+             * Скорость стекания здесь взята за один запрос в секунду, а не за
+             * rate правила: узел не помнит, какому правилу принадлежит его
+             * скорость, а для вытеснения важно лишь то, что ключ давно не
+             * использовался.
+             */
+            if (excess > 0) {
+                return;
+            }
+        }
+
+        node = (ngx_rbtree_node_t *)
+                   ((u_char *) rn - offsetof(ngx_rbtree_node_t, color));
+
+        ngx_queue_remove(q);
+        ngx_rbtree_delete(&shm->rate, node);
+        ngx_slab_free_locked(shm->shpool, node);
+
+        force = 0;
+    }
+}
+
+
+/*
+ * Вставка в дерево счётчиков. Своя, а не ngx_rbtree_insert_value, потому что
+ * при совпадении хеша порядок должен определяться подписью правила и ключом:
+ * иначе два ключа с одним хешем становятся неотличимы, и один из них теряется.
+ */
+void
+ngx_http_waf_rate_insert_value(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    ngx_rbtree_node_t        **p;
+    ngx_http_waf_rate_node_t  *rn, *rn_temp;
+
+    for ( ;; ) {
+
+        if (node->key < temp->key) {
+            p = &temp->left;
+
+        } else if (node->key > temp->key) {
+            p = &temp->right;
+
+        } else {
+            rn      = (ngx_http_waf_rate_node_t *) &node->color;
+            rn_temp = (ngx_http_waf_rate_node_t *) &temp->color;
+
+            if (rn->sig != rn_temp->sig) {
+                p = (rn->sig < rn_temp->sig) ? &temp->left : &temp->right;
+
+            } else {
+                p = (ngx_memn2cmp(rn->data, rn_temp->data,
+                                  (size_t) rn->len, (size_t) rn_temp->len) < 0)
+                        ? &temp->left : &temp->right;
+            }
+        }
+
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    *p           = node;
+    node->parent = temp;
+    node->left   = sentinel;
+    node->right  = sentinel;
+    ngx_rbt_red(node);
+}
