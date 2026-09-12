@@ -24,11 +24,11 @@ type StatusRates struct {
 }
 
 type Counter struct {
-	mu      sync.Mutex
-	total   [Window]uint64
-	class   [4][Window]uint64
-	epoch   int64
-	now     func() int64
+	mu    sync.Mutex
+	total [Window]uint64
+	class [4][Window]uint64
+	epoch int64
+	now   func() int64
 }
 
 func New() *Counter {

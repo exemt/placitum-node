@@ -135,18 +135,18 @@ type Report struct {
 }
 
 type Step struct {
-	Workers          int     `json:"workers"`
-	Requests         int64   `json:"requests"`
-	Objects          int64   `json:"objects"`
-	Errors           int64   `json:"errors"`
-	Bytes            int64   `json:"bytes"`
-	ElapsedNs        int64   `json:"elapsed_ns"`
-	RequestsPerSec   float64 `json:"requests_per_sec"`
-	ObjectsPerSec    float64 `json:"objects_per_sec"`
-	MebibytesPerSec  float64 `json:"mebibytes_per_sec"`
-	P50PutNs         int64   `json:"p50_put_ns"`
-	P99PutNs         int64   `json:"p99_put_ns"`
-	FirstError       string  `json:"first_error,omitempty"`
+	Workers         int     `json:"workers"`
+	Requests        int64   `json:"requests"`
+	Objects         int64   `json:"objects"`
+	Errors          int64   `json:"errors"`
+	Bytes           int64   `json:"bytes"`
+	ElapsedNs       int64   `json:"elapsed_ns"`
+	RequestsPerSec  float64 `json:"requests_per_sec"`
+	ObjectsPerSec   float64 `json:"objects_per_sec"`
+	MebibytesPerSec float64 `json:"mebibytes_per_sec"`
+	P50PutNs        int64   `json:"p50_put_ns"`
+	P99PutNs        int64   `json:"p99_put_ns"`
+	FirstError      string  `json:"first_error,omitempty"`
 }
 
 type stepConfig struct {
@@ -171,14 +171,14 @@ func runStep(cfg stepConfig) (Step, error) {
 	})
 
 	var (
-		seq     atomic.Uint64
-		okReq   atomic.Int64
-		okObj   atomic.Int64
-		errN    atomic.Int64
-		bytes   atomic.Int64
-		first   atomic.Value
-		latMu   sync.Mutex
-		lat     []time.Duration
+		seq   atomic.Uint64
+		okReq atomic.Int64
+		okObj atomic.Int64
+		errN  atomic.Int64
+		bytes atomic.Int64
+		first atomic.Value
+		latMu sync.Mutex
+		lat   []time.Duration
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -331,6 +331,6 @@ func percentile(samples []time.Duration, p int) time.Duration {
 	}
 	cp := append([]time.Duration(nil), samples...)
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
-	i := (len(cp)-1) * p / 100
+	i := (len(cp) - 1) * p / 100
 	return cp[i]
 }

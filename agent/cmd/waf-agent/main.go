@@ -23,12 +23,13 @@ import (
 	"github.com/exemt/placitum-node/agent/internal/flow"
 	"github.com/exemt/placitum-node/agent/internal/handoff"
 	"github.com/exemt/placitum-node/agent/internal/id"
-	"github.com/exemt/placitum-node/agent/internal/logkit"
 	"github.com/exemt/placitum-node/agent/internal/nginxlog"
 	"github.com/exemt/placitum-node/agent/internal/nodekey"
 	"github.com/exemt/placitum-node/agent/internal/pulse"
 	"github.com/exemt/placitum-node/agent/internal/retain"
 	"github.com/exemt/placitum-node/agent/internal/rps"
+	"github.com/exemt/placitum-shared/logkit"
+	"github.com/exemt/placitum-shared/loglevel"
 )
 
 func main() {
@@ -64,14 +65,14 @@ func run() error {
 	storeDir := cfg.StoreDir
 	nginxBin := cfg.NginxBin
 
-	level, err := logkit.Env("WAF_AGENT_LOG", "info")
+	level, err := loglevel.Env("WAF_AGENT_LOG", "info")
 	if err != nil {
 		return err
 	}
 
 	/*
 	 * Свой журнал агента -- в waf.log рядом со строками nginx этой же ноды
-	 * (internal/logkit): writer у обоих -- имя ноды, сервис -- agent и nginx.
+	 * (shared/logkit): writer у обоих -- имя ноды, сервис -- agent и nginx.
 	 * Канал log в пульсе общий: потеря строки агента и строки nginx -- одна и
 	 * та же поломка шины.
 	 */

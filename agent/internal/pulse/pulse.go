@@ -26,14 +26,14 @@ type AgentConf struct {
 // Message — кадр присутствия агента. Apply и hash появятся вместе с watch KV;
 // без манифеста они пустые, кадр всё равно уходит.
 type Message struct {
-	V          int             `json:"v"`
-	Kind       string          `json:"kind"`
-	ID         string          `json:"id"`
-	NodeID     string          `json:"node_id"`
-	Hostname   string          `json:"hostname"`
-	ConfigHash string          `json:"config_hash,omitempty"`
-	Rev        *int            `json:"rev,omitempty"`
-	Apply      string          `json:"apply,omitempty"`
+	V          int    `json:"v"`
+	Kind       string `json:"kind"`
+	ID         string `json:"id"`
+	NodeID     string `json:"node_id"`
+	Hostname   string `json:"hostname"`
+	ConfigHash string `json:"config_hash,omitempty"`
+	Rev        *int   `json:"rev,omitempty"`
+	Apply      string `json:"apply,omitempty"`
 	// ConfFingerprint -- отпечаток боевого nginx.conf, который агент положил
 	// на ноду последним удачным apply: `md5:<hex>`, тот же вид и та же сумма,
 	// что воркер кладёт в своё присутствие. Не то же, что ConfigHash: там
@@ -44,14 +44,14 @@ type Message struct {
 	// том числе false: контроллер иначе не отличит сайдкар, которому нечего
 	// применять, от управляемой ноды, которая ещё ничего не применила, и
 	// вечно ждал бы от первой сходимости поколения шаблона.
-	NginxManage bool           `json:"nginx_manage"`
-	AgentConf  *AgentConf      `json:"agent_conf,omitempty"`
-	At         string          `json:"at"`
-	RPS        float64         `json:"rps"`
-	Codes      rps.StatusRates `json:"codes"`
-	Host       host.Snapshot   `json:"host"`
-	WindowS    int             `json:"window_s,omitempty"`
-	IO         map[string]flow.Flow `json:"io,omitempty"`
+	NginxManage bool                 `json:"nginx_manage"`
+	AgentConf   *AgentConf           `json:"agent_conf,omitempty"`
+	At          string               `json:"at"`
+	RPS         float64              `json:"rps"`
+	Codes       rps.StatusRates      `json:"codes"`
+	Host        host.Snapshot        `json:"host"`
+	WindowS     int                  `json:"window_s,omitempty"`
+	IO          map[string]flow.Flow `json:"io,omitempty"`
 
 	// Routes -- тот же темп, разложенный по маршрутам конфигурации: сумма
 	// `rps` строк равна `rps` кадра, сумма классов -- `codes`. Молчащего

@@ -3,8 +3,8 @@ package desired
 import "sync"
 
 const (
-	ApplyOK     = "ok"
-	ApplyFailed = "apply_failed"
+	ApplyOK       = "ok"
+	ApplyFailed   = "apply_failed"
 	Undecryptable = "undecryptable"
 )
 
