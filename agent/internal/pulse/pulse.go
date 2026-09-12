@@ -26,11 +26,14 @@ type AgentConf struct {
 // Message — кадр присутствия агента. Apply и hash появятся вместе с watch KV;
 // без манифеста они пустые, кадр всё равно уходит.
 type Message struct {
-	V          int    `json:"v"`
-	Kind       string `json:"kind"`
-	ID         string `json:"id"`
-	NodeID     string `json:"node_id"`
-	Hostname   string `json:"hostname"`
+	V        int    `json:"v"`
+	Kind     string `json:"kind"`
+	ID       string `json:"id"`
+	NodeID   string `json:"node_id"`
+	Hostname string `json:"hostname"`
+	// Version и Revision -- сборка агента, как в шапке кадра сервисов.
+	Version    string `json:"version,omitempty"`
+	Revision   string `json:"revision,omitempty"`
 	ConfigHash string `json:"config_hash,omitempty"`
 	Rev        *int   `json:"rev,omitempty"`
 	Apply      string `json:"apply,omitempty"`

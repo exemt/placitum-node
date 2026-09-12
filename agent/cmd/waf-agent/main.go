@@ -86,6 +86,8 @@ func run() error {
 	defer journal.Close()
 
 	log := journal.Log
+
+	log.Info("build", "version", version, "revision", revision)
 	slog.SetDefault(log)
 
 	agentID, err := id.Load(dataDir)
@@ -359,6 +361,7 @@ func beat(
 		io["log"] = logIO.Snapshot()
 	}
 	msg := pulse.Build(agentID, nodeID, traffic.Rate(), traffic.Status(), routes.Snapshot(), io)
+	msg.Version, msg.Revision = version, revision
 
 	msg.NginxManage = nginxManage
 

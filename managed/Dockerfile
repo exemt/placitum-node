@@ -65,7 +65,11 @@ RUN go mod download
 # нельзя ставить.
 RUN go test ./...
 
-RUN go build -trimpath -ldflags="-s -w" -o /out/waf-agent ./cmd/waf-agent
+# Сборка в бинарь: версия и ревизия видны в журнале старта и в кадре
+# присутствия, а не только в метках образа.
+ARG VERSION=dev
+ARG REVISION=unknown
+RUN go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.revision=${REVISION}" -o /out/waf-agent ./cmd/waf-agent
 
 FROM nginx:${NGINX_VERSION}-bookworm
 
@@ -92,4 +96,8 @@ COPY managed/entrypoint.sh /usr/local/bin/waf-node-entrypoint.sh
 RUN chmod +x /usr/local/bin/waf-node-entrypoint.sh \
     && mkdir -p /var/run/waf /var/lib/waf/store
 
+# Мастер nginx жив: pid-файл пишет он сам. Агент -- PID 1, его смерть роняет
+# контейнер и без проверки; своё присутствие он шлёт контроллеру.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD sh -c 'kill -0 "$(cat /var/run/nginx.pid)"'
 ENTRYPOINT ["/usr/local/bin/waf-node-entrypoint.sh"]

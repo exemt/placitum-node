@@ -3,7 +3,7 @@ module github.com/exemt/placitum-node/agent
 go 1.25.0
 
 require (
-	github.com/exemt/placitum-shared v0.3.0
+	github.com/exemt/placitum-shared v0.4.0
 	github.com/nats-io/nats.go v1.53.1
 	github.com/redis/go-redis/v9 v9.7.3
 )
