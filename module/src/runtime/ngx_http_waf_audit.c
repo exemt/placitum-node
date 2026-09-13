@@ -213,6 +213,35 @@ ngx_http_waf_route_verdict(ngx_http_waf_ctx_t *ctx)
 }
 
 
+static void
+ngx_http_waf_audit_deferred_cleanup(void *data)
+{
+    ngx_http_waf_audit_flush_deferred(data);
+}
+
+
+/*
+ * Отложить запись фазы запроса до исхода маршрута. Если исхода так и не будет
+ * -- клиент ушёл, пока ждали апстрим, -- запись уходит из cleanup запроса:
+ * там пул ещё жив. Cleanup пула для этого не годится, nginx обнуляет r->pool
+ * до его обхода, и собирать запись было бы не из чего.
+ */
+void
+ngx_http_waf_audit_defer(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_http_cleanup_t  *cln;
+
+    ctx->ph->audit_deferred = 1;
+
+    cln = ngx_http_cleanup_add(ctx->request, 0);
+
+    if (cln != NULL) {
+        cln->handler = ngx_http_waf_audit_deferred_cleanup;
+        cln->data    = ctx;
+    }
+}
+
+
 void
 ngx_http_waf_audit_flush_deferred(ngx_http_waf_ctx_t *ctx)
 {
@@ -1573,6 +1602,17 @@ ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx)
     }
 
     r = ctx->request;
+
+    /*
+     * Из cleanup пула запись не собрать: nginx обнуляет r->pool до его
+     * обхода. Всё, что обязано дописаться в конце запроса, пишет cleanup
+     * запроса (ngx_http_waf_audit_defer, журнал ответа); здесь -- страховка
+     * от падения воркера, а не способ записи.
+     */
+    if (r->pool == NULL) {
+        return;
+    }
+
     wmcf = ngx_http_get_module_main_conf(r, ngx_http_waf_module);
     wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
 

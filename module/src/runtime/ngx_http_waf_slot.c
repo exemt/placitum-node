@@ -187,6 +187,33 @@ ngx_http_waf_slot_acquire(ngx_http_waf_ctx_t *ctx)
 }
 
 
+/*
+ * rid без ожидания: фаза-журнал кладёт объекты в обменник, а ключ объекта
+ * держит rid. Слот берётся ради поколения и тут же отпускается -- ждать
+ * вердикта некому, а rid остаётся у запроса и по-прежнему уникален: поколение
+ * у следующего владельца слота уже другое.
+ */
+ngx_int_t
+ngx_http_waf_rid_assign(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_http_waf_slot_t  *slot;
+
+    if (ctx->slot != NGX_HTTP_WAF_SLOT_NIL) {
+        return NGX_OK;
+    }
+
+    slot = ngx_http_waf_slot_acquire(ctx);
+
+    if (slot == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_http_waf_slot_release(slot);
+
+    return NGX_OK;
+}
+
+
 ngx_http_waf_slot_t *
 ngx_http_waf_slot_lookup(uint64_t rid)
 {

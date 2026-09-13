@@ -785,6 +785,39 @@ try {
 
   bad.socket.destroy();
 
+  // --- журнал и поток без инспекторов кадров ---------------------------------
+  //
+  // /journal/: waf_audit_frames all, превью обеих сторон и архив c2s -- без
+  // единого инспектора кадров. Эхо приходит как обычно: кадр уходит
+  // получателю, не дожидаясь записи. /quiet/: ни инспекторов, ни записи
+  // кадров -- обработчик цепляется ради итога сессии, нагрузка идёт потоком,
+  // и кадр больше буфера потока проходит кусками.
+  const hsJ = await connectOrDie(port, { path: "/journal/chat" });
+  check("журнал: рукопожатие 101", hsJ.status, 101);
+
+  const rxJ = reader(hsJ.socket, hsJ.rest);
+  const journalOne = JSON.stringify({ type: "msg", text: "журнал раз" });
+  const journalTwo = JSON.stringify({ type: "msg", text: "журнал два" });
+  hsJ.socket.write(text(journalOne));
+  hsJ.socket.write(text(journalTwo));
+
+  check("журнал: оба эха вернулись", await rxJ.wait(2), true);
+  check("журнал: эхо цело и по порядку",
+    assemble(rxJ.frames).map((f) => f.payload.toString("utf8")).join("|"),
+    `${journalOne}|${journalTwo}`);
+  hsJ.socket.destroy();
+
+  const hsQuiet = await connectOrDie(port, { path: "/quiet/chat" });
+  check("поток: рукопожатие 101", hsQuiet.status, 101);
+
+  const rxQuiet = reader(hsQuiet.socket, hsQuiet.rest);
+  const quietMsg = "x".repeat(70000);
+  hsQuiet.socket.write(text(quietMsg));
+
+  check("поток: эхо кадра больше буфера вернулось", await rxQuiet.wait(1, 5000), true);
+  check("поток: эхо цело", assemble(rxQuiet.frames)[0]?.payload.toString("utf8"), quietMsg);
+  hsQuiet.socket.destroy();
+
   await sleep(300);
 
   // --- сколько записей увидел модуль ----------------------------------------
@@ -793,7 +826,8 @@ try {
 
   const count = (re) => (logs.match(re) ?? []).length;
 
-  check("лог: четырнадцать записей на рукопожатия", count(/waf: allow phase request/g), 14);
+  // четырнадцать спрошенных маршрутов и два без инспекторов кадров
+  check("лог: шестнадцать записей на рукопожатия", count(/waf: allow phase request/g), 16);
   // плохой UA, GET без апгрейда и рукопожатие с забаненного адреса
   check("лог: три отказа рукопожатия записаны", count(/waf: deny phase request/g), 3);
   check("лог: снятие расширения записано", count(/stripped 1 websocket extension/g), 1);
@@ -805,7 +839,7 @@ try {
   // сессия 1: инъекция; 2: схема; 4: двоичный; 7: счётчик; /local/: лимит и
   // список; /quota/: бан. Фрагменты (сессия 5) теперь собираются и проходят.
   check("лог: семь отказанных кадров", count(/waf: deny phase frame/g), 7);
-  check("лог: четырнадцать сессий кадров закрыты", count(/waf: frame session closed/g), 14);
+  check("лог: шестнадцать сессий кадров закрыты", count(/waf: frame session closed/g), 16);
   // /ws2/: две подмены и собранное сообщение; /quota/: четыре кадра ошибкой
   check("лог: семь подмен полезной нагрузки", count(/waf: (c2s|s2c) frame payload rewritten/g), 7);
   check("лог: подмена в обе стороны",
@@ -852,7 +886,12 @@ try {
     frames.filter((r) => r.frame?.rewritten === true).length, 7);
   // /quota/ пишет все кадры: у подменённых видно, что просьба mutate дошла
   // -- rewrite_quota среди участников, а у седьмого код local_list.
-  const quota = frames.filter((r) => r.route?.location === "/quota/");
+  // Спрошенная сторона -- c2s: эхо приложения на /quota/ никто не судит, и при
+  // waf_audit_frames all оно пишется журналом, без участников.
+  const quota = frames.filter((r) => r.route?.location === "/quota/" && r.frame?.direction === "c2s");
+  check("аудит: эхо квоты записано журналом, без инспекторов",
+    frames.filter((r) => r.route?.location === "/quota/" && r.frame?.direction === "s2c")
+      .every((r) => Object.keys(r.inspectors ?? {}).join(",") === "module"), true);
   check("аудит: кадры квоты записаны с участниками", quota.length, 7);
   check("аудит: у подменённых кадров квоты rewrite_quota среди участников",
     quota.filter((r) => r.frame?.rewritten === true)
@@ -920,11 +959,42 @@ try {
     .map((r) => r.ray));
   const policyClosed = sessions
     .filter((r) => r.session?.close_reason === "waf_deny" && !localDenied.has(r.ray)).length;
+  // Журнал без инспекторов: каждый кадр обеих сторон записан, у c2s -- архив.
+  const journal = frames.filter((r) => r.route?.location === "/journal/");
+  const journalC2s = journal.filter((r) => r.frame?.direction === "c2s");
+  const journalS2c = journal.filter((r) => r.frame?.direction === "s2c");
+
+  check("журнал: записаны оба кадра клиента и оба эха",
+    `${journalC2s.length}/${journalS2c.length}`, "2/2");
+  check("журнал: у кадров без инспекторов вердикт allow и пустой состав",
+    journal.every((r) => r.verdict === "allow"
+      && Object.keys(r.inspectors ?? {}).join(",") === "module"), true);
+  check("журнал: срез нагрузки и body_preview у каждой записи",
+    journal.every((r) => (r.frame?.payload_preview ?? "").includes("журнал")
+      && (r.body_preview ?? "").includes("журнал")), true);
+  check("журнал: архив c2s с адресом объекта :frm",
+    journalC2s.every((r) => r.store?.archive?.body?.ttl === 3600
+      && /^ws:[0-9a-f]+:frm$/.test(r.store?.body?.key ?? "")), true);
+  check("журнал: у s2c архива нет", journalS2c.every((r) => r.store?.archive === undefined), true);
+  check("журнал: архивированные кадры лежат в обменнике",
+    journalC2s.every((r) => kept.includes(r.store?.body?.key)), true);
+
+  // Поток: записей кадров нет вовсе, итог сессии -- есть.
+  check("поток: записей кадров нет", frames.filter((r) => r.route?.location === "/quiet/").length, 0);
+
+  const quietSession = sessions.find((r) => r.route?.location === "/quiet/");
+  const journalSession = sessions.find((r) => r.route?.location === "/journal/");
+  check("поток: итог сессии записан, кадр туда и эхо обратно",
+    `${quietSession?.session?.frames_c2s}/${quietSession?.session?.frames_s2c}`, "1/1");
+  check("поток: байты кадра больше буфера посчитаны",
+    (quietSession?.session?.bytes_c2s ?? 0) > 70000 && (quietSession?.session?.bytes_s2c ?? 0) > 70000, true);
+  check("журнал: итог сессии записан", `${journalSession?.session?.frames_c2s}/${journalSession?.session?.frames_s2c}`, "2/2");
+
   check("обменник: каждый архивированный кадр лежит в обменнике",
     deniedWs.length > 0 && deniedWs.every((r) => kept.includes(r.store?.body?.key)), true);
   check("обменник: сверх архива — только застрявшие при закрытии кадры",
-    kept.length, deniedWs.length + policyClosed);
-  check("аудит: четырнадцать сессий", sessions.length, 14);
+    kept.length, deniedWs.length + journalC2s.length + policyClosed);
+  check("аудит: шестнадцать сессий", sessions.length, 16);
   check("аудит: сессия под ray рукопожатия",
     sessions.every((r) => r.ray === r.session?.conn_id && handshakes.has(r.ray)), true);
   check("аудит: семь сессий с отказом",
@@ -932,8 +1002,8 @@ try {
   check("аудит: у сессии есть причина закрытия",
     sessions.every((r) => (r.session?.close_reason ?? "") !== ""), true);
   // Рукопожатия без кадров (расширения, plain) тоже сессии: с нулями.
-  check("аудит: двенадцать сессий с кадрами",
-    sessions.filter((r) => (r.session?.frames_c2s ?? 0) + (r.session?.frames_s2c ?? 0) > 0).length, 12);
+  check("аудит: четырнадцать сессий с кадрами",
+    sessions.filter((r) => (r.session?.frames_c2s ?? 0) + (r.session?.frames_s2c ?? 0) > 0).length, 14);
   // Итоги сессии видят кеш, сборку и отброшенные контрольные кадры.
   check("аудит: сессия с вердиктом из кеша",
     sessions.filter((r) => (r.session?.frames_cached ?? 0) > 0).length, 1);

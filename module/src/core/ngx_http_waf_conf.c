@@ -682,11 +682,6 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
         ngx_http_waf_merge_archive(&conf->shoot[i], &prev->shoot[i]);
 
-        rv = ngx_http_waf_check_archive_reload(cf, conf, i);
-        if (rv != NGX_CONF_OK) {
-            return rv;
-        }
-
         rv = ngx_http_waf_merge_preview(cf, wmcf, conf, prev, i);
         if (rv != NGX_CONF_OK) {
             return rv;
@@ -696,6 +691,24 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     rv = ngx_http_waf_merge_waves(cf, wmcf, conf);
     if (rv != NGX_CONF_OK) {
         return rv;
+    }
+
+    /*
+     * Архив и превью против снимка -- после волн: снимок бывает только у
+     * фазы, где спрашивают. Фаза без инспекторов пишет журнал, и её архив и
+     * превью берутся из трафика, а не из того, что сняли бы для волн.
+     */
+    for (i = 0; i < NGX_HTTP_WAF_NPHASE; i++) {
+
+        rv = ngx_http_waf_check_archive_reload(cf, conf, i);
+        if (rv != NGX_CONF_OK) {
+            return rv;
+        }
+
+        rv = ngx_http_waf_check_preview_reload(cf, conf, i);
+        if (rv != NGX_CONF_OK) {
+            return rv;
+        }
     }
 
     rv = ngx_http_waf_check_scoring(cf, wmcf, conf);
@@ -1100,9 +1113,11 @@ static char *
 ngx_http_waf_check_archive_reload(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase)
 {
-    ngx_uint_t                  i, bit, captured, reloading;
+    ngx_uint_t                  i, bit, captured, reloading, inspected;
     size_t                      limit, cap;
     ngx_http_waf_shoot_conf_t  *sh = &conf->shoot[phase];
+
+    inspected = ngx_http_waf_phase_inspected(conf, phase);
 
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
         bit = NGX_HTTP_WAF_OBJ_BIT(i);
@@ -1134,8 +1149,31 @@ ngx_http_waf_check_archive_reload(ngx_conf_t *cf,
                 return NGX_CONF_ERROR;
             }
 
-            if (ngx_http_waf_reload_wider(cf, phase, "waf_archive", i, limit,
-                                          cap)
+            /*
+             * Держать сверх снимка ответ и кадр не умеют, пока их держат ради
+             * волн. Журнал фазы без инспекторов снимает копию сам и в
+             * размере архива -- ему шире некуда.
+             */
+            if (inspected
+                && ngx_http_waf_reload_wider(cf, phase, "waf_archive", i,
+                                             limit, cap)
+                   != NGX_CONF_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        /*
+         * Фаза без инспекторов: снимка нет, и архиву не с чем сверяться.
+         * Объект кладёт журнал в размере архива, со списками снимка, если
+         * они названы, -- остаётся потолок чтения.
+         */
+        if (!inspected) {
+
+            if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_archive",
+                                                i, limit)
                 != NGX_CONF_OK)
             {
                 return NGX_CONF_ERROR;
@@ -1267,9 +1305,11 @@ static char *
 ngx_http_waf_check_preview_reload(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase)
 {
-    ngx_uint_t                  i, bit, captured, reloading;
+    ngx_uint_t                  i, bit, captured, reloading, inspected;
     size_t                      cap;
     ngx_http_waf_shoot_conf_t  *sh = &conf->shoot[phase];
+
+    inspected = ngx_http_waf_phase_inspected(conf, phase);
 
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
         bit = NGX_HTTP_WAF_OBJ_BIT(i);
@@ -1294,13 +1334,23 @@ ngx_http_waf_check_preview_reload(ngx_conf_t *cf,
                 return NGX_CONF_ERROR;
             }
 
-            if (ngx_http_waf_reload_wider(cf, phase, "waf_preview", i,
-                                          sh->preview_reload_limit[i], cap)
-                != NGX_CONF_OK)
+            if (inspected
+                && ngx_http_waf_reload_wider(cf, phase, "waf_preview", i,
+                                             sh->preview_reload_limit[i], cap)
+                   != NGX_CONF_OK)
             {
                 return NGX_CONF_ERROR;
             }
 
+            continue;
+        }
+
+        /*
+         * Фаза без инспекторов: превью берётся из трафика со списками снимка,
+         * а не из снимка, которого нет. Предел бюджета уже проверен слиянием
+         * (ngx_http_waf_preview_budget).
+         */
+        if (!inspected) {
             continue;
         }
 
@@ -1708,5 +1758,9 @@ ngx_http_waf_merge_preview(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
 
     (void) wmcf;
 
-    return ngx_http_waf_check_preview_reload(cf, conf, phase);
+    /*
+     * Превью против снимка сверяется позже, после волн: у фазы без
+     * инспекторов снимка нет, и узнать это можно только по волнам.
+     */
+    return NGX_CONF_OK;
 }

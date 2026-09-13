@@ -326,6 +326,17 @@ void       ngx_http_waf_needs_write(ngx_http_waf_jw_t *jw,
 ngx_int_t  ngx_http_waf_store_reload(ngx_http_waf_ctx_t *ctx);
 ngx_uint_t ngx_http_waf_store_reload_needs_body(ngx_http_waf_ctx_t *ctx);
 
+/*
+ * Сколько объекта кладёт перекладка перед агентом на этом запросе: reload
+ * маршрута, архив фазы-журнала, просьбы соседей. (size_t) -1 -- целиком,
+ * ноль -- не кладёт.
+ */
+size_t     ngx_http_waf_store_reload_size(ngx_http_waf_ctx_t *ctx,
+               ngx_uint_t obj);
+
+/* Тело текущей фазы цепочкой: запрос, удержанный ответ либо кадр. */
+ngx_chain_t *ngx_http_waf_body_chain(ngx_http_waf_ctx_t *ctx);
+
 /* Суффикс ключа, которым модуль называет свой объект (hdr, arg): инспектору под rewrite не отдаётся. */
 ngx_uint_t ngx_http_waf_obj_suffix_reserved(ngx_str_t *suffix);
 

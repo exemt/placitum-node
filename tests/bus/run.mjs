@@ -898,6 +898,16 @@ try {
   check("запись по просьбе: запрос прошёл", status(request("/audit-on/index.html")), 200);
   check("обе записи с фазы запроса: запрос прошёл", status(request("/audit-rsp/index.html")), 200);
   check("обе записи с фазы ответа: запрос прошёл", status(request("/audit-rsp-late/index.html")), 200);
+
+  // Журнал без инспекторов: запрос с телом и ответ приложения. Архив оставляет
+  // ключи агенту -- поэтому здесь, после сканов "ключей не осталось".
+  check("журнал запроса: POST с телом дошёл до апстрима",
+    status(request("/journal-req/?q=journal", [
+      "-X", "POST", "-H", "X-Journal-Secret: s3cr3t-journal",
+      "-H", "Content-Type: text/plain", "--data", "journal-body-payload",
+    ])), 200);
+  check("журнал ответа: ответ приложения дошёл целиком",
+    body(request("/journal-rsp/")).includes("WAF-CANARY-0badc0de"), true);
   await sleep(300);
 
   // --- запись аудита --------------------------------------------------------
@@ -1011,6 +1021,64 @@ try {
       lateRsp.store?.archive?.body?.ttl, 333);
     check("обе записи с фазы ответа: превью заголовков ответа без waf_preview",
       Array.isArray(lateRsp.headers_preview) && lateRsp.headers_preview.length > 0, true);
+  }
+
+  // --- журнал без инспекторов -------------------------------------------------
+  //
+  // /journal-req/ и /journal-rsp/ никого не спрашивают, а записи и архив есть:
+  // превью заголовков, строки и тела у запроса, заголовков и тела у ответа.
+  // Объекты лежат в обменнике под rid, а не под прочерками, и маска снимка на
+  // заголовках действует и в превью, и в обменнике.
+  const jReq = records.find((rec) => rec.phase === "request"
+    && /\/journal-req\/$/.test(rec.http?.uri ?? ""));
+  const jRsp = records.find((rec) => rec.phase === "response"
+    && /\/journal-rsp\/$/.test(rec.http?.uri ?? ""));
+
+  check("журнал запроса: запись есть", Boolean(jReq), true);
+  check("журнал ответа: запись фазы ответа есть", Boolean(jRsp), true);
+
+  if (jReq) {
+    check("журнал запроса: в составе только модуль",
+      Object.keys(jReq.inspectors ?? {}).join(","), "module");
+    check("журнал запроса: превью тела", /journal-body-payload/.test(jReq.body_preview ?? ""), true);
+    check("журнал запроса: превью строки",
+      JSON.stringify(jReq.args_preview ?? []).includes("journal"), true);
+    check("журнал запроса: секрет в превью замаскирован",
+      JSON.stringify(jReq.headers_preview ?? []).includes("s3cr3t-journal"), false);
+    check("журнал запроса: архив заголовков, строки и тела",
+      [jReq.store?.archive?.headers?.ttl, jReq.store?.archive?.args?.ttl,
+        jReq.store?.archive?.body?.ttl].join(","), "3600,3600,3600");
+    check("журнал запроса: ключ под rid, не под прочерками",
+      /^bus:[0-9a-f]+:req:hdr$/.test(jReq.store?.headers?.key ?? ""), true);
+
+    const hdrKept = docker([
+      "exec", `${tag}-redis`, "redis-cli", "GET", jReq.store?.headers?.key ?? "none",
+    ]).stdout;
+    check("журнал запроса: заголовки лежат в обменнике", /x-journal-secret/i.test(hdrKept), true);
+    check("журнал запроса: в обменнике секрет -- sha256, не значение",
+      hdrKept.includes("s3cr3t-journal"), false);
+
+    const bodyKept = docker([
+      "exec", `${tag}-redis`, "redis-cli", "GET", jReq.store?.body?.key ?? "none",
+    ]).stdout;
+    check("журнал запроса: тело лежит в обменнике", bodyKept.includes("journal-body-payload"), true);
+  }
+
+  if (jRsp) {
+    check("журнал ответа: в составе только модуль",
+      Object.keys(jRsp.inspectors ?? {}).join(","), "module");
+    check("журнал ответа: код приложения", jRsp.http?.upstream_status, 200);
+    check("журнал ответа: превью заголовков ответа",
+      JSON.stringify(jRsp.headers_preview ?? []).toLowerCase().includes("content-type"), true);
+    check("журнал ответа: превью тела -- ответ, а не запрос",
+      /WAF-CANARY-0badc0de/.test(jRsp.body_preview ?? ""), true);
+    check("журнал ответа: архив заголовков и тела",
+      [jRsp.store?.archive?.headers?.ttl, jRsp.store?.archive?.body?.ttl].join(","), "3600,3600");
+
+    const rspKept = docker([
+      "exec", `${tag}-redis`, "redis-cli", "GET", jRsp.store?.body?.key ?? "none",
+    ]).stdout;
+    check("журнал ответа: тело ответа лежит в обменнике", rspKept.includes("WAF-CANARY-0badc0de"), true);
   }
 
   const leakRecords = records.filter((rec) => /rsp-leak\/$/.test(rec.http?.uri ?? ""));

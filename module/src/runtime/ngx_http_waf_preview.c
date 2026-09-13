@@ -63,8 +63,8 @@ static void ngx_http_waf_preview_lists(ngx_http_waf_ctx_t *ctx,
     ngx_array_t **deny, ngx_array_t **mask, ngx_array_t **cap_deny,
     ngx_array_t **cap_mask);
 static void ngx_http_waf_preview_hash(ngx_str_t *src, u_char hex[64]);
-static size_t ngx_http_waf_preview_take(ngx_http_request_t *r, u_char *dst,
-    size_t size);
+static size_t ngx_http_waf_preview_take(ngx_http_request_t *r,
+    ngx_chain_t *in, u_char *dst, size_t size);
 
 
 /*
@@ -124,6 +124,21 @@ ngx_http_waf_preview_room_ctx(ngx_http_waf_ctx_t *ctx)
     }
 
     return room + ngx_http_waf_preview_overhead();
+}
+
+
+/* Бюджет превью тела на этом запросе: сколько тела ответа держать для записи. */
+size_t
+ngx_http_waf_preview_body_budget(ngx_http_waf_ctx_t *ctx)
+{
+    size_t                    budget[NGX_HTTP_WAF_OBJ_COUNT];
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    ngx_http_waf_preview_budgets(ctx, wlcf, budget);
+
+    return budget[NGX_HTTP_WAF_OBJ_BODY];
 }
 
 
@@ -413,6 +428,7 @@ ngx_http_waf_preview_body(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
 {
     u_char                     *buf;
     size_t                      len, room, budget[NGX_HTTP_WAF_OBJ_COUNT];
+    ngx_chain_t                *cl;
     ngx_http_request_t         *r = ctx->request;
 
     ngx_http_waf_preview_budgets(ctx, wlcf, budget);
@@ -471,7 +487,15 @@ ngx_http_waf_preview_body(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
         return;
     }
 
-    if (r->request_body == NULL || r->request_body->bufs == NULL) {
+    /*
+     * Тело своей фазы: прочитанный запрос, копия ответа (удержанная волнами
+     * либо снятая журналом), полезная нагрузка кадра. Раньше здесь всегда
+     * читался запрос, и запись ответа без объекта в обменнике показывала бы
+     * тело запроса.
+     */
+    cl = ngx_http_waf_body_chain(ctx);
+
+    if (cl == NULL) {
         return;                        /* тело не читалось -- секции нет */
     }
 
@@ -484,7 +508,7 @@ ngx_http_waf_preview_body(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
         return;
     }
 
-    len = ngx_http_waf_preview_take(r, buf, room);
+    len = ngx_http_waf_preview_take(r, cl, buf, room);
     if (len == 0) {
         return;
     }
@@ -844,7 +868,8 @@ ngx_http_waf_preview_listed(ngx_array_t *list, ngx_str_t *name)
  * префикс, не всё тело.
  */
 static size_t
-ngx_http_waf_preview_take(ngx_http_request_t *r, u_char *dst, size_t size)
+ngx_http_waf_preview_take(ngx_http_request_t *r, ngx_chain_t *in, u_char *dst,
+    size_t size)
 {
     off_t         pos;
     size_t        taken, avail;
@@ -854,7 +879,7 @@ ngx_http_waf_preview_take(ngx_http_request_t *r, u_char *dst, size_t size)
 
     taken = 0;
 
-    for (cl = r->request_body->bufs; cl != NULL && taken < size; cl = cl->next) {
+    for (cl = in; cl != NULL && taken < size; cl = cl->next) {
         b = cl->buf;
 
         if (b->in_file) {

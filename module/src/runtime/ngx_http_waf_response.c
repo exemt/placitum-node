@@ -24,6 +24,7 @@
 
 #include "ngx_http_waf.h"
 #include "body/ngx_http_waf_body.h"
+#include "runtime/ngx_http_waf_preview.h"
 
 
 static ngx_int_t ngx_http_waf_header_filter(ngx_http_request_t *r);
@@ -48,6 +49,14 @@ static void ngx_http_waf_rewrite_fail(ngx_http_waf_ctx_t *ctx,
                      ngx_uint_t index, const char *why);
 static ngx_int_t ngx_http_waf_rewrite_swap(ngx_http_waf_ctx_t *ctx,
                      ngx_http_waf_body_op_t *op);
+static ngx_uint_t ngx_http_waf_response_journal_wanted(ngx_http_request_t *r,
+                      ngx_http_waf_ctx_t *ctx, ngx_http_waf_loc_conf_t *wlcf);
+static ngx_int_t ngx_http_waf_response_journal_start(ngx_http_waf_ctx_t *ctx);
+static ngx_int_t ngx_http_waf_response_journal_body(ngx_http_waf_ctx_t *ctx,
+                     ngx_chain_t *in);
+static void ngx_http_waf_response_journal_finish(ngx_http_waf_ctx_t *ctx);
+static void ngx_http_waf_response_journal_resume(ngx_http_waf_ctx_t *ctx);
+static void ngx_http_waf_response_journal_cleanup(void *data);
 
 
 /*
@@ -112,10 +121,21 @@ ngx_http_waf_header_filter(ngx_http_request_t *r)
 
     wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
 
-    if (!wlcf->enable
-        || wlcf->waves[NGX_HTTP_WAF_PHASE_RESPONSE] == NULL
-        || wlcf->waves[NGX_HTTP_WAF_PHASE_RESPONSE]->nelts == 0)
-    {
+    if (!wlcf->enable) {
+        return ngx_http_next_header_filter(r);
+    }
+
+    if (!ngx_http_waf_phase_inspected(wlcf, NGX_HTTP_WAF_PHASE_RESPONSE)) {
+
+        /*
+         * Спрашивать на ответе некого, но записать его маршрут может велеть
+         * (waf_preview, waf_archive): журнал идёт мимо удержания, и клиент
+         * ничего не ждёт.
+         */
+        if (ngx_http_waf_response_journal_wanted(r, ctx, wlcf)) {
+            return ngx_http_waf_response_journal_start(ctx);
+        }
+
         return ngx_http_next_header_filter(r);
     }
 
@@ -330,7 +350,14 @@ ngx_http_waf_strip_accept_encoding(ngx_http_waf_ctx_t *ctx)
     wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
     sh   = &wlcf->shoot[NGX_HTTP_WAF_PHASE_RESPONSE];
 
-    strip = (sh->capture & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY)) != 0;
+    /*
+     * Тело ответа нужно не только снимку: превью и архив журнала пишут его и
+     * без инспекторов, и сжатое тело в записи так же бесполезно. У фазы с
+     * инспекторами оба уже внутри снимка (nginx -t), и там ничего не меняется.
+     */
+    strip = ((sh->capture | sh->archive)
+             & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY)) != 0
+            || sh->preview[NGX_HTTP_WAF_OBJ_BODY] != 0;
 
     if (wlcf->strip_accept_encoding != NGX_CONF_UNSET) {
         strip = (ngx_uint_t) wlcf->strip_accept_encoding;
@@ -588,6 +615,12 @@ ngx_http_waf_response_resume(ngx_http_waf_ctx_t *ctx)
     ngx_int_t            rc;
     ngx_http_request_t  *r = ctx->request;
 
+    /* журнал ответа: исхода нет, ждали только обменник */
+    if (ctx->rsp_journal) {
+        ngx_http_waf_response_journal_resume(ctx);
+        return;
+    }
+
     ctx->waiting = 0;
 
     /*
@@ -603,12 +636,7 @@ ngx_http_waf_response_resume(ngx_http_waf_ctx_t *ctx)
         return;                        /* колбэк обменника вернёт нас сюда */
     }
 
-    if (ctx->state == NGX_HTTP_WAF_ST_NEXT_WAVE) {
-        rc = ngx_http_waf_wave_start(ctx, ctx->ph->wave);
-
-    } else {
-        rc = ngx_http_waf_phase_apply(ctx);
-    }
+    rc = ngx_http_waf_phase_resume(ctx);
 
     if (rc == NGX_DONE) {
         /* Следующая волна опубликована либо обменник ещё пишет: ждём дальше. */
@@ -1001,6 +1029,10 @@ ngx_http_waf_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         }
     }
 
+    if (ctx != NULL && ctx->rsp_journal && r == r->main) {
+        return ngx_http_waf_response_journal_body(ctx, in);
+    }
+
     if (ctx == NULL || r != r->main || !ctx->rsp_entered || ctx->rsp_settled) {
         return ngx_http_next_body_filter(r, in);
     }
@@ -1116,4 +1148,301 @@ ngx_http_waf_hold_chain(ngx_http_waf_ctx_t *ctx, ngx_chain_t *in)
     }
 
     return NGX_OK;
+}
+
+
+/* --- журнал ответа --------------------------------------------------------- */
+
+/*
+ * Писать ли ответ, которого никто не спрашивает. Вход тот же, что у фазы с
+ * инспекторами (ngx_http_waf_response_bypass), кроме тела: журнал ничего не
+ * держит, и ответ без тела -- HEAD, 204, 304 -- пишется заголовками.
+ */
+static ngx_uint_t
+ngx_http_waf_response_journal_wanted(ngx_http_request_t *r,
+    ngx_http_waf_ctx_t *ctx, ngx_http_waf_loc_conf_t *wlcf)
+{
+    ngx_http_waf_audit_ovr_t  *ovr;
+
+    /* записи уходят агенту: без сокета журналу писать некуда */
+    if (!ngx_http_waf_audit_enabled()) {
+        return 0;
+    }
+
+    /* подзапрос -- не ответ клиенту; после 101 -- фаза кадров */
+    if (r != r->main
+        || r->headers_out.status == NGX_HTTP_SWITCHING_PROTOCOLS)
+    {
+        return 0;
+    }
+
+    /* своя страница отказа фазы запроса: о ней написала сама фаза */
+    if (ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST].verdict == NGX_HTTP_WAF_V_DENY
+        || ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST].fail_blocked)
+    {
+        return 0;
+    }
+
+    if (ngx_http_waf_preview_room(wlcf, NGX_HTTP_WAF_PHASE_RESPONSE) != 0
+        || wlcf->shoot[NGX_HTTP_WAF_PHASE_RESPONSE].archive != 0)
+    {
+        return 1;
+    }
+
+    /* запись и архив ответа, о которых попросил инспектор фазы запроса */
+    ovr = &ctx->audit_ovr[NGX_HTTP_WAF_OVR_RESPONSE];
+
+    return ovr->audit.set == NGX_HTTP_WAF_SET_ON
+           || ovr->archive.set == NGX_HTTP_WAF_SET_ON;
+}
+
+
+static ngx_int_t
+ngx_http_waf_response_journal_start(ngx_http_waf_ctx_t *ctx)
+{
+    size_t                     need, one;
+    ngx_int_t                  rc;
+    ngx_http_cleanup_t        *cln;
+    ngx_http_request_t        *r = ctx->request;
+    ngx_http_waf_loc_conf_t   *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+
+    /*
+     * Запись уходит и тогда, когда ответ оборвался до last_buf: её пишет
+     * cleanup запроса, с тем, что успели снять. Именно запроса, а не пула:
+     * nginx обнуляет r->pool до обхода cleanup пула, и запись там собирать не
+     * из чего. Нет места под cleanup -- нет и журнала; ответ от этого не
+     * страдает.
+     */
+    cln = ngx_http_cleanup_add(r, 0);
+    if (cln == NULL) {
+        return ngx_http_next_header_filter(r);
+    }
+
+    cln->handler = ngx_http_waf_response_journal_cleanup;
+    cln->data    = ctx;
+
+    ctx->rsp_status = r->headers_out.status;
+
+    /*
+     * Заголовки -- до следующих фильтров, как у фазы с инспекторами: запись
+     * показывает ответ приложения, а не то, что допишут Server и Date.
+     */
+    if (ngx_http_waf_response_headers(ctx) == NULL) {
+        return ngx_http_next_header_filter(r);
+    }
+
+    if (r->upstream != NULL && r->upstream->state != NULL) {
+        ctx->upstream_ms = r->upstream->state->response_time;
+    }
+
+    ngx_http_waf_phase_enter(ctx, NGX_HTTP_WAF_PHASE_RESPONSE);
+
+    ctx->started     = ngx_current_msec;
+    ctx->state       = NGX_HTTP_WAF_ST_INIT;
+    ctx->ph->journal = 1;
+
+    ctx->rsp_entered = 1;
+    ctx->rsp_journal = 1;
+    ctx->hold_last   = &ctx->hold;
+
+    /*
+     * Сколько тела копировать: превью и то, что положит архив на этом исходе,
+     * -- не больше waf_body_limit ответа. Остальное уходит клиенту, не
+     * задерживаясь и не копируясь.
+     */
+    need = ngx_http_waf_preview_body_budget(ctx);
+    one  = ngx_http_waf_store_reload_size(ctx, NGX_HTTP_WAF_OBJ_BODY);
+
+    if (one > need) {
+        need = one;
+    }
+
+    ctx->rsp_journal_need = ngx_min(need,
+                                    wlcf->body_limit[NGX_HTTP_WAF_PHASE_RESPONSE]);
+
+    rc = ngx_http_next_header_filter(r);
+
+    /*
+     * Тела не будет: HEAD, 204, 304. header_only ставит сам
+     * ngx_http_header_filter, уже после нас, а last_buf у такого ответа может
+     * и не пройти через фильтр тела. Пишем сейчас.
+     */
+    if (r->header_only && rc != NGX_ERROR) {
+        ngx_http_waf_response_journal_finish(ctx);
+    }
+
+    return rc;
+}
+
+
+/*
+ * Тело ответа мимо удержания. Префикс в rsp_journal_need копируется до отдачи
+ * дальше: следующий фильтр вправе сдвинуть позиции буферов, а апстрим
+ * переиспользует их сразу после возврата. Сам ответ уходит как пришёл и когда
+ * пришёл.
+ */
+static ngx_int_t
+ngx_http_waf_response_journal_body(ngx_http_waf_ctx_t *ctx, ngx_chain_t *in)
+{
+    off_t                size;
+    size_t               take;
+    u_char              *p;
+    ngx_int_t            rc;
+    ngx_uint_t           last;
+    ngx_buf_t           *b;
+    ngx_chain_t         *cl, *copy;
+    ngx_http_request_t  *r = ctx->request;
+
+    last = 0;
+
+    for (cl = in; cl != NULL && !ctx->rsp_journal_done; cl = cl->next) {
+
+        if (cl->buf->last_buf) {
+            last = 1;
+        }
+
+        size = ngx_buf_size(cl->buf);
+
+        if (size <= 0) {
+            continue;
+        }
+
+        ctx->rsp_journal_total += size;
+
+        if (ctx->hold_size >= ctx->rsp_journal_need) {
+            continue;
+        }
+
+        take = (size_t) ngx_min(size,
+                                (off_t) (ctx->rsp_journal_need
+                                         - ctx->hold_size));
+
+        b    = ngx_calloc_buf(r->pool);
+        copy = ngx_alloc_chain_link(r->pool);
+        p    = NULL;
+
+        if (b != NULL && copy != NULL && ngx_buf_in_memory(cl->buf)) {
+            p = ngx_pnalloc(r->pool, take);
+        }
+
+        if (b == NULL || copy == NULL
+            || (ngx_buf_in_memory(cl->buf) && p == NULL))
+        {
+            /* журнал не вправе сорвать сам ответ: копия кончается здесь */
+            ctx->rsp_journal_need = ctx->hold_size;
+            continue;
+        }
+
+        if (p != NULL) {
+            ngx_memcpy(p, cl->buf->pos, take);
+
+            b->start  = p;
+            b->pos    = p;
+            b->last   = p + take;
+            b->end    = p + take;
+            b->memory = 1;
+
+        } else {
+            /* файл живёт до конца запроса: копируется окно, а не байты */
+            b->in_file   = 1;
+            b->file      = cl->buf->file;
+            b->file_pos  = cl->buf->file_pos;
+            b->file_last = cl->buf->file_pos + (off_t) take;
+        }
+
+        copy->buf  = b;
+        copy->next = NULL;
+
+        *ctx->hold_last = copy;
+        ctx->hold_last  = &copy->next;
+        ctx->hold_size += take;
+    }
+
+    rc = ngx_http_next_body_filter(r, in);
+
+    if (last && !ctx->rsp_journal_done) {
+        ctx->rsp_last = 1;
+        ngx_http_waf_response_journal_finish(ctx);
+    }
+
+    return rc;
+}
+
+
+/*
+ * Ответ отдан целиком: объекты -- в обменник, запись -- агенту. Исхода у
+ * журнала нет, поэтому и применять нечего: перекладка и строка лога.
+ */
+static void
+ngx_http_waf_response_journal_finish(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_http_request_t  *r = ctx->request;
+
+    ctx->rsp_journal_done = 1;
+    ctx->ph->body_ready   = 1;
+    ctx->state            = NGX_HTTP_WAF_ST_DONE;
+
+    if (ngx_http_waf_store_reload(ctx) == NGX_AGAIN) {
+        /*
+         * Ответ у клиента, запись ждёт ключей обменника. Запрос держится
+         * своей ссылкой, как при чтении тела: финализация nginx проходит как
+         * обычно и отпускает только свою, а клиент, закрывший соединение
+         * сразу за ответом, записи уже не срывает. Не r->buffered: при нём
+         * nginx ставит ngx_http_test_reading, и такой клиент обрывал бы
+         * запрос вместе с архивом. Ссылку отпускает возобновление.
+         */
+        ctx->state            = NGX_HTTP_WAF_ST_RELOADING;
+        ctx->waiting          = 1;
+        ctx->rsp_journal_held = 1;
+        r->main->count++;
+        return;
+    }
+
+    ngx_http_waf_log_verdict(ctx);
+}
+
+
+static void
+ngx_http_waf_response_journal_resume(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_http_request_t  *r = ctx->request;
+
+    ctx->waiting = 0;
+    ctx->state   = NGX_HTTP_WAF_ST_DONE;
+
+    ngx_http_waf_log_verdict(ctx);
+
+    if (!ctx->rsp_journal_held) {
+        return;
+    }
+
+    ctx->rsp_journal_held = 0;
+
+    /*
+     * NGX_DONE отпускает нашу ссылку; последняя -- доигрывает соединение:
+     * keepalive или закрытие, как решила бы сама финализация. После этого
+     * запроса может уже не быть, и ни r, ни r->connection трогать нельзя.
+     */
+    ngx_http_finalize_request(r, NGX_DONE);
+}
+
+
+/*
+ * Ответ оборвался до last_buf -- клиент ушёл, апстрим упал, -- либо обменник
+ * не ответил до конца запроса. Запись всё равно уходит: с тем, что успели
+ * снять, и без объектов, класть которые уже некуда.
+ */
+static void
+ngx_http_waf_response_journal_cleanup(void *data)
+{
+    ngx_http_waf_ctx_t  *ctx = data;
+
+    if (!ctx->rsp_journal || ctx->phases[NGX_HTTP_WAF_PHASE_RESPONSE].logged) {
+        return;
+    }
+
+    ngx_http_waf_phase_enter(ctx, NGX_HTTP_WAF_PHASE_RESPONSE);
+    ngx_http_waf_log_verdict(ctx);
 }

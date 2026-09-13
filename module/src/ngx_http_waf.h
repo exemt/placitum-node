@@ -1793,6 +1793,14 @@ typedef struct {
     unsigned                   reload_after_body:1;
 
     /*
+     * Фаза пишет журнал: спрашивать некого (волн нет либо все сняты
+     * условиями), снимка в обменнике нет. Архив тогда кладёт объекты сам,
+     * перекладкой перед агентом (ngx_http_waf_store_reload), в размере
+     * архива: без reload -- со списками снимка, с reload -- оригиналом.
+     */
+    unsigned                   journal:1;
+
+    /*
      * Итог фазы уже записан: строка лога и запись агенту. На фазу, а не на
      * запрос -- записей столько, сколько фаз бежало, и общий флаг молча съел
      * бы вторую.
@@ -1903,6 +1911,20 @@ struct ngx_http_waf_ctx_s {
     unsigned                   rsp_denied:1;    /* фаза ответа отказала      */
     unsigned                   rsp_monitor:1;   /* waf_hold response monitor */
     unsigned                   rsp_wait_body:1; /* волна ждёт тело ответа    */
+
+    /*
+     * Журнал ответа: инспекторов у фазы нет, а записать ответ маршрут велит
+     * (waf_preview, waf_archive). Ответ ничем не держится -- заголовки и тело
+     * уходят клиенту сразу, в hold ложится копия префикса размером
+     * rsp_journal_need. Запись и архив -- по last_buf; пока обменник
+     * дописывает, запрос держится своей ссылкой (rsp_journal_held) уже после
+     * отдачи.
+     */
+    unsigned                   rsp_journal:1;
+    unsigned                   rsp_journal_done:1;
+    unsigned                   rsp_journal_held:1; /* своя ссылка на запрос */
+    size_t                     rsp_journal_need;
+    off_t                      rsp_journal_total; /* байт ответа всего      */
 
     /*
      * Подмена тела по секции rewrite. fetch_done -- вопрос закрыт: подменять
@@ -2986,6 +3008,12 @@ void       ngx_http_waf_strip_accept_encoding(ngx_http_waf_ctx_t *ctx);
 ngx_int_t  ngx_http_waf_phase_apply(ngx_http_waf_ctx_t *ctx);
 
 /*
+ * Возобновление фазы ответа и кадра: следующая волна, исход после перекладки
+ * (ST_FINISH) либо применение вердикта.
+ */
+ngx_int_t  ngx_http_waf_phase_resume(ngx_http_waf_ctx_t *ctx);
+
+/*
  * Возврат в фазу ответа после вердикта. Аналог возврата в фазы nginx на фазе
  * запроса: там запрос доигрывает обработчик фаз, здесь -- фильтры, потому что
  * никаких фаз у ответа уже нет.
@@ -3022,10 +3050,16 @@ void       ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx);
 
 /*
  * Запись фазы, отложенная до исхода маршрута. Зовётся там, где исход стал
- * известен: конец фазы ответа, обход фазы ответа фильтром, cleanup пула.
+ * известен: конец фазы ответа, обход фазы ответа фильтром, cleanup запроса.
  * Без отложенной записи -- ничего не делает.
  */
 void       ngx_http_waf_audit_flush_deferred(ngx_http_waf_ctx_t *ctx);
+
+/*
+ * Отложить запись фазы запроса до исхода маршрута и повесить её дописку на
+ * cleanup запроса: фазы ответа может и не быть.
+ */
+void       ngx_http_waf_audit_defer(ngx_http_waf_ctx_t *ctx);
 
 /*
  * Исход маршрута, а не фазы: отказ любой из бежавших фаз. По нему выбирается
@@ -3159,6 +3193,9 @@ ngx_int_t            ngx_http_waf_slot_table_init(ngx_cycle_t *cycle,
 ngx_http_waf_slot_t *ngx_http_waf_slot_acquire(ngx_http_waf_ctx_t *ctx);
 ngx_http_waf_slot_t *ngx_http_waf_slot_lookup(uint64_t rid);
 void                 ngx_http_waf_slot_release(ngx_http_waf_slot_t *slot);
+
+/* rid для ключей обменника без ожидания вердикта: фаза-журнал. */
+ngx_int_t            ngx_http_waf_rid_assign(ngx_http_waf_ctx_t *ctx);
 void                 ngx_http_waf_slot_detach(void *data);
 
 void       ngx_http_waf_rid_hex(uint64_t rid, u_char *dst);
@@ -3178,6 +3215,17 @@ ngx_http_waf_phase_enter(ngx_http_waf_ctx_t *ctx, ngx_uint_t phase)
 {
     ctx->phase = phase;
     ctx->ph    = &ctx->phases[phase];
+}
+
+
+/*
+ * Спрашивают ли на фазе хоть кого-то. Фаза без волн -- журнал: снимка для
+ * инспекторов у неё нет, а запись, превью и архив есть.
+ */
+static ngx_inline ngx_uint_t
+ngx_http_waf_phase_inspected(ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t phase)
+{
+    return wlcf->waves[phase] != NULL && wlcf->waves[phase]->nelts != 0;
 }
 
 

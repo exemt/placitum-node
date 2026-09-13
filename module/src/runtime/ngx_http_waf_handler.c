@@ -295,10 +295,13 @@ ngx_http_waf_access_handler(ngx_http_request_t *r)
             || !ngx_http_waf_waves_pending(ctx))
         {
             /*
-             * Спрашивать некого. Archive и preview всё равно могут требовать
-             * оригиналы в Redis -- reload кладёт их до записи агенту.
+             * Спрашивать некого, и фаза пишет журнал: запись агенту уходит
+             * и без инспекторов, а waf_archive кладёт объекты перекладкой
+             * до неё (ngx_http_waf_store_reload) -- снимка, за которым
+             * архив стоял бы, здесь нет.
              */
-            ctx->state = NGX_HTTP_WAF_ST_DONE;
+            ctx->ph->journal = 1;
+            ctx->state       = NGX_HTTP_WAF_ST_DONE;
             return ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_OVERRIDES);
         }
 
@@ -397,6 +400,30 @@ ngx_http_waf_phase_apply(ngx_http_waf_ctx_t *ctx)
     default:
         /* ST_FAILED: причина в ctx->ph->fail */
         return ngx_http_waf_fail_policy(ctx);
+    }
+}
+
+
+/*
+ * Возобновление там, где обработчика фаз nginx нет: у фильтра ответа и у
+ * обработчика кадров. Запрос разбирает состояние в access-обработчике, здесь
+ * тот же разбор. ST_FINISH -- перекладка перед агентом либо чтение формы
+ * закрылись, исход уже решён: его применяют, а не зовут политику сбоя,
+ * которой phase_apply отвечает на всё, чего не знает.
+ */
+ngx_int_t
+ngx_http_waf_phase_resume(ngx_http_waf_ctx_t *ctx)
+{
+    switch (ctx->state) {
+
+    case NGX_HTTP_WAF_ST_NEXT_WAVE:
+        return ngx_http_waf_wave_start(ctx, ctx->ph->wave);
+
+    case NGX_HTTP_WAF_ST_FINISH:
+        return ngx_http_waf_finish_done(ctx);
+
+    default:
+        return ngx_http_waf_phase_apply(ctx);
     }
 }
 

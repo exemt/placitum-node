@@ -34,6 +34,9 @@ size_t     ngx_http_waf_preview_room(ngx_http_waf_loc_conf_t *wlcf,
  */
 size_t     ngx_http_waf_preview_room_ctx(ngx_http_waf_ctx_t *ctx);
 
+/* Бюджет превью тела на этом запросе, с просьбами audit. */
+size_t     ngx_http_waf_preview_body_budget(ngx_http_waf_ctx_t *ctx);
+
 /* Секции headers_preview, args_preview и body_preview в документ агента. */
 void       ngx_http_waf_preview_write(ngx_http_waf_jw_t *jw,
                ngx_http_waf_ctx_t *ctx);

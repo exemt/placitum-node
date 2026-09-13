@@ -11,6 +11,7 @@
  */
 
 #include "body/ngx_http_waf_body.h"
+#include "runtime/ngx_http_waf_preview.h"
 
 
 #define NGX_HTTP_WAF_BODY_MAX_DRIVERS   8
@@ -287,6 +288,23 @@ ngx_http_waf_reload_size(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
         if (one > need) {
             need = one;
         }
+
+    } else if (ctx->ph->journal
+               && (sh->archive & NGX_HTTP_WAF_OBJ_BIT(obj)))
+    {
+        /*
+         * Журнал: снимка нет, и архив без reload кладёт объект сам -- в
+         * размере архива, а не снимка, которого не было.
+         */
+        one = sh->archive_limit[obj];
+
+        if (one == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE) {
+            return (size_t) -1;
+        }
+
+        if (one > need) {
+            need = one;
+        }
     }
 
     if (sh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(obj)) {
@@ -408,11 +426,36 @@ ngx_http_waf_reload_need(ngx_http_waf_ctx_t *ctx,
         return 1;
     }
 
-    if (!(sh->archive_reload & NGX_HTTP_WAF_OBJ_BIT(obj))) {
+    if (!(sh->archive_reload & NGX_HTTP_WAF_OBJ_BIT(obj))
+        && !(ctx->ph->journal && (sh->archive & NGX_HTTP_WAF_OBJ_BIT(obj))))
+    {
         return 0;
     }
 
     return ngx_http_waf_archive_may_take(ctx, wlcf, obj);
+}
+
+
+/*
+ * Кладётся ли объект оригиналом. Перекладка по reload -- да, ради оригинала
+ * она и затеяна. Архив журнала без reload -- нет: он встаёт на место снимка,
+ * которого не было, и берёт объект так, как его сняли бы, -- со списками
+ * снимка. Иначе mask= у waf_capture молча переставал бы действовать ровно на
+ * маршруте, где инспекторов нет.
+ */
+static ngx_uint_t
+ngx_http_waf_reload_raw(ngx_http_waf_ctx_t *ctx, ngx_http_waf_loc_conf_t *wlcf,
+    ngx_uint_t obj)
+{
+    ngx_http_waf_shoot_conf_t  *sh = &wlcf->shoot[ctx->phase];
+
+    if (!ctx->ph->journal) {
+        return 1;
+    }
+
+    return (sh->archive_reload & NGX_HTTP_WAF_OBJ_BIT(obj))
+           || (sh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(obj))
+           || ngx_http_waf_ovr_reload_need(ctx, obj) != 0;
 }
 
 
@@ -745,13 +788,12 @@ ngx_http_waf_body_validate_phase(ngx_conf_t *cf,
 
     if (sh->archive != 0) {
 
-        if (wlcf->waves[phase] == NULL || wlcf->waves[phase]->nelts == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: waf_archive %V needs inspectors on the "
-                               "route; inspect none leaves nothing to archive "
-                               "after", pname);
-            return NGX_CONF_ERROR;
-        }
+        /*
+         * Инспекторы архиву не нужны. Фаза без волн пишет журнал: запрос и
+         * ответ кладут оригиналы после прохода, кадр -- по записи кадра
+         * (waf_audit_frames). Снимка, за которым архив мог бы стоять, у
+         * такой фазы нет, и объекты берутся из самого трафика.
+         */
 
         /*
          * Забирает объекты агент. Без сокета до него не дойдёт ни одна запись
@@ -1666,8 +1708,16 @@ ngx_http_waf_meta_on_put(ngx_http_waf_body_op_t *op)
         *ctx->ph->meta[op->obj] = op->locator;
         ctx->ph->meta_placed   |= NGX_HTTP_WAF_OBJ_BIT(op->obj);
 
-        /* Лёг оригинал: маски снимка на этом объекте больше не лежат. */
-        if (ctx->ph->reloading) {
+        /*
+         * Лёг оригинал: маски снимка на этом объекте больше не лежат. Архив
+         * журнала кладёт со списками снимка -- у него маски на месте.
+         */
+        if (ctx->ph->reloading
+            && ngx_http_waf_reload_raw(ctx,
+                   ngx_http_get_module_loc_conf(ctx->request,
+                                                ngx_http_waf_module),
+                   op->obj))
+        {
             ctx->ph->raw |= NGX_HTTP_WAF_OBJ_BIT(op->obj);
         }
 
@@ -2429,7 +2479,12 @@ ngx_http_waf_store_del_key(ngx_http_waf_ctx_t *ctx, ngx_str_t *key)
     wmcf  = ngx_http_get_module_main_conf(r, ngx_http_waf_module);
     store = wmcf->body_store;
 
-    if (store == NULL
+    /*
+     * Из cleanup пула: nginx обнуляет r->pool до его обхода, и операцию
+     * заводить не в чем. Объект умрёт по TTL.
+     */
+    if (r->pool == NULL
+        || store == NULL
         || !(store->driver->caps & NGX_HTTP_WAF_BODY_CAP_DELETE)
         || store->driver->del == NULL)
     {
@@ -3623,12 +3678,40 @@ ngx_http_waf_store_reload_needs_body(ngx_http_waf_ctx_t *ctx)
      * Та же проверка, что у самого reload: на исходе, где архив тело не берёт,
      * его незачем и читать -- иначе allow с when=deny дочитывал бы мегабайт
      * ради put, который тут же уйдёт под DEL.
+     *
+     * Журнал читает тело и ради одного превью: снимка, из которого превью
+     * взяло бы префикс, у него нет, а в записи тело обещано.
      */
-    if (!ngx_http_waf_reload_need(ctx, wlcf, NGX_HTTP_WAF_OBJ_BODY)) {
+    if (!ngx_http_waf_reload_need(ctx, wlcf, NGX_HTTP_WAF_OBJ_BODY)
+        && !(ctx->ph->journal && ngx_http_waf_preview_body_budget(ctx) != 0))
+    {
         return 0;
     }
 
     return (r->headers_in.content_length_n > 0 || r->headers_in.chunked);
+}
+
+
+size_t
+ngx_http_waf_store_reload_size(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
+{
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    /* на исходе, где объект никто не берёт, класть его незачем */
+    if (!ngx_http_waf_reload_need(ctx, wlcf, obj)) {
+        return 0;
+    }
+
+    return ngx_http_waf_reload_size(ctx, obj);
+}
+
+
+ngx_chain_t *
+ngx_http_waf_body_chain(ngx_http_waf_ctx_t *ctx)
+{
+    return ngx_http_waf_body_source(ctx);
 }
 
 
@@ -3742,6 +3825,24 @@ ngx_http_waf_obj_suffix_reserved(ngx_str_t *suffix)
 }
 
 
+/* Положит ли перекладка хоть что-то: без этого rid ей не нужен. */
+static ngx_uint_t
+ngx_http_waf_reload_places(ngx_http_waf_ctx_t *ctx,
+    ngx_http_waf_loc_conf_t *wlcf)
+{
+    ngx_uint_t  i;
+
+    for (i = 0; i < NGX_HTTP_WAF_META_COUNT; i++) {
+        if (ngx_http_waf_reload_need(ctx, wlcf, i)) {
+            return 1;
+        }
+    }
+
+    return ctx->ph->body_ready
+           && ngx_http_waf_reload_need(ctx, wlcf, NGX_HTTP_WAF_OBJ_BODY);
+}
+
+
 ngx_int_t
 ngx_http_waf_store_reload(ngx_http_waf_ctx_t *ctx)
 {
@@ -3755,6 +3856,23 @@ ngx_http_waf_store_reload(ngx_http_waf_ctx_t *ctx)
 
     wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
 
+    /*
+     * Ключ объекта держит rid, а у фазы, где никого не спрашивали, слота не
+     * было и rid -- прочерки: объекты двух запросов легли бы одним ключом.
+     * Не нашлось слота -- класть нельзя вовсе, запись уйдёт без объектов.
+     */
+    if (ctx->rid_hex[0] == '-'
+        && ngx_http_waf_reload_places(ctx, wlcf)
+        && ngx_http_waf_rid_assign(ctx) != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "waf: no free slot to name store objects, the record "
+                      "goes without them");
+
+        ctx->ph->store_reloaded = 1;
+        return NGX_OK;
+    }
+
     ctx->ph->store_raw      = 1;
     ctx->ph->reloading      = 1;
     ctx->ph->reload_issuing = 1;
@@ -3764,12 +3882,17 @@ ngx_http_waf_store_reload(ngx_http_waf_ctx_t *ctx)
             continue;
         }
 
+        /* списки снимка -- архиву журнала, оригинал -- reload */
+        ctx->ph->store_raw = ngx_http_waf_reload_raw(ctx, wlcf, i);
+
         if (ngx_http_waf_meta_reload_one(ctx, i) != NGX_OK) {
             ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
                           "waf: failed to reload %V for the agent",
                           &ngx_http_waf_objs[i].name);
         }
     }
+
+    ctx->ph->store_raw = 1;
 
     if (ngx_http_waf_reload_need(ctx, wlcf, NGX_HTTP_WAF_OBJ_BODY)
         && ctx->ph->body_ready)

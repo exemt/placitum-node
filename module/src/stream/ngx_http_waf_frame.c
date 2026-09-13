@@ -79,6 +79,12 @@
 /* Меньше буфера на направление не заводим даже при крошечном лимите. */
 #define NGX_HTTP_WAF_FRAME_BUF_MIN     4096
 
+/*
+ * Буфер стороны-потока: кадр в нём целиком не лежит, и размер -- это только
+ * пропускная способность одного чтения, как proxy_buffer_size у апгрейда.
+ */
+#define NGX_HTTP_WAF_FRAME_PASS_BUF    16384
+
 /* Пул кадра: сообщение, локатор, разбор ответа, строка лога, объект подмены. */
 #define NGX_HTTP_WAF_FRAME_POOL        4096
 
@@ -89,6 +95,24 @@
  * только если есть куда сдвинуть хвост.
  */
 #define NGX_HTTP_WAF_FRAME_SLACK       8
+
+
+/*
+ * Что сторона делает с кадром данных. Решается при подключении, один раз:
+ *
+ *   INSPECT -- на стороне есть волны: кадр лежит в буфере до вердикта;
+ *   JOURNAL -- волн нет, а кадры пишутся (waf_audit_frames all либо просьба
+ *              audit рукопожатия): кадр собирается целиком, уходит записью
+ *              с превью и архивом и следом -- получателю, никого не ждя;
+ *   PASS    -- волн нет и кадры не пишутся: кадрирование проверяется,
+ *              нагрузка идёт потоком, буфер -- под заголовки и контрольные
+ *              кадры.
+ *
+ * Итог сессии (phase=session) пишется при любом из трёх.
+ */
+#define NGX_HTTP_WAF_FRAME_INSPECT     0
+#define NGX_HTTP_WAF_FRAME_JOURNAL     1
+#define NGX_HTTP_WAF_FRAME_PASS        2
 
 
 /*
@@ -104,6 +128,7 @@
  */
 typedef struct {
     ngx_uint_t                 phase;        /* FRAME_C2S | FRAME_S2C      */
+    ngx_uint_t                 mode;         /* NGX_HTTP_WAF_FRAME_INSPECT...*/
 
     ngx_buf_t                 *in;
     u_char                    *cleared;
@@ -242,9 +267,15 @@ static void ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc,
     ngx_http_waf_frame_dir_t *d);
 static ngx_int_t ngx_http_waf_frame_parse(ngx_http_waf_frame_t *fc,
     ngx_http_waf_frame_dir_t *d);
-static ngx_uint_t ngx_http_waf_frame_dir_wanted(ngx_http_waf_frame_t *fc,
-    ngx_http_waf_frame_dir_t *d);
+static ngx_uint_t ngx_http_waf_frame_mode(ngx_http_request_t *r,
+    ngx_http_waf_ctx_t *ctx, ngx_uint_t phase);
+static ngx_int_t ngx_http_waf_frame_begin(ngx_http_waf_frame_t *fc,
+    ngx_http_waf_frame_dir_t *d, u_char *payload, size_t len, u_char *key);
 static ngx_int_t ngx_http_waf_frame_inspect(ngx_http_waf_frame_t *fc,
+    ngx_http_waf_frame_dir_t *d, u_char *payload, size_t len, u_char *key);
+static ngx_uint_t ngx_http_waf_frame_journal_wanted(ngx_http_waf_frame_t *fc,
+    ngx_http_waf_frame_dir_t *d);
+static ngx_int_t ngx_http_waf_frame_journal(ngx_http_waf_frame_t *fc,
     ngx_http_waf_frame_dir_t *d, u_char *payload, size_t len, u_char *key);
 static ngx_int_t ngx_http_waf_frame_outcome(ngx_http_waf_frame_t *fc,
     ngx_int_t rc);
@@ -266,7 +297,8 @@ static void ngx_http_waf_frame_events(ngx_http_waf_frame_t *fc);
 static void ngx_http_waf_frame_header_out(ngx_http_request_t *r,
     ngx_http_waf_frame_t *fc);
 static ngx_int_t ngx_http_waf_frame_dir_init(ngx_http_request_t *r,
-    ngx_http_waf_frame_dir_t *d, ngx_uint_t phase, ngx_buf_t *seed);
+    ngx_http_waf_frame_dir_t *d, ngx_uint_t phase, ngx_uint_t mode,
+    ngx_buf_t *seed);
 static void ngx_http_waf_frame_ends(ngx_http_waf_frame_t *fc,
     ngx_http_waf_frame_dir_t *d, ngx_connection_t **src,
     ngx_connection_t **dst);
@@ -309,7 +341,12 @@ static ngx_str_t  ngx_http_waf_frame_cache_rule = ngx_string("FRAME_CACHE");
 
 /* --- подключение ---------------------------------------------------------- */
 
-/* Маршрут инспектирует кадры: есть хоть одна волна в любом направлении. */
+/*
+ * Цеплять ли обработчик кадров. Волна на любой стороне -- да. Без волн -- ради
+ * журнала: итог сессии пишется при любой политике waf_audit_frames, кроме off,
+ * а all пишет ещё и сами кадры. Без сокета агента писать некуда, и соединение
+ * остаётся за nginx.
+ */
 ngx_uint_t
 ngx_http_waf_frame_wanted(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx)
 {
@@ -317,10 +354,50 @@ ngx_http_waf_frame_wanted(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx)
 
     wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
 
-    return (wlcf->waves[NGX_HTTP_WAF_PHASE_FRAME_C2S] != NULL
-            && wlcf->waves[NGX_HTTP_WAF_PHASE_FRAME_C2S]->nelts != 0)
-           || (wlcf->waves[NGX_HTTP_WAF_PHASE_FRAME_S2C] != NULL
-               && wlcf->waves[NGX_HTTP_WAF_PHASE_FRAME_S2C]->nelts != 0);
+    if (ngx_http_waf_phase_inspected(wlcf, NGX_HTTP_WAF_PHASE_FRAME_C2S)
+        || ngx_http_waf_phase_inspected(wlcf, NGX_HTTP_WAF_PHASE_FRAME_S2C))
+    {
+        return 1;
+    }
+
+    return wlcf->enable
+           && wlcf->audit_frames != NGX_HTTP_WAF_AUDIT_FRAMES_OFF
+           && ngx_http_waf_audit_enabled();
+}
+
+
+/*
+ * Режим стороны: волны -- инспекция. Без волн -- журнал, если кадры пишутся:
+ * waf_audit_frames all либо просьба audit рукопожатия (выключенный журнал
+ * кадров она не включает, как и в ngx_http_waf_frame_audit_policy). Иначе
+ * поток.
+ */
+static ngx_uint_t
+ngx_http_waf_frame_mode(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx,
+    ngx_uint_t phase)
+{
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+
+    if (ngx_http_waf_phase_inspected(wlcf, phase)) {
+        return NGX_HTTP_WAF_FRAME_INSPECT;
+    }
+
+    if (!ngx_http_waf_audit_enabled()
+        || wlcf->audit_frames == NGX_HTTP_WAF_AUDIT_FRAMES_OFF)
+    {
+        return NGX_HTTP_WAF_FRAME_PASS;
+    }
+
+    if (wlcf->audit_frames == NGX_HTTP_WAF_AUDIT_FRAMES_ALL
+        || ctx->audit_ovr[NGX_HTTP_WAF_OVR_REQUEST].audit.set
+           == NGX_HTTP_WAF_SET_ON)
+    {
+        return NGX_HTTP_WAF_FRAME_JOURNAL;
+    }
+
+    return NGX_HTTP_WAF_FRAME_PASS;
 }
 
 
@@ -362,6 +439,8 @@ ngx_http_waf_frame_attach(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx)
      * заголовками, и nginx отдал бы их клиенту своей петлёй.
      */
     if (ngx_http_waf_frame_dir_init(r, &fc->c2s, NGX_HTTP_WAF_PHASE_FRAME_C2S,
+                                    ngx_http_waf_frame_mode(r, ctx,
+                                        NGX_HTTP_WAF_PHASE_FRAME_C2S),
                                     r->header_in)
         != NGX_OK)
     {
@@ -369,6 +448,8 @@ ngx_http_waf_frame_attach(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx)
     }
 
     if (ngx_http_waf_frame_dir_init(r, &fc->s2c, NGX_HTTP_WAF_PHASE_FRAME_S2C,
+                                    ngx_http_waf_frame_mode(r, ctx,
+                                        NGX_HTTP_WAF_PHASE_FRAME_S2C),
                                     &u->buffer)
         != NGX_OK)
     {
@@ -451,7 +532,7 @@ ngx_http_waf_frame_attach(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx)
  */
 static ngx_int_t
 ngx_http_waf_frame_dir_init(ngx_http_request_t *r, ngx_http_waf_frame_dir_t *d,
-    ngx_uint_t phase, ngx_buf_t *seed)
+    ngx_uint_t phase, ngx_uint_t mode, ngx_buf_t *seed)
 {
     size_t                    size, rest;
     ngx_http_waf_loc_conf_t  *wlcf;
@@ -462,15 +543,29 @@ ngx_http_waf_frame_dir_init(ngx_http_request_t *r, ngx_http_waf_frame_dir_t *d,
      * Два заголовка, не один: при сборке в буфере лежат собранное сообщение
      * с заголовком первого фрагмента и следующий фрагмент со своим. Плюс
      * запас под рост заголовка при запечатывании сообщения.
+     *
+     * Поток кадр целиком не держит: нагрузка уходит по мере прихода, и
+     * буфер -- как у проксирования апгрейда, под заголовки и контрольные
+     * кадры. Байты, пришедшие вместе с рукопожатием, в него помещаются
+     * всегда: закрывать соединение, которое никто не инспектирует, за
+     * размер первой пачки было бы нечестно.
      */
-    size = wlcf->body_limit[phase] + 2 * NGX_HTTP_WAF_WS_HEADER_MAX
-           + NGX_HTTP_WAF_FRAME_SLACK;
+    if (mode == NGX_HTTP_WAF_FRAME_PASS) {
+        rest = (seed != NULL) ? (size_t) (seed->last - seed->pos) : 0;
+        size = ngx_max(NGX_HTTP_WAF_FRAME_PASS_BUF,
+                       rest + NGX_HTTP_WAF_FRAME_SLACK);
+
+    } else {
+        size = wlcf->body_limit[phase] + 2 * NGX_HTTP_WAF_WS_HEADER_MAX
+               + NGX_HTTP_WAF_FRAME_SLACK;
+    }
 
     if (size < NGX_HTTP_WAF_FRAME_BUF_MIN) {
         size = NGX_HTTP_WAF_FRAME_BUF_MIN;
     }
 
     d->phase = phase;
+    d->mode  = mode;
 
     d->in = ngx_create_temp_buf(r->pool, size);
     if (d->in == NULL) {
@@ -724,7 +819,13 @@ ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
 
     for ( ;; ) {
 
-        if (fc->cur == NULL && d->drop == 0
+        /*
+         * Кадр в полёте держит разбор обеих сторон: машина слотов ведёт одно
+         * ожидание на соединение. Потоку ждать нечего -- он никого не
+         * спрашивает и никуда не пишет, и его кадры идут мимо чужого вердикта.
+         */
+        if ((fc->cur == NULL || d->mode == NGX_HTTP_WAF_FRAME_PASS)
+            && d->drop == 0
             && (d->out == NULL || d->out->pos == d->out->last))
         {
             (void) ngx_http_waf_frame_parse(fc, d);
@@ -837,19 +938,6 @@ ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
 }
 
 
-/* Есть ли на этом направлении кому спрашивать. */
-static ngx_uint_t
-ngx_http_waf_frame_dir_wanted(ngx_http_waf_frame_t *fc,
-    ngx_http_waf_frame_dir_t *d)
-{
-    ngx_http_waf_loc_conf_t  *wlcf;
-
-    wlcf = ngx_http_get_module_loc_conf(fc->r, ngx_http_waf_module);
-
-    return wlcf->waves[d->phase] != NULL && wlcf->waves[d->phase]->nelts != 0;
-}
-
-
 /*
  * Разбор RFC 6455 по [cleared, last). Двигает cleared через всё, что идёт
  * получателю без вопросов, и останавливается на первом кадре данных, который
@@ -880,7 +968,12 @@ ngx_http_waf_frame_parse(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
     ngx_http_waf_loc_conf_t  *wlcf;
 
     wlcf     = ngx_http_get_module_loc_conf(fc->r, ngx_http_waf_module);
-    assemble = wlcf->frame_reassemble ? 1 : 0;
+    /*
+     * Сборка -- ради инспекции: судить сообщение целиком. Журнал пишет кадры
+     * как пришли, а поток их вовсе не держит, и склеивать им нечего.
+     */
+    assemble = (wlcf->frame_reassemble
+                && d->mode == NGX_HTTP_WAF_FRAME_INSPECT) ? 1 : 0;
 
     for ( ;; ) {
 
@@ -1030,6 +1123,17 @@ ngx_http_waf_frame_parse(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
             return NGX_OK;
         }
 
+        /*
+         * Поток: кадрирование проверено, нагрузка идёт получателю по мере
+         * прихода -- спрашивать некого и писать некуда. Сборки, предела и
+         * расширений у потока нет: всё это вопросы инспекции и записи.
+         */
+        if (d->mode == NGX_HTTP_WAF_FRAME_PASS) {
+            d->seq++;
+            d->skip = (off_t) (hlen + plen);
+            continue;
+        }
+
         limit  = wlcf->body_limit[d->phase];
         policy = wlcf->body_limit_policy[d->phase];
 
@@ -1081,7 +1185,15 @@ ngx_http_waf_frame_parse(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
 
         if (total > limit) {
 
-            if (policy == NGX_HTTP_WAF_POLICY_BLOCK) {
+            /*
+             * Закрывает предел только сторону, которую инспектируют: журнал
+             * держит кадр ради записи, а не ради вердикта, и рвать за размер
+             * соединение, которое никто не спрашивает, незачем. Такой кадр
+             * идёт получателю мимо записи.
+             */
+            if (policy == NGX_HTTP_WAF_POLICY_BLOCK
+                && d->mode == NGX_HTTP_WAF_FRAME_INSPECT)
+            {
                 ngx_log_error(NGX_LOG_INFO, log, 0,
                               "waf: %V %s of %uz bytes exceeds "
                               "waf_body_limit frame %uz, closing, conn %*s",
@@ -1166,10 +1278,28 @@ ngx_http_waf_frame_parse(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
 
         d->seq++;
 
-        /* направление без инспекторов: кадрирование проверено, дальше мимо */
-        if (!ngx_http_waf_frame_dir_wanted(fc, d)) {
-            d->cleared += hlen + plen;
-            continue;
+        /*
+         * Журнал: кадр целиком на руках, спрашивать некого. Запись -- по
+         * политике waf_audit_frames. Кадр уходит получателю сразу в обоих
+         * случаях; записанному следом уходят запись и архив.
+         */
+        if (d->mode == NGX_HTTP_WAF_FRAME_JOURNAL) {
+
+            if (!ngx_http_waf_frame_journal_wanted(fc, d)) {
+                d->cleared += hlen + plen;
+                continue;
+            }
+
+            d->held      = hlen + (size_t) plen;
+            d->opcode    = opcode;
+            d->fin       = fin ? 1 : 0;
+            d->fragments = 1;
+            d->held_seq  = d->seq;
+
+            (void) ngx_http_waf_frame_journal(fc, d, p + hlen, (size_t) plen,
+                                              masked ? p + hlen - 4 : NULL);
+
+            return NGX_OK;
         }
 
         if (assemble && !fin && opcode != NGX_HTTP_WAF_WS_OP_CONT) {
@@ -1628,18 +1758,21 @@ ngx_http_waf_frame_cacheable(ngx_http_waf_frame_t *fc)
 
 /* --- кадр в машине вердикта ---------------------------------------------- */
 
+/*
+ * Кадр входит в машину вердикта: пул кадра, размаскированная копия нагрузки,
+ * накопитель фазы с чистого листа, наборы действий и меток рукопожатия.
+ * Общее у инспекции и журнала -- дальше они расходятся: одна спрашивает
+ * волны, другой пишет запись.
+ */
 static ngx_int_t
-ngx_http_waf_frame_inspect(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d,
+ngx_http_waf_frame_begin(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d,
     u_char *payload, size_t len, u_char *key)
 {
-    u_char                    *p, *vars;
+    u_char                    *p;
     size_t                     i;
-    ngx_int_t                  rc;
-    ngx_msec_t                 ttl;
     ngx_http_request_t        *r = fc->r;
     ngx_http_waf_ctx_t        *ctx = fc->ctx;
     ngx_http_waf_phase_ctx_t  *ph;
-    ngx_http_waf_loc_conf_t   *wlcf;
 
     fc->pool = ngx_create_pool(NGX_HTTP_WAF_FRAME_POOL, r->connection->log);
     if (fc->pool == NULL) {
@@ -1786,6 +1919,25 @@ ngx_http_waf_frame_inspect(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d
         }
     }
 
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_waf_frame_inspect(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d,
+    u_char *payload, size_t len, u_char *key)
+{
+    u_char                   *vars;
+    ngx_int_t                 rc;
+    ngx_msec_t                ttl;
+    ngx_http_request_t       *r = fc->r;
+    ngx_http_waf_ctx_t       *ctx = fc->ctx;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    if (ngx_http_waf_frame_begin(fc, d, payload, len, key) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
     fc->cur       = d;
     fc->settled   = 0;
     fc->fetching  = 0;
@@ -1820,7 +1972,7 @@ ngx_http_waf_frame_inspect(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d
         ngx_http_waf_sha256_t  sha;
 
         ngx_http_waf_sha256_init(&sha);
-        ngx_http_waf_sha256_update(&sha, p, len);
+        ngx_http_waf_sha256_update(&sha, fc->body_buf.start, len);
         ngx_http_waf_sha256_final(&sha, fc->sha256);
         fc->sha_set = 1;
 
@@ -1844,6 +1996,88 @@ ngx_http_waf_frame_inspect(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d
     }
 
     rc = ngx_http_waf_wave_start(ctx, 0);
+
+    fc->in_stack = 0;
+
+    return ngx_http_waf_frame_outcome(fc, rc);
+}
+
+
+/*
+ * Писать ли кадр стороны-журнала. Та же политика, что у самой записи
+ * (ngx_http_waf_frame_audit_policy), но до входа в машину вердикта: кадр,
+ * которому записи не выпало, не стоит ни пула, ни копии. Сказать журнальному
+ * кадру нечего -- отказа, подмены и счёта у него нет, -- поэтому без all не
+ * пишется ничего, а all берёт каждый sample-й. Просьба audit рукопожатия
+ * пишет каждый.
+ */
+static ngx_uint_t
+ngx_http_waf_frame_journal_wanted(ngx_http_waf_frame_t *fc,
+    ngx_http_waf_frame_dir_t *d)
+{
+    ngx_uint_t                set;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(fc->r, ngx_http_waf_module);
+
+    set = fc->ctl_init
+              ? fc->conn_audit.audit.set
+              : fc->ctx->audit_ovr[NGX_HTTP_WAF_OVR_REQUEST].audit.set;
+
+    if (set == NGX_HTTP_WAF_SET_ON) {
+        return 1;
+    }
+
+    if (wlcf->audit_frames != NGX_HTTP_WAF_AUDIT_FRAMES_ALL
+        || set == NGX_HTTP_WAF_SET_OFF)
+    {
+        return 0;
+    }
+
+    return wlcf->audit_frames_sample <= 1
+           || (d->seq % wlcf->audit_frames_sample) == 0;
+}
+
+
+/*
+ * Кадр стороны-журнала: вход в машину вердикта без волн. Кадр уходит
+ * получателю сразу -- вердикта, который мог бы его задержать, нет, -- а в
+ * обменник и в запись идёт копия из пула кадра. Архив кладётся тем же путём,
+ * что у фазы запроса без инспекторов (ngx_http_waf_store_reload), запись
+ * уходит из ngx_http_waf_frame_settle(). Пока обменник пишет, следующий кадр
+ * этой стороны ждёт в буфере: кадр в полёте один на соединение.
+ */
+static ngx_int_t
+ngx_http_waf_frame_journal(ngx_http_waf_frame_t *fc,
+    ngx_http_waf_frame_dir_t *d, u_char *payload, size_t len, u_char *key)
+{
+    ngx_int_t            rc;
+    ngx_http_waf_ctx_t  *ctx = fc->ctx;
+
+    if (ngx_http_waf_frame_begin(fc, d, payload, len, key) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    fc->cur      = d;
+    fc->settled  = 0;
+    fc->fetching = 0;
+    fc->cached   = 0;
+    fc->sha_set  = 0;
+    fc->in_stack = 1;
+
+    d->cleared += d->held;
+    d->held     = 0;
+
+    /*
+     * Перекладка кадру обычно не нужна -- снимок и есть оригинал, -- и begin
+     * закрывает её заранее. У журнала снимка нет: архив кладёт она.
+     */
+    ctx->ph->journal        = 1;
+    ctx->ph->body_ready     = 1;
+    ctx->ph->store_reloaded = 0;
+    ctx->state              = NGX_HTTP_WAF_ST_DONE;
+
+    rc = ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_OVERRIDES);
 
     fc->in_stack = 0;
 
@@ -1917,12 +2151,7 @@ ngx_http_waf_frame_resume(ngx_http_waf_ctx_t *ctx)
         return;
     }
 
-    if (ctx->state == NGX_HTTP_WAF_ST_NEXT_WAVE) {
-        rc = ngx_http_waf_wave_start(ctx, ctx->ph->wave);
-
-    } else {
-        rc = ngx_http_waf_phase_apply(ctx);
-    }
+    rc = ngx_http_waf_phase_resume(ctx);
 
     if (rc == NGX_DONE) {
         return;                        /* следующая волна опубликована */

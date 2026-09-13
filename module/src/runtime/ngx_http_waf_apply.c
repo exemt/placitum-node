@@ -2240,7 +2240,7 @@ ngx_http_waf_log_verdict(ngx_http_waf_ctx_t *ctx)
         /* запись у обработчика кадров */
 
     } else if (ngx_http_waf_archive_pending(ctx)) {
-        ctx->ph->audit_deferred = 1;
+        ngx_http_waf_audit_defer(ctx);
 
     } else {
         ngx_http_waf_audit_request(ctx);
