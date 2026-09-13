@@ -881,15 +881,6 @@ ngx_http_waf_msg_prior_actions(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
             continue;
         }
 
-        /*
-         * Бан -- туда же: адресат у него набор самого маршрута, исполняет
-         * модуль, а соседу от чужой просьбы о наборе нечего делать. Состав
-         * набора он и так увидит зеркалом, когда keeper разнесёт запись.
-         */
-        if (ngx_http_waf_do_ban(action[i].verb)) {
-            continue;
-        }
-
         if (first) {
             ngx_http_waf_jw_lit(jw, ",\"actions\":[{\"do\":");
             first = 0;

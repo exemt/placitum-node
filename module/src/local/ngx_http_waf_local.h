@@ -471,10 +471,6 @@ ngx_int_t  ngx_http_waf_dataset_put(ngx_http_waf_ctx_t *ctx,
                ngx_http_waf_dataset_t *ds, ngx_str_t *value, ngx_uint_t ttl,
                ngx_str_t *reason);
 
-/* Просьба ban: адрес клиента в названный живой набор. */
-ngx_int_t  ngx_http_waf_ban_apply(ngx_http_waf_ctx_t *ctx,
-               ngx_http_waf_action_t *action);
-
 
 /* --- local/ngx_http_waf_frame_cache.c ------------------------------------- */
 

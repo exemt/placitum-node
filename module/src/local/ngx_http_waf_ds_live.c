@@ -595,62 +595,6 @@ ngx_http_waf_ds_material(ngx_http_waf_dataset_t *ds, ngx_str_t *value,
 
 
 /*
- * Просьба ban: адрес клиента в живой набор, названный инспектором.
- *
- * Отсюда и до keeper путь тот же, что у автобана waf_local_rate list=, --
- * ngx_http_waf_dataset_put. Разница только в том, кто назвал набор: там
- * конфигурация маршрута (имя проверено на nginx -t), здесь ответ с провода, и
- * проверить имя можно только сейчас. Поэтому всё, что не сошлось, -- WARN и
- * отказ от записи, а не отбраковка ответа: волну ронять из-за опечатки в чужом
- * профиле нельзя, а молчать о несостоявшемся бане -- тем более.
- *
- * Значение -- addr_text соединения: после realip это тот самый адрес, по
- * которому судили инспекторы и по которому будет резать локальная проверка.
- */
-ngx_int_t
-ngx_http_waf_ban_apply(ngx_http_waf_ctx_t *ctx, ngx_http_waf_action_t *action)
-{
-    ngx_uint_t                 ttl;
-    ngx_http_waf_dataset_t    *ds;
-    ngx_http_waf_main_conf_t  *wmcf;
-
-    wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
-
-    ds = ngx_http_waf_dataset_find(wmcf, &action->list);
-    if (ds == NULL) {
-        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
-                      "waf: ban asked for dataset \"%V\", which is not "
-                      "declared on this node", &action->list);
-        return NGX_ERROR;
-    }
-
-    if (ds->mode != NGX_HTTP_WAF_DS_MODE_ACTIVE) {
-        /*
-         * Набор без active живёт телом поколения: запись в него никуда не
-         * уедет и пропадёт на первой же раскатке.
-         */
-        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
-                      "waf: ban asked for dataset \"%V\", which is not active",
-                      &action->list);
-        return NGX_ERROR;
-    }
-
-    ttl = action->spec.has_ttl ? (ngx_uint_t) action->spec.ttl : ds->ttl;
-
-    if (ttl == 0) {
-        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
-                      "waf: ban into dataset \"%V\" has no ttl, neither in the "
-                      "ask nor on the dataset", &action->list);
-        return NGX_ERROR;
-    }
-
-    return ngx_http_waf_dataset_put(ctx, ds,
-                                    &ctx->request->connection->addr_text, ttl,
-                                    action->code.len != 0 ? &action->code : NULL);
-}
-
-
-/*
  * Автобан: запись в overlay этой ноды сразу и событие keeper, который
  * разнесёт её остальным пакетом. Хеш записи пока 0 -- его принесёт пакет.
  */

@@ -66,8 +66,7 @@ static ngx_str_t  ngx_http_waf_do_names[] = {
     ngx_string("audit"),
     ngx_string("archive"),
     ngx_string("mark"),
-    ngx_string("score"),
-    ngx_string("ban")
+    ngx_string("score")
 };
 
 
@@ -467,17 +466,6 @@ ngx_http_waf_actions_merge(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
          */
         if (ngx_http_waf_do_mark(src[i].verb)) {
             (void) ngx_http_waf_markers_add(ctx, &src[i]);
-        }
-
-        /*
-         * Бан -- тоже здесь, на приёме ответа: запись в набор нужна не этому
-         * запросу (его судьбу решает вердикт), а следующим, и чем раньше она
-         * уедет к keeper, тем меньше их проскочит. Несостоявшаяся запись
-         * просьбу из набора не убирает: её высказали, и это факт записи, а
-         * почему не вышло -- сказано в логе края.
-         */
-        if (ngx_http_waf_do_ban(src[i].verb)) {
-            (void) ngx_http_waf_ban_apply(ctx, &src[i]);
         }
 
         /*

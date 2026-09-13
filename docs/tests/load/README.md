@@ -63,7 +63,7 @@ docker compose -f compose.load.yml exec inspector ip-probe --quiet --client-ip 8
 | edge×N | Собственно объект измерения: nginx с модулем, отдельная конфигурация под нагрузку |
 | origin | Заглушка приложения; обязана быть заведомо быстрее всего остального |
 | NATS | Core NATS для горячего пути; JetStream не участвует, аудит появится на этапе 8 |
-| Инспектор | inspectors/ip (`inspectors/ip`) — один subject и одно имя, но реплик сколько нужно: подписка идёт queue group |
+| Инспектор | inspectors/ip (`inspectors/ip`) — один subject и одно имя, но реплик сколько нужно: подписка идёт queue group. Политика своя, `ip/policy` рядом с compose: отказ по 203.0.113.0/24, остальное allow — в образе ip только `default` без правил |
 | Обсервабилити | Prometheus, Grafana, cAdvisor, экспортер NATS — см. [observability.md](observability.md) |
 
 ### Почему HAProxy, а не nginx

@@ -1,0 +1,9 @@
+# Политика нагрузочного прогона: отказ по blocklist, остальное -- allow.
+# Генератор шлёт отказные запросы с X-Forwarded-For 203.0.113.10
+# (k6/lib/request.js), realip на /api/ отдаёт этот адрес инспектору.
+rules:
+  - set: blocked
+    action: deny
+    response: blocked
+
+default: allow

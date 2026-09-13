@@ -60,10 +60,10 @@ services:
       WAF_IP_LOG: "${INSPECTOR_LOG:-error}"
       WAF_IP_VERSIONS: "2"
     volumes:
-      # Данные и профили -- из того же дерева; при сборке из git монтирования
-      # снимают, инспектор поднимается на том, что лежит в образе.
-      - ${PLC_SRC_IP:-../../../inspectors/ip}/data:/app/data:ro
-      - ${PLC_SRC_IP:-../../../inspectors/ip}/profiles:/app/profiles:ro
+      # Политика прогона -- своя, рядом: в образе ip только default без
+      # правил, а генератору нужен отказ по адресу (203.0.113.10 из blocklist,
+      # k6/lib/request.js). Одинаково и со сборкой из пути, и из git.
+      - ./ip/policy:/app/policy:ro
     depends_on:
       nats:
         condition: service_healthy

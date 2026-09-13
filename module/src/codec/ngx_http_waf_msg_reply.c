@@ -114,7 +114,6 @@ static ngx_http_waf_kw_t  ngx_http_waf_do_verbs[] = {
     { ngx_string("archive"),   NGX_HTTP_WAF_DO_ARCHIVE   },
     { ngx_string("mark"),      NGX_HTTP_WAF_DO_MARK      },
     { ngx_string("score"),     NGX_HTTP_WAF_DO_SCORE     },
-    { ngx_string("ban"),       NGX_HTTP_WAF_DO_BAN       },
     { ngx_null_string, 0 }
 };
 
@@ -478,7 +477,7 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
          * Просьбы соседям выбрасываются, а глаголы, которые исполняет модуль,
          * остаются: "не вправе просить о чужой работе" -- это про соседа, а о
          * себе сказать можно. Сброшенный на входе инспектор именно это и
-         * делает: просит забанить клиента (ban) и не звать его до конца
+         * делает: просит пометить запись (mark) и не звать его до конца
          * транзакции (off). Очки -- исключение: вклада в сумму у ответа без
          * вердикта нет, и score снят выше вместе со счётом.
          */
@@ -1924,24 +1923,6 @@ ngx_http_waf_reply_actions(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
                 continue;
             }
 
-            if (key.len == 4 && ngx_strncmp(key.data, "list", 4) == 0) {
-                if (ngx_http_waf_jp_string(jp, &action.list) != NGX_OK) {
-                    return NGX_ERROR;
-                }
-
-                /*
-                 * Имя набора: форма проверяется здесь, существование -- на
-                 * исполнении. Токен, как имя инспектора: набора с
-                 * управляющим символом в имени не бывает, и такое поле --
-                 * признак битого отправителя, а не опечатки оператора.
-                 */
-                if (!ngx_http_waf_token_clean(&action.list)) {
-                    ngx_http_waf_reply_reject(err, "action list is not a name");
-                }
-
-                continue;
-            }
-
             if (key.len == 3 && ngx_strncmp(key.data, "set", 3) == 0) {
                 if (ngx_http_waf_jp_string(jp, &value) != NGX_OK) {
                     return NGX_ERROR;
@@ -2111,25 +2092,6 @@ ngx_http_waf_reply_actions(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
         }
 
         /*
-         * Набор -- только у ban, и у ban он обязателен: "забань" без имени
-         * набора не просьба, а полуфраза, и угадывать набор за отправителя
-         * модуль не станет. Адресат -- набор самого маршрута, поэтому
-         * названный сосед здесь битая форма, как у mark и score.
-         */
-        if (ngx_http_waf_do_ban(action.verb)) {
-            if (action.list.len == 0) {
-                ngx_http_waf_reply_reject(err, "ban without a list");
-            }
-
-            if (to.len != 0) {
-                ngx_http_waf_reply_reject(err, "ban takes no addressee");
-            }
-
-        } else if (action.list.len != 0) {
-            ngx_http_waf_reply_reject(err, "list is only for ban");
-        }
-
-        /*
          * Группа и сторона -- только у mutate, и у mutate -- обе: что именно
          * переключить и куда, называет отправитель, как корзину у note.
          * Правило приёма получателя решает, дают ли ему это, а не что.
@@ -2210,20 +2172,6 @@ ngx_http_waf_reply_actions(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
             {
                 ngx_http_waf_reply_reject(err,
                     "set, ttl, when and objects are only for audit and archive");
-            }
-
-        } else if (ngx_http_waf_do_ban(action.verb)) {
-
-            /*
-             * Срок записи: тот же ttl секундами, что у archive. Не прислан --
-             * возьмётся срок самого набора; нет и там -- запись не состоится,
-             * и это видно в логе края.
-             */
-            if (action.set != NGX_HTTP_WAF_SET_NONE || action.spec.has_when
-                || action.spec.named != 0)
-            {
-                ngx_http_waf_reply_reject(err,
-                    "set, when and objects are only for audit and archive");
             }
 
         } else if (ngx_http_waf_do_score(action.verb)) {
@@ -2581,14 +2529,6 @@ ngx_http_waf_apply_allowed(ngx_uint_t verb, ngx_uint_t axis)
         /* Управление: до конца транзакции либо, на кадрах, соединения. */
         return axis == NGX_HTTP_WAF_APPLY_REQUEST
                || axis == NGX_HTTP_WAF_APPLY_CONN;
-
-    case NGX_HTTP_WAF_DO_BAN:
-        /*
-         * Бан -- про адрес клиента: другого субъекта у модуля и нет. Ни
-         * системы, ни сессии он не знает -- это к инспекторам, у которых
-         * есть кодер и зеркало списка сессий.
-         */
-        return axis == NGX_HTTP_WAF_APPLY_IP;
 
     case NGX_HTTP_WAF_DO_AUDIT:
     case NGX_HTTP_WAF_DO_ARCHIVE:
