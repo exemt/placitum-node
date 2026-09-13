@@ -89,6 +89,16 @@ server.on("upgrade", (req, socket) => {
         continue;
       }
 
+      // Залп приложения: N кадров одной записью в сокет. Так стенд видит, что
+      // модуль разбирает всё, что пришло одним чтением, а не кадр на событие.
+      const burst = /залп:(\d+)$/.exec(text);
+
+      if (burst) {
+        socket.write(Buffer.concat(Array.from({ length: Number(burst[1]) }, (_, i) =>
+          encodeFrame({ opcode: OP.text, payload: Buffer.from(`журнал залп ${i + 1}`) }))));
+        continue;
+      }
+
       // Эхо сохраняет опкод и фрагментацию: сообщение, пришедшее двумя
       // кадрами, уходит обратно двумя.
       socket.write(encodeFrame({

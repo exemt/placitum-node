@@ -1570,6 +1570,16 @@ ngx_http_waf_local_deny(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule,
     ctx->state           = NGX_HTTP_WAF_ST_DONE;
 
     /*
+     * Волн не было, снимка тоже: архив и превью отказа берут объекты из
+     * самого запроса, как журнал. Иначе waf_archive when=deny молча пропускал
+     * бы ровно те отказы, ради которых его пишут. У кадра перекладки нет
+     * вовсе -- store_reloaded выставлен заранее.
+     */
+    if (!ngx_http_waf_phase_is_frame(ctx->phase)) {
+        ctx->ph->journal = 1;
+    }
+
+    /*
      * Тело не сбрасываем до reload: archive-only body ещё не читали, а агенту
      * оно нужно. discard -- после записи.
      */

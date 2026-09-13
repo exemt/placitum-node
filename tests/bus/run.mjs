@@ -908,6 +908,11 @@ try {
     ])), 200);
   check("журнал ответа: ответ приложения дошёл целиком",
     body(request("/journal-rsp/")).includes("WAF-CANARY-0badc0de"), true);
+  check("журнал отказа: локальный слой отказал",
+    status(request("/journal-deny/", [
+      "-X", "POST", "-A", "journal-bad-agent",
+      "-H", "Content-Type: text/plain", "--data", "journal-deny-payload",
+    ])), 403);
   await sleep(300);
 
   // --- запись аудита --------------------------------------------------------
@@ -1079,6 +1084,25 @@ try {
       "exec", `${tag}-redis`, "redis-cli", "GET", jRsp.store?.body?.key ?? "none",
     ]).stdout;
     check("журнал ответа: тело ответа лежит в обменнике", rspKept.includes("WAF-CANARY-0badc0de"), true);
+  }
+
+  // Отказ локального слоя без инспекторов: запись с исходом deny, и when=deny
+  // у архива выпадает -- заголовки и тело отказанного запроса остаются агенту.
+  const jDeny = records.find((rec) => rec.phase === "request"
+    && /\/journal-deny\/$/.test(rec.http?.uri ?? ""));
+
+  check("журнал отказа: запись с исходом deny", jDeny?.verdict, "deny");
+
+  if (jDeny) {
+    check("журнал отказа: архив заголовков и тела when=deny",
+      [jDeny.store?.archive?.headers?.ttl, jDeny.store?.archive?.body?.ttl].join(","), "3600,3600");
+    check("журнал отказа: превью тела отказанного запроса",
+      /journal-deny-payload/.test(jDeny.body_preview ?? ""), true);
+
+    const denyKept = docker([
+      "exec", `${tag}-redis`, "redis-cli", "GET", jDeny.store?.body?.key ?? "none",
+    ]).stdout;
+    check("журнал отказа: тело лежит в обменнике", denyKept.includes("journal-deny-payload"), true);
   }
 
   const leakRecords = records.filter((rec) => /rsp-leak\/$/.test(rec.http?.uri ?? ""));

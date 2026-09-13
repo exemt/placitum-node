@@ -805,6 +805,12 @@ try {
   check("журнал: эхо цело и по порядку",
     assemble(rxJ.frames).map((f) => f.payload.toString("utf8")).join("|"),
     `${journalOne}|${journalTwo}`);
+
+  // Залп приложения одной записью в сокет: у стороны-журнала без архива исход
+  // кадра решается на месте, и разбор обязан взять из буфера все кадры, а не
+  // по одному на событие сокета.
+  hsJ.socket.write(text("журнал залп:40"));
+  check("журнал: залп приложения дошёл целиком", await rxJ.wait(42), true);
   hsJ.socket.destroy();
 
   const hsQuiet = await connectOrDie(port, { path: "/quiet/chat" });
@@ -964,8 +970,8 @@ try {
   const journalC2s = journal.filter((r) => r.frame?.direction === "c2s");
   const journalS2c = journal.filter((r) => r.frame?.direction === "s2c");
 
-  check("журнал: записаны оба кадра клиента и оба эха",
-    `${journalC2s.length}/${journalS2c.length}`, "2/2");
+  check("журнал: записаны кадры клиента, эха и залп приложения",
+    `${journalC2s.length}/${journalS2c.length}`, "3/42");
   check("журнал: у кадров без инспекторов вердикт allow и пустой состав",
     journal.every((r) => r.verdict === "allow"
       && Object.keys(r.inspectors ?? {}).join(",") === "module"), true);
@@ -988,7 +994,7 @@ try {
     `${quietSession?.session?.frames_c2s}/${quietSession?.session?.frames_s2c}`, "1/1");
   check("поток: байты кадра больше буфера посчитаны",
     (quietSession?.session?.bytes_c2s ?? 0) > 70000 && (quietSession?.session?.bytes_s2c ?? 0) > 70000, true);
-  check("журнал: итог сессии записан", `${journalSession?.session?.frames_c2s}/${journalSession?.session?.frames_s2c}`, "2/2");
+  check("журнал: итог сессии записан", `${journalSession?.session?.frames_c2s}/${journalSession?.session?.frames_s2c}`, "3/42");
 
   check("обменник: каждый архивированный кадр лежит в обменнике",
     deniedWs.length > 0 && deniedWs.every((r) => kept.includes(r.store?.body?.key)), true);

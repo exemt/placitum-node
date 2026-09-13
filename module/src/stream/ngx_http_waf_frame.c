@@ -811,6 +811,7 @@ ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
 {
     size_t                size, rest;
     ssize_t               n;
+    ngx_int_t             rc;
     ngx_buf_t            *b = d->in;
     ngx_connection_t     *src, *dst;
     ngx_http_upstream_t  *u = fc->r->upstream;
@@ -818,6 +819,8 @@ ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
     ngx_http_waf_frame_ends(fc, d, &src, &dst);
 
     for ( ;; ) {
+
+        rc = NGX_AGAIN;
 
         /*
          * Кадр в полёте держит разбор обеих сторон: машина слотов ведёт одно
@@ -828,7 +831,7 @@ ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
             && d->drop == 0
             && (d->out == NULL || d->out->pos == d->out->last))
         {
-            (void) ngx_http_waf_frame_parse(fc, d);
+            rc = ngx_http_waf_frame_parse(fc, d);
 
             if (fc->closing) {
                 return;
@@ -914,10 +917,6 @@ ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
 
             n = src->recv(src, b->last, size);
 
-            if (n == NGX_AGAIN || n == 0) {
-                break;
-            }
-
             if (n > 0) {
                 b->last += n;
 
@@ -931,6 +930,16 @@ ngx_http_waf_frame_pump(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
             if (n == NGX_ERROR) {
                 src->read->eof = 1;
             }
+        }
+
+        /*
+         * Разбор встал на кадре, исход которого применён тут же, в нашем
+         * стеке: журнал без архива, вердикт из кеша или локального слоя. Кадры,
+         * пришедшие тем же чтением, уже в буфере, а сокет о них второй раз не
+         * скажет -- без этого они ждали бы следующего байта с провода.
+         */
+        if (rc == NGX_OK && fc->cur == NULL) {
+            continue;
         }
 
         break;
