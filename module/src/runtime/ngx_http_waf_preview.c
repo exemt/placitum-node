@@ -383,7 +383,17 @@ ngx_http_waf_preview_body(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
         return;
     }
 
-    if (ctx->ph->store_blob[NGX_HTTP_WAF_OBJ_BODY].len != 0) {
+    /*
+     * The copy of the capture serves when it is long enough: the whole body,
+     * or at least as much as the budget. A record wider than the capture reads
+     * the body itself, not the capture's prefix.
+     */
+
+    if (ctx->ph->store_blob[NGX_HTTP_WAF_OBJ_BODY].len != 0
+        && (ctx->ph->store_blob[NGX_HTTP_WAF_OBJ_BODY].len >= room
+            || (ctx->ph->locator != NULL && ctx->ph->locator->complete)
+            || ngx_http_waf_body_chain(ctx) == NULL))
+    {
         len = ctx->ph->store_blob[NGX_HTTP_WAF_OBJ_BODY].len;
 
         if (len > room) {
@@ -625,19 +635,20 @@ ngx_http_waf_preview_lists(ngx_http_waf_ctx_t *ctx,
     ngx_array_t **deny, ngx_array_t **mask, ngx_array_t **cap_deny,
     ngx_array_t **cap_mask)
 {
-    ngx_uint_t                  reload;
+    ngx_uint_t                  own;
     ngx_array_t               **pv, **cap;
     ngx_http_waf_ovr_part_t    *part = &ngx_http_waf_audit_ovr_cur(ctx)->audit;
     ngx_http_waf_shoot_conf_t  *sh = &wlcf->shoot[ctx->phase];
 
-    reload = (sh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(obj)) != 0;
+    /*
+     * The record's own lists replace the capture lists; without them the
+     * record masks what the capture masked. The module cuts the record from
+     * the request itself, so either way the slice comes from the original.
+     * An inspector asking for the original gets the own lists only, asking
+     * for the store gets the own lists over the capture lists.
+     */
 
-    if (ngx_http_waf_ovr_original(part, obj)) {
-        reload = 1;
-
-    } else if (ngx_http_waf_ovr_store(part, obj)) {
-        reload = 0;
-    }
+    own = ngx_http_waf_lists_own(sh, NGX_HTTP_WAF_LIST_PREVIEW, obj);
 
     pv  = sh->lists[NGX_HTTP_WAF_LIST_PREVIEW][obj];
     cap = sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][obj];
@@ -646,7 +657,9 @@ ngx_http_waf_preview_lists(ngx_http_waf_ctx_t *ctx,
     *deny  = pv[NGX_HTTP_WAF_AXIS_DENY];
     *mask  = pv[NGX_HTTP_WAF_AXIS_MASK];
 
-    if (reload) {
+    if (ngx_http_waf_ovr_original(part, obj)
+        || (own && !ngx_http_waf_ovr_store(part, obj)))
+    {
         *cap_deny = NULL;
         *cap_mask = NULL;
         return;

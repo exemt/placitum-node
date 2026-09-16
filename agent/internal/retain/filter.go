@@ -126,3 +126,72 @@ func splitArg(part string) (name, value string, hadEq bool) {
 	}
 	return part, "", false
 }
+
+// cutToLimit shortens the object to the archive size. The body is a byte
+// prefix; headers and the query string keep whole pairs, so the archived
+// object still parses: a JSON array cut in the middle of a pair is not a
+// shorter object but a broken one.
+func cutToLimit(kind string, data []byte, limit int64) ([]byte, bool) {
+	if limit <= 0 || int64(len(data)) <= limit {
+		return data, false
+	}
+
+	switch kind {
+	case "headers":
+		return cutHeaders(data, limit), true
+	case "args":
+		return cutArgs(data, limit), true
+	default:
+		return data[:limit], true
+	}
+}
+
+func cutHeaders(data []byte, limit int64) []byte {
+	var pairs [][]string
+	if err := json.Unmarshal(data, &pairs); err != nil {
+		return data[:limit]
+	}
+
+	out := make([][]string, 0, len(pairs))
+	size := int64(2)
+
+	for _, pair := range pairs {
+		raw, err := json.Marshal(pair)
+		if err != nil {
+			continue
+		}
+
+		add := int64(len(raw))
+		if len(out) > 0 {
+			add++
+		}
+
+		if size+add > limit {
+			break
+		}
+
+		out = append(out, pair)
+		size += add
+	}
+
+	cut, err := json.Marshal(out)
+	if err != nil {
+		return data[:limit]
+	}
+
+	return cut
+}
+
+func cutArgs(data []byte, limit int64) []byte {
+	cut := data[:limit]
+
+	if limit < int64(len(data)) && data[limit] == '&' {
+		return cut
+	}
+
+	if i := strings.LastIndexByte(string(cut), '&'); i > 0 {
+		return cut[:i]
+	}
+
+	return cut
+}

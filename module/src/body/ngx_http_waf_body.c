@@ -6,6 +6,8 @@
 
 #define NGX_HTTP_WAF_BODY_CHUNK         4096
 
+#define NGX_HTTP_WAF_ATTACH_CHUNK       16384
+
 
 static ngx_int_t ngx_http_waf_body_decide(ngx_http_waf_ctx_t *ctx);
 static ngx_chain_t *ngx_http_waf_body_source(ngx_http_waf_ctx_t *ctx);
@@ -16,9 +18,9 @@ static ngx_int_t ngx_http_waf_body_key(ngx_http_waf_ctx_t *ctx,
 static ngx_uint_t ngx_http_waf_store_is_external(
     ngx_http_waf_body_store_t *store);
 static ngx_int_t ngx_http_waf_headers_collect(ngx_http_waf_ctx_t *ctx,
-    ngx_str_t *out);
+    size_t limit, ngx_uint_t raw, ngx_str_t *out, ngx_uint_t *truncated);
 static ngx_int_t ngx_http_waf_args_collect(ngx_http_waf_ctx_t *ctx,
-    ngx_str_t *out);
+    size_t limit, ngx_uint_t raw, ngx_str_t *out, ngx_uint_t *truncated);
 static ngx_int_t ngx_http_waf_meta_place_one(ngx_http_waf_ctx_t *ctx,
     ngx_uint_t obj);
 static ngx_int_t ngx_http_waf_meta_result(ngx_http_waf_ctx_t *ctx);
@@ -31,13 +33,14 @@ static void ngx_http_waf_body_release_all(ngx_http_waf_ctx_t *ctx);
 static ngx_uint_t ngx_http_waf_phase_follows(ngx_http_waf_ctx_t *ctx);
 static ngx_uint_t ngx_http_waf_archive_kept(ngx_http_waf_ctx_t *ctx,
     ngx_uint_t phase);
-static char *ngx_http_waf_obj_names(ngx_uint_t mask);
 static size_t ngx_http_waf_locator_object_size(ngx_http_waf_locator_t *loc);
 static off_t ngx_http_waf_body_length(ngx_http_waf_ctx_t *ctx);
 static void ngx_http_waf_body_encoding(ngx_http_request_t *r,
     ngx_http_waf_locator_t *loc);
 static void ngx_http_waf_body_encoding_out(ngx_http_request_t *r,
     ngx_http_waf_locator_t *loc);
+static void ngx_http_waf_body_attach_response(ngx_http_waf_ctx_t *ctx,
+    ngx_http_waf_locator_t *loc, off_t held);
 static void ngx_http_waf_body_on_put(ngx_http_waf_body_op_t *op);
 static void ngx_http_waf_body_cleanup(void *data);
 static void ngx_http_waf_body_abandon(ngx_http_waf_ctx_t *ctx);
@@ -55,21 +58,14 @@ static ngx_int_t ngx_http_waf_args_filter(ngx_http_request_t *r, ngx_str_t *src,
 static size_t ngx_http_waf_store_need(ngx_http_waf_loc_conf_t *wlcf,
     ngx_uint_t phase,
     ngx_uint_t obj);
-static size_t ngx_http_waf_ovr_reload_need(ngx_http_waf_ctx_t *ctx,
-    ngx_uint_t obj);
-static size_t ngx_http_waf_reload_size(ngx_http_waf_ctx_t *ctx,
-    ngx_uint_t obj);
 static size_t ngx_http_waf_store_need_ctx(ngx_http_waf_ctx_t *ctx,
     ngx_uint_t obj);
-static ngx_uint_t ngx_http_waf_archive_may_take(ngx_http_waf_ctx_t *ctx,
-    ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t obj);
-static ngx_uint_t ngx_http_waf_reload_need(ngx_http_waf_ctx_t *ctx,
-    ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t obj);
+static ngx_uint_t ngx_http_waf_capture_masks(ngx_http_waf_shoot_conf_t *sh,
+    ngx_uint_t obj);
+static ngx_uint_t ngx_http_waf_attachable(ngx_http_waf_ctx_t *ctx,
+    ngx_uint_t obj);
 static ngx_int_t ngx_http_waf_meta_place_blob(ngx_http_waf_ctx_t *ctx,
     ngx_uint_t obj, ngx_str_t *blob);
-static ngx_int_t ngx_http_waf_meta_reload_one(ngx_http_waf_ctx_t *ctx,
-    ngx_uint_t obj);
-static ngx_uint_t ngx_http_waf_body_reload_wider(ngx_http_waf_ctx_t *ctx);
 static void ngx_http_waf_jw_namelist(ngx_http_waf_jw_t *jw, const char *field,
     ngx_array_t *list);
 
@@ -110,7 +106,9 @@ static ngx_str_t  ngx_http_waf_store_hot = ngx_string("hot");
 typedef struct {
     ngx_str_t    name;
     ngx_str_t    suffix;
-    ngx_int_t  (*collect)(ngx_http_waf_ctx_t *ctx, ngx_str_t *out);
+    ngx_int_t  (*collect)(ngx_http_waf_ctx_t *ctx, size_t limit,
+                          ngx_uint_t raw, ngx_str_t *out,
+                          ngx_uint_t *truncated);
 } ngx_http_waf_obj_t;
 
 
@@ -166,116 +164,9 @@ ngx_http_waf_store_need(ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t phase,
 
 
 static size_t
-ngx_http_waf_ovr_reload_need(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
-{
-    size_t                      need, one;
-    ngx_http_waf_ovr_part_t    *part;
-    ngx_http_waf_loc_conf_t    *wlcf;
-    ngx_http_waf_shoot_conf_t  *sh;
-
-    need = 0;
-    part = &ngx_http_waf_audit_ovr_cur(ctx)->archive;
-
-    if (ngx_http_waf_ovr_original(part, obj)) {
-        need = (part->has_limit & NGX_HTTP_WAF_OBJ_BIT(obj))
-               ? part->limit[obj] : (size_t) -1;
-    }
-
-    part = &ngx_http_waf_audit_ovr_cur(ctx)->audit;
-
-    if (ngx_http_waf_ovr_original(part, obj)) {
-        wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-        sh   = &wlcf->shoot[ctx->phase];
-        one  = (part->has_limit & NGX_HTTP_WAF_OBJ_BIT(obj))
-               ? part->limit[obj] : sh->preview[obj];
-
-        if (need != (size_t) -1 && one > need) {
-            need = one;
-        }
-    }
-
-    return need;
-}
-
-
-static size_t
-ngx_http_waf_reload_size(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
-{
-    size_t                      need, one;
-    ngx_http_waf_loc_conf_t    *wlcf;
-    ngx_http_waf_shoot_conf_t  *sh;
-
-    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-    sh   = &wlcf->shoot[ctx->phase];
-    need = 0;
-
-    if (sh->archive_reload & NGX_HTTP_WAF_OBJ_BIT(obj)) {
-        one = sh->archive_reload_limit[obj];
-
-        if (one == NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE) {
-            one = sh->capture_limit[obj];
-        }
-
-        if (one == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE
-            || one == NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE)
-        {
-            return (size_t) -1;
-        }
-
-        if (one > need) {
-            need = one;
-        }
-
-    } else if (ctx->ph->journal
-               && (sh->archive & NGX_HTTP_WAF_OBJ_BIT(obj)))
-    {
-        one = sh->archive_limit[obj];
-
-        if (one == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE) {
-            return (size_t) -1;
-        }
-
-        if (one > need) {
-            need = one;
-        }
-    }
-
-    if (sh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(obj)) {
-        one = sh->preview_reload_limit[obj];
-
-        if (one == NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE) {
-            one = sh->capture_limit[obj];
-        }
-
-        if (one == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE
-            || one == NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE)
-        {
-            return (size_t) -1;
-        }
-
-        if (one > need) {
-            need = one;
-        }
-    }
-
-    one = ngx_http_waf_ovr_reload_need(ctx, obj);
-
-    if (one == (size_t) -1) {
-        return (size_t) -1;
-    }
-
-    return one > need ? one : need;
-}
-
-
-static size_t
 ngx_http_waf_store_need_ctx(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
 {
     ngx_http_waf_loc_conf_t  *wlcf;
-
-    if (ctx->ph->reloading) {
-        return ngx_http_waf_reload_size(ctx, obj);
-    }
 
     wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
 
@@ -283,85 +174,290 @@ ngx_http_waf_store_need_ctx(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
 }
 
 
-static ngx_uint_t
-ngx_http_waf_archive_may_take(ngx_http_waf_ctx_t *ctx,
-    ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t obj)
+/*
+ * How much of the object the agent takes on this outcome: 0 when it does not,
+ * NGX_HTTP_WAF_AGENT_WHOLE for the whole object, a byte count otherwise. The
+ * route line and the archive verb of the inspectors are both read here.
+ */
+
+size_t
+ngx_http_waf_archive_wants(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj,
+    ngx_uint_t verdict)
 {
-    ngx_uint_t                  verdict;
-    ngx_http_waf_shoot_conf_t  *sh = &wlcf->shoot[ctx->phase];
+    size_t                      limit;
+    ngx_uint_t                  bit, mask, forced;
+    ngx_http_waf_ovr_part_t    *ovr;
+    ngx_http_waf_loc_conf_t    *wlcf;
+    ngx_http_waf_shoot_conf_t  *sh;
 
-    if (ngx_http_waf_phase_follows(ctx)) {
-        return 1;
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+    sh   = &wlcf->shoot[ctx->phase];
+    ovr  = &ngx_http_waf_audit_ovr_cur(ctx)->archive;
+    bit  = NGX_HTTP_WAF_OBJ_BIT(obj);
+
+    if (ovr->set == NGX_HTTP_WAF_SET_OFF) {
+        return 0;
     }
 
-    if (ctx->phase == NGX_HTTP_WAF_PHASE_REQUEST
-        && ngx_http_waf_send_of(wlcf, ctx->phase, NGX_HTTP_WAF_OBJ_BODY)
-           == NGX_HTTP_WAF_SEND_STORE)
-    {
-        return 1;
+    forced = (ovr->set == NGX_HTTP_WAF_SET_ON && ngx_http_waf_audit_enabled());
+
+    if (forced) {
+        mask = ngx_http_waf_ovr_on(ovr);
+
+        if (mask == 0) {
+            mask = (sh->archive != 0 ? sh->archive : NGX_HTTP_WAF_OBJ_ALL)
+                   & ~ovr->off;
+        }
+
+        if (!(mask & bit)) {
+            return 0;
+        }
+
+        if (ovr->has_when && !(ovr->when & (1u << verdict))) {
+            return 0;
+        }
+
+        limit = (ovr->has_limit & bit) ? ovr->limit[obj]
+                                       : sh->archive_limit[obj];
+
+    } else {
+
+        if (!(sh->archive & bit)
+            || !(sh->archive_when[obj] & (1u << verdict)))
+        {
+            return 0;
+        }
+
+        limit = sh->archive_limit[obj];
     }
 
-    verdict = ngx_http_waf_route_verdict(ctx);
-
-    return (sh->archive_when[obj] & (1u << verdict)) != 0;
+    return (limit == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE)
+               ? NGX_HTTP_WAF_AGENT_WHOLE : limit;
 }
 
 
-static ngx_uint_t
-ngx_http_waf_reload_need(ngx_http_waf_ctx_t *ctx,
-    ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t obj)
+ngx_uint_t
+ngx_http_waf_archive_names(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
 {
-    ngx_uint_t                  store_only;
-    ngx_http_waf_shoot_conf_t  *sh = &wlcf->shoot[ctx->phase];
-
-    if (ngx_http_waf_reload_size(ctx, obj) == 0) {
-        return 0;
-    }
-
-    if (ngx_http_waf_ovr_reload_need(ctx, obj) != 0) {
-        return 1;
-    }
-
-    store_only = ngx_http_waf_ovr_store(&ngx_http_waf_audit_ovr_cur(ctx)->archive,
-                                       obj)
-                 || ngx_http_waf_ovr_store(&ngx_http_waf_audit_ovr_cur(ctx)->audit,
-                                          obj);
-
-    if (store_only) {
-        return 0;
-    }
-
-    if (sh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(obj)) {
-        return 1;
-    }
-
-    if (!(sh->archive_reload & NGX_HTTP_WAF_OBJ_BIT(obj))
-        && !(ctx->ph->journal && (sh->archive & NGX_HTTP_WAF_OBJ_BIT(obj))))
-    {
-        return 0;
-    }
-
-    return ngx_http_waf_archive_may_take(ctx, wlcf, obj);
+    return ngx_http_waf_archive_wants(ctx, obj, NGX_HTTP_WAF_V_ALLOW) != 0
+           || ngx_http_waf_archive_wants(ctx, obj, NGX_HTTP_WAF_V_DENY) != 0
+           || ngx_http_waf_archive_wants(ctx, obj, NGX_HTTP_WAF_V_REDIRECT)
+              != 0;
 }
 
 
-static ngx_uint_t
-ngx_http_waf_reload_raw(ngx_http_waf_ctx_t *ctx, ngx_http_waf_loc_conf_t *wlcf,
+/*
+ * Name lists of a consumer (archive or record) are its own once any of the
+ * three is named for the object, on this level or above: then they replace
+ * the capture lists instead of adding to them. Without them the consumer
+ * takes the capture lists, exactly what the inspectors saw.
+ */
+
+ngx_uint_t
+ngx_http_waf_lists_own(ngx_http_waf_shoot_conf_t *sh, ngx_uint_t kind,
     ngx_uint_t obj)
 {
-    ngx_http_waf_shoot_conf_t  *sh = &wlcf->shoot[ctx->phase];
+    ngx_array_t  **list;
 
-    if (!ctx->ph->journal) {
-        return 1;
+    if (obj >= NGX_HTTP_WAF_META_COUNT) {
+        return 0;
     }
 
-    return (sh->archive_reload & NGX_HTTP_WAF_OBJ_BIT(obj))
-           || (sh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(obj))
-           || ngx_http_waf_ovr_reload_need(ctx, obj) != 0;
+    list = sh->lists[kind][obj];
+
+    return list[NGX_HTTP_WAF_AXIS_ALLOW] != NULL
+           || list[NGX_HTTP_WAF_AXIS_MASK] != NULL
+           || list[NGX_HTTP_WAF_AXIS_DENY] != NULL;
 }
 
 
-static char *
+static ngx_uint_t
+ngx_http_waf_lists_drop(ngx_array_t **own, ngx_str_t *name)
+{
+    ngx_array_t  *allow = own[NGX_HTTP_WAF_AXIS_ALLOW];
+
+    if (ngx_http_waf_name_listed(own[NGX_HTTP_WAF_AXIS_DENY], name)) {
+        return 1;
+    }
+
+    return allow != NULL && allow->nelts != 0
+           && !ngx_http_waf_name_listed(allow, name);
+}
+
+
+/*
+ * Whether the own lists can be laid over the capture view: every name the
+ * capture dropped the own lists drop too, every name the capture hashed they
+ * hash or drop. Then the copy in the exchange serves, and the agent applies
+ * the own lists without hashing twice. Otherwise the view needs something the
+ * capture took away, and only the original has it.
+ */
+
+ngx_uint_t
+ngx_http_waf_lists_cover(ngx_http_waf_shoot_conf_t *sh, ngx_uint_t kind,
+    ngx_uint_t obj)
+{
+    ngx_str_t     *name;
+    ngx_uint_t     i;
+    ngx_array_t  **cap, **own;
+
+    if (obj >= NGX_HTTP_WAF_META_COUNT) {
+        return 1;
+    }
+
+    cap = sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][obj];
+    own = sh->lists[kind][obj];
+
+    if (cap[NGX_HTTP_WAF_AXIS_DENY] != NULL) {
+        name = cap[NGX_HTTP_WAF_AXIS_DENY]->elts;
+
+        for (i = 0; i < cap[NGX_HTTP_WAF_AXIS_DENY]->nelts; i++) {
+            if (!ngx_http_waf_lists_drop(own, &name[i])) {
+                return 0;
+            }
+        }
+    }
+
+    if (cap[NGX_HTTP_WAF_AXIS_MASK] != NULL) {
+        name = cap[NGX_HTTP_WAF_AXIS_MASK]->elts;
+
+        for (i = 0; i < cap[NGX_HTTP_WAF_AXIS_MASK]->nelts; i++) {
+            if (!ngx_http_waf_lists_drop(own, &name[i])
+                && !ngx_http_waf_name_listed(own[NGX_HTTP_WAF_AXIS_MASK],
+                                             &name[i]))
+            {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+
+/*
+ * The agent needs the object before the capture masks: the archive has own
+ * lists the capture view cannot give, or an inspector asked for the original.
+ */
+
+ngx_uint_t
+ngx_http_waf_archive_original(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
+{
+    ngx_http_waf_ovr_part_t  *ovr = &ngx_http_waf_audit_ovr_cur(ctx)->archive;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    if (ngx_http_waf_ovr_original(ovr, obj)) {
+        return 1;
+    }
+
+    if (ngx_http_waf_ovr_store(ovr, obj)) {
+        return 0;
+    }
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    return (wlcf->shoot[ctx->phase].archive_original
+            & NGX_HTTP_WAF_OBJ_BIT(obj)) != 0;
+}
+
+
+static ngx_uint_t
+ngx_http_waf_capture_masks(ngx_http_waf_shoot_conf_t *sh, ngx_uint_t obj)
+{
+    ngx_array_t  *mask, *deny;
+
+    if (obj >= NGX_HTTP_WAF_META_COUNT) {
+        return 0;
+    }
+
+    mask = sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][obj][NGX_HTTP_WAF_AXIS_MASK];
+    deny = sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][obj][NGX_HTTP_WAF_AXIS_DENY];
+
+    return (mask != NULL && mask->nelts != 0)
+           || (deny != NULL && deny->nelts != 0);
+}
+
+
+/*
+ * The copy in the exchange is what the inspectors saw: the capture slice under
+ * the capture masks. It serves the agent when the agent asks for no more than
+ * that; otherwise the original travels with the record.
+ */
+
+ngx_uint_t
+ngx_http_waf_store_serves(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
+{
+    size_t                    need;
+    ngx_uint_t                bit;
+    ngx_http_waf_locator_t   *loc;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    bit = NGX_HTTP_WAF_OBJ_BIT(obj);
+    loc = ngx_http_waf_store_locator(ctx, obj);
+
+    if (loc == NULL
+        || loc->unavailable != NGX_HTTP_WAF_BODY_AVAILABLE
+        || loc->key.len == 0)
+    {
+        return 0;
+    }
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    if (ngx_http_waf_archive_original(ctx, obj)
+        && ngx_http_waf_capture_masks(&wlcf->shoot[ctx->phase], obj))
+    {
+        return 0;
+    }
+
+    need = ngx_http_waf_archive_wants(ctx, obj,
+                                      ngx_http_waf_route_verdict(ctx));
+
+    if (obj == NGX_HTTP_WAF_OBJ_BODY) {
+
+        if (loc->complete) {
+            return 1;
+        }
+
+        return need != NGX_HTTP_WAF_AGENT_WHOLE
+               && (off_t) need <= ctx->ph->body_placed_len;
+    }
+
+    if (!(ctx->ph->meta_truncated & bit)) {
+        return 1;
+    }
+
+    return need != NGX_HTTP_WAF_AGENT_WHOLE
+           && need <= ctx->ph->store_blob[obj].len;
+}
+
+
+static ngx_uint_t
+ngx_http_waf_attachable(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
+{
+    off_t  total;
+
+    if (ngx_http_waf_phase_is_frame(ctx->phase)) {
+        return 0;
+    }
+
+    switch (obj) {
+
+    case NGX_HTTP_WAF_OBJ_HEADERS:
+        return 1;
+
+    case NGX_HTTP_WAF_OBJ_ARGS:
+        return ctx->phase == NGX_HTTP_WAF_PHASE_REQUEST
+               && ctx->request->args.len != 0;
+
+    default:
+        return ngx_http_waf_body_attach_len(ctx, NGX_HTTP_WAF_AGENT_WHOLE,
+                                            &total) != 0;
+    }
+}
+
+
+char *
 ngx_http_waf_obj_names(ngx_uint_t mask)
 {
     static u_char  buf[64];
@@ -985,17 +1081,33 @@ ngx_http_waf_meta_result(ngx_http_waf_ctx_t *ctx)
 static ngx_int_t
 ngx_http_waf_meta_place_one(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
 {
-    ngx_str_t  blob;
+    ngx_str_t   blob;
+    ngx_uint_t  truncated;
 
     if (ctx->ph->meta[obj] != NULL) {
         return NGX_OK;
     }
 
-    if (ngx_http_waf_objs[obj].collect(ctx, &blob) != NGX_OK) {
+    if (ngx_http_waf_objs[obj].collect(ctx, ngx_http_waf_store_need_ctx(ctx, obj),
+                                       0, &blob, &truncated)
+        != NGX_OK)
+    {
         return NGX_ERROR;
     }
 
+    if (truncated) {
+        ctx->ph->meta_truncated |= NGX_HTTP_WAF_OBJ_BIT(obj);
+    }
+
     return ngx_http_waf_meta_place_blob(ctx, obj, &blob);
+}
+
+
+ngx_int_t
+ngx_http_waf_meta_collect(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj,
+    size_t limit, ngx_uint_t raw, ngx_str_t *out, ngx_uint_t *truncated)
+{
+    return ngx_http_waf_objs[obj].collect(ctx, limit, raw, out, truncated);
 }
 
 
@@ -1200,9 +1312,10 @@ ngx_http_waf_header_pairs(ngx_http_waf_ctx_t *ctx)
 
 
 static ngx_int_t
-ngx_http_waf_headers_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
+ngx_http_waf_headers_collect(ngx_http_waf_ctx_t *ctx, size_t limit,
+    ngx_uint_t raw, ngx_str_t *out, ngx_uint_t *truncated)
 {
-    size_t                    size, limit, vroom;
+    size_t                    size, vroom;
     u_char                   *buf, *mark, hex[64];
     ngx_str_t                 value;
     ngx_uint_t                i, first;
@@ -1213,9 +1326,10 @@ ngx_http_waf_headers_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
     ngx_http_waf_loc_conf_t    *wlcf;
     ngx_http_waf_shoot_conf_t  *sh;
 
-    wlcf  = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
-    sh    = &wlcf->shoot[ctx->phase];
-    limit = ngx_http_waf_store_need_ctx(ctx, NGX_HTTP_WAF_OBJ_HEADERS);
+    *truncated = 0;
+
+    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+    sh   = &wlcf->shoot[ctx->phase];
 
     mask = sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][NGX_HTTP_WAF_OBJ_HEADERS]
                     [NGX_HTTP_WAF_AXIS_MASK];
@@ -1259,17 +1373,13 @@ ngx_http_waf_headers_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
 
     for (i = 0; i < pairs->nelts; i++) {
 
-        if (!ctx->ph->store_raw
-            && ngx_http_waf_name_listed(deny, &kv[i].key))
-        {
+        if (!raw && ngx_http_waf_name_listed(deny, &kv[i].key)) {
             continue;
         }
 
         value = kv[i].value;
 
-        if (!ctx->ph->store_raw
-            && ngx_http_waf_name_listed(mask, &kv[i].key))
-        {
+        if (!raw && ngx_http_waf_name_listed(mask, &kv[i].key)) {
             ngx_http_waf_capture_hash(&value, hex);
             value.data = hex;
             value.len  = 64;
@@ -1291,6 +1401,7 @@ ngx_http_waf_headers_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
             && ngx_http_waf_jw_len(&jw) + 1 > limit)
         {
             jw.pos = mark;
+            *truncated = 1;
             break;
         }
 
@@ -1311,21 +1422,22 @@ ngx_http_waf_headers_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
 
 
 static ngx_int_t
-ngx_http_waf_args_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
+ngx_http_waf_args_collect(ngx_http_waf_ctx_t *ctx, size_t limit,
+    ngx_uint_t raw, ngx_str_t *out, ngx_uint_t *truncated)
 {
-    size_t                      limit;
     ngx_array_t                *deny, *mask;
     ngx_http_waf_loc_conf_t    *wlcf;
     ngx_http_waf_shoot_conf_t  *sh;
+
+    *truncated = 0;
 
     if (ctx->phase != NGX_HTTP_WAF_PHASE_REQUEST) {
         ngx_str_null(out);
         return NGX_OK;
     }
 
-    wlcf  = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-    sh    = &wlcf->shoot[ctx->phase];
-    limit = ngx_http_waf_store_need_ctx(ctx, NGX_HTTP_WAF_OBJ_ARGS);
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+    sh   = &wlcf->shoot[ctx->phase];
 
     if (limit == (size_t) -1) {
         limit = NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE;
@@ -1336,7 +1448,7 @@ ngx_http_waf_args_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
     mask = sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][NGX_HTTP_WAF_OBJ_ARGS]
                     [NGX_HTTP_WAF_AXIS_MASK];
 
-    if (!ctx->ph->store_raw
+    if (!raw
         && ((deny != NULL && deny->nelts != 0)
             || (mask != NULL && mask->nelts != 0)))
     {
@@ -1352,7 +1464,8 @@ ngx_http_waf_args_collect(ngx_http_waf_ctx_t *ctx, ngx_str_t *out)
     }
 
     if (limit != NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE && out->len > limit) {
-        out->len = limit;
+        out->len   = limit;
+        *truncated = 1;
     }
 
     return NGX_OK;
@@ -1473,26 +1586,6 @@ ngx_http_waf_meta_on_put(ngx_http_waf_body_op_t *op)
         *ctx->ph->meta[op->obj] = op->locator;
         ctx->ph->meta_placed   |= NGX_HTTP_WAF_OBJ_BIT(op->obj);
 
-        if (ctx->ph->reloading
-            && ngx_http_waf_reload_raw(ctx,
-                   ngx_http_get_module_loc_conf(ctx->request,
-                                                ngx_http_waf_module),
-                   op->obj))
-        {
-            ctx->ph->raw |= NGX_HTTP_WAF_OBJ_BIT(op->obj);
-        }
-
-    } else if (ctx->ph->reloading) {
-        ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
-                      "waf: body store failed to reload %V; agent may see "
-                      "the inspector view", &ngx_http_waf_objs[op->obj].name);
-
-        if (op->hold) {
-            ngx_http_waf_body_holds--;
-            op->hold = 0;
-            ctx->ph->meta_op[op->obj] = NULL;
-        }
-
     } else {
         wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
 
@@ -1522,12 +1615,7 @@ ngx_http_waf_meta_on_put(ngx_http_waf_body_op_t *op)
     }
 
     if (ctx->ph->meta_pending == 0 && !ctx->ph->meta_in_put) {
-        if (ctx->ph->reloading && ctx->ph->body_in_put && !ctx->ph->body_settled) {
-            return;
-        }
-
-        ngx_http_waf_body_resumed(ctx,
-            ctx->ph->reloading ? NGX_OK : ngx_http_waf_meta_result(ctx));
+        ngx_http_waf_body_resumed(ctx, ngx_http_waf_meta_result(ctx));
     }
 }
 
@@ -1538,19 +1626,8 @@ ngx_http_waf_body_place(ngx_http_waf_ctx_t *ctx)
     ngx_http_request_t      *r = ctx->request;
     ngx_http_waf_locator_t  *loc;
 
-    if (!ctx->ph->reloading && (ctx->ph->locator != NULL || ctx->ph->body_placed)) {
+    if (ctx->ph->locator != NULL || ctx->ph->body_placed) {
         return NGX_OK;
-    }
-
-    if (ctx->ph->reloading && ctx->ph->locator != NULL) {
-        if (!ngx_http_waf_body_reload_wider(ctx)) {
-            return NGX_OK;
-        }
-
-        ctx->ph->locator->size = ngx_http_waf_body_length(ctx);
-        ctx->ph->body_placed   = 0;
-        ctx->ph->body_settled  = 0;
-        return ngx_http_waf_body_decide(ctx);
     }
 
     loc = ngx_pcalloc(r->pool, sizeof(ngx_http_waf_locator_t));
@@ -1806,26 +1883,6 @@ ngx_http_waf_body_on_put(ngx_http_waf_body_op_t *op)
         return;
     }
 
-    if (ctx->ph->reloading) {
-        ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
-                      "waf: body store failed to reload body; agent may see "
-                      "the inspector view");
-
-        if (op->hold) {
-            ngx_http_waf_body_holds--;
-            op->hold = 0;
-            ctx->ph->body_op = NULL;
-        } else {
-            ctx->ph->body_placed = 1;
-        }
-
-        if (!ctx->ph->body_in_put) {
-            ngx_http_waf_body_resumed(ctx, NGX_OK);
-        }
-
-        return;
-    }
-
     wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
 
     ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
@@ -1977,14 +2034,18 @@ ngx_http_waf_archive_pending(ngx_http_waf_ctx_t *ctx)
 }
 
 
+/* Keys the agent will read: the archive set minus what rode with the record. */
+
 static ngx_uint_t
 ngx_http_waf_archive_kept(ngx_http_waf_ctx_t *ctx, ngx_uint_t phase)
 {
+    ngx_http_waf_phase_ctx_t  *ph = &ctx->phases[phase];
+
     if (phase == ctx->phase) {
-        return ngx_http_waf_archive_mask(ctx);
+        return ngx_http_waf_archive_mask(ctx) & ~ph->attached;
     }
 
-    return ctx->phases[phase].archive_settled ? ctx->phases[phase].archive : 0;
+    return ph->archive_settled ? (ph->archive & ~ph->attached) : 0;
 }
 
 
@@ -2108,11 +2169,7 @@ ngx_http_waf_store_del_key(ngx_http_waf_ctx_t *ctx, ngx_str_t *key)
 ngx_uint_t
 ngx_http_waf_archive_mask(ngx_http_waf_ctx_t *ctx)
 {
-    ngx_uint_t                  i, mask, placed, verdict, forced;
-    ngx_http_waf_locator_t     *loc;
-    ngx_http_waf_loc_conf_t    *wlcf;
-    ngx_http_waf_shoot_conf_t  *sh;
-    ngx_http_waf_audit_ovr_t   *ovr;
+    ngx_uint_t  i, mask, verdict;
 
     if (ctx->ph->archive_settled) {
         return ctx->ph->archive;
@@ -2131,65 +2188,19 @@ ngx_http_waf_archive_mask(ngx_http_waf_ctx_t *ctx)
         return 0;
     }
 
-    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-    sh   = &wlcf->shoot[ctx->phase];
-    ovr  = ngx_http_waf_audit_ovr_cur(ctx);
-
-    if (ovr->archive.set == NGX_HTTP_WAF_SET_OFF) {
-        return 0;
-    }
-
-    forced = (ovr->archive.set == NGX_HTTP_WAF_SET_ON
-              && ngx_http_waf_audit_enabled());
-
-    if (sh->archive == 0 && !forced) {
-        return 0;
-    }
-
-    placed = ctx->ph->meta_placed
-             | (ctx->ph->body_placed
-                    ? NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY) : 0);
-
-    if (forced) {
-        mask = ngx_http_waf_ovr_on(&ovr->archive);
-
-        if (mask == 0) {
-            mask = (sh->archive != 0 ? sh->archive : NGX_HTTP_WAF_OBJ_ALL)
-                   & ~ovr->archive.off;
-        }
-
-        mask &= placed;
-
-    } else {
-        mask = sh->archive & placed;
-    }
-
     verdict = ngx_http_waf_route_verdict(ctx);
-
-    if (forced && ovr->archive.has_when
-        && !(ovr->archive.when & (1u << verdict)))
-    {
-        return 0;
-    }
+    mask    = 0;
 
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
 
-        if (!(mask & NGX_HTTP_WAF_OBJ_BIT(i))) {
+        if (ngx_http_waf_archive_wants(ctx, i, verdict) == 0) {
             continue;
         }
 
-        if (!forced && !(sh->archive_when[i] & (1u << verdict))) {
-            mask &= ~NGX_HTTP_WAF_OBJ_BIT(i);
-            continue;
-        }
-
-        loc = ngx_http_waf_store_locator(ctx, i);
-
-        if (loc == NULL
-            || loc->unavailable != NGX_HTTP_WAF_BODY_AVAILABLE
-            || loc->key.len == 0)
+        if (ngx_http_waf_store_serves(ctx, i)
+            || ngx_http_waf_attachable(ctx, i))
         {
-            mask &= ~NGX_HTTP_WAF_OBJ_BIT(i);
+            mask |= NGX_HTTP_WAF_OBJ_BIT(i);
         }
     }
 
@@ -2378,7 +2389,17 @@ ngx_http_waf_archive_write(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
         }
 
         if (i < NGX_HTTP_WAF_META_COUNT) {
-            lists = sh->lists[NGX_HTTP_WAF_LIST_ARCHIVE][i];
+
+            /*
+             * The lists the agent applies: the archive's own, or the capture
+             * lists when it has none. An inspector asking for the original
+             * gets the own lists only, whatever they are.
+             */
+
+            lists = (ngx_http_waf_lists_own(sh, NGX_HTTP_WAF_LIST_ARCHIVE, i)
+                     || ngx_http_waf_ovr_original(&ovr->archive, i))
+                        ? sh->lists[NGX_HTTP_WAF_LIST_ARCHIVE][i]
+                        : sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][i];
 
             ngx_http_waf_jw_namelist(jw, "allow",
                                      lists[NGX_HTTP_WAF_AXIS_ALLOW]);
@@ -2387,7 +2408,7 @@ ngx_http_waf_archive_write(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
             ngx_http_waf_jw_namelist(jw, "deny",
                                      lists[NGX_HTTP_WAF_AXIS_DENY]);
 
-            if (!(ctx->ph->raw & NGX_HTTP_WAF_OBJ_BIT(i))) {
+            if (!(ctx->ph->attach_raw & NGX_HTTP_WAF_OBJ_BIT(i))) {
                 ngx_http_waf_jw_namelist(jw, "hashed",
                     sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][i]
                              [NGX_HTTP_WAF_AXIS_MASK]);
@@ -2728,10 +2749,11 @@ ngx_http_waf_locator_object_size(ngx_http_waf_locator_t *loc)
     return sizeof("{\"store\":\"\",\"driver\":\"\",\"key\":\"\","
                   "\"size\":,\"declared_size\":,\"sha256\":\"\","
                   "\"complete\":false,\"truncated\":false,\"encoding\":\"\","
-                  "\"expires_at\":,\"hint\":\"\",\"unavailable\":\"\"}")
+                  "\"expires_at\":,\"hint\":\"\",\"unavailable\":\"\","
+                  "\"offset\":}")
            + 6 * (loc->store.len + loc->driver.len + loc->key.len
                   + loc->encoding.len + loc->hint.len)
-           + 64 + 4 * NGX_INT_T_LEN + 32;
+           + 64 + 5 * NGX_INT_T_LEN + 32;
 }
 
 
@@ -2897,6 +2919,13 @@ ngx_http_waf_locator_write(ngx_http_waf_jw_t *jw, ngx_http_waf_locator_t *loc,
         ngx_http_waf_jw_str(jw, &loc->encoding);
     }
 
+    if (flags & NGX_HTTP_WAF_LOC_ATTACH) {
+        ngx_http_waf_jw_lit(jw, ",\"store\":\"attach\",\"offset\":");
+        ngx_http_waf_jw_int(jw, (ngx_int_t) loc->offset);
+        ngx_http_waf_jw_lit(jw, "}");
+        return;
+    }
+
     if (!(flags & NGX_HTTP_WAF_LOC_ADDRESS)) {
         ngx_http_waf_jw_lit(jw, "}");
         return;
@@ -3042,40 +3071,36 @@ ngx_http_waf_store_write_phase(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
 }
 
 
+/*
+ * The body still has to be read from the client when the agent or the preview
+ * of this record wants it and no wave asked for it. With a response phase
+ * ahead the outcome is not final yet, so a body the archive names on any
+ * outcome is read now: later there is no client to read it from.
+ */
+
 ngx_uint_t
-ngx_http_waf_store_reload_needs_body(ngx_http_waf_ctx_t *ctx)
+ngx_http_waf_agent_needs_body(ngx_http_waf_ctx_t *ctx)
 {
-    ngx_http_request_t       *r = ctx->request;
-    ngx_http_waf_loc_conf_t  *wlcf;
+    ngx_http_request_t  *r = ctx->request;
+
+    if (ctx->phase != NGX_HTTP_WAF_PHASE_REQUEST) {
+        return 0;
+    }
 
     if (ctx->ph->body_ready || ctx->ph->body_discarded) {
         return 0;
     }
 
-    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
-
-    if (!ngx_http_waf_reload_need(ctx, wlcf, NGX_HTTP_WAF_OBJ_BODY)
-        && !(ctx->ph->journal && ngx_http_waf_preview_body_budget(ctx) != 0))
+    if (ngx_http_waf_archive_wants(ctx, NGX_HTTP_WAF_OBJ_BODY,
+                                   ngx_http_waf_route_verdict(ctx)) == 0
+        && !(ngx_http_waf_phase_follows(ctx)
+             && ngx_http_waf_archive_names(ctx, NGX_HTTP_WAF_OBJ_BODY))
+        && ngx_http_waf_preview_body_budget(ctx) == 0)
     {
         return 0;
     }
 
     return (r->headers_in.content_length_n > 0 || r->headers_in.chunked);
-}
-
-
-size_t
-ngx_http_waf_store_reload_size(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
-{
-    ngx_http_waf_loc_conf_t  *wlcf;
-
-    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-
-    if (!ngx_http_waf_reload_need(ctx, wlcf, obj)) {
-        return 0;
-    }
-
-    return ngx_http_waf_reload_size(ctx, obj);
 }
 
 
@@ -3086,72 +3111,239 @@ ngx_http_waf_body_chain(ngx_http_waf_ctx_t *ctx)
 }
 
 
-static ngx_int_t
-ngx_http_waf_meta_reload_one(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
+/*
+ * The body as the module saw it, not as much of it as the store got: the
+ * record reports the whole length even when the capture is a slice.
+ */
+
+off_t
+ngx_http_waf_body_seen(ngx_http_waf_ctx_t *ctx)
 {
-    ngx_str_t                blob;
-    ngx_http_waf_locator_t  *loc = ctx->ph->meta[obj];
+    off_t  total;
 
-    if (ngx_http_waf_objs[obj].collect(ctx, &blob) != NGX_OK) {
-        return NGX_ERROR;
+    /* a journaled response keeps only a prefix copy, but counts every byte */
+
+    if (ctx->phase == NGX_HTTP_WAF_PHASE_RESPONSE && ctx->rsp_journal) {
+        return ctx->rsp_journal_total;
     }
 
-    if (loc != NULL
-        && loc->unavailable == NGX_HTTP_WAF_BODY_AVAILABLE
-        && loc->key.len != 0
-        && blob.len == ctx->ph->store_blob[obj].len
-        && ngx_memcmp(blob.data, ctx->ph->store_blob[obj].data, blob.len) == 0)
-    {
-        ctx->ph->raw |= NGX_HTTP_WAF_OBJ_BIT(obj);
-        return NGX_OK;
+    total = ngx_http_waf_body_length(ctx);
+
+    if (total > 0) {
+        return total;
     }
 
-    ctx->ph->meta[obj] = NULL;
-
-    return ngx_http_waf_meta_place_blob(ctx, obj, &blob);
+    return (ctx->ph->locator != NULL) ? ctx->ph->locator->size : 0;
 }
 
 
-static ngx_uint_t
-ngx_http_waf_body_reload_wider(ngx_http_waf_ctx_t *ctx)
+/*
+ * How many bytes of the body can ride with the record: the body as read, no
+ * wider than waf_body_limit (a trimmed body gives its prefix, a body over the
+ * limit under another policy gives nothing) and no wider than asked.
+ */
+
+off_t
+ngx_http_waf_body_attach_len(ngx_http_waf_ctx_t *ctx, size_t limit,
+    off_t *total)
 {
-    off_t                     place;
-    size_t                    need, limit;
-    ngx_http_waf_locator_t   *loc = ctx->ph->locator;
+    off_t                     len, cap;
     ngx_http_waf_loc_conf_t  *wlcf;
 
-    if (loc->unavailable != NGX_HTTP_WAF_BODY_AVAILABLE) {
+    *total = 0;
+
+    if (ctx->phase == NGX_HTTP_WAF_PHASE_REQUEST
+        && (!ctx->ph->body_ready || ctx->ph->body_discarded))
+    {
         return 0;
     }
 
-    if (ctx->phase != NGX_HTTP_WAF_PHASE_REQUEST) {
+    len = ngx_http_waf_body_length(ctx);
+
+    if (len <= 0) {
         return 0;
     }
 
-    need = ngx_http_waf_store_need_ctx(ctx, NGX_HTTP_WAF_OBJ_BODY);
+    *total = len;
 
-    if (need == 0) {
-        return 0;
-    }
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+    cap  = (off_t) wlcf->body_limit[ctx->phase];
 
-    wlcf  = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-    limit = wlcf->body_limit[ctx->phase];
-    place = ngx_http_waf_body_length(ctx);
-
-    if (place > (off_t) limit) {
+    if (len > cap) {
 
         if (wlcf->body_limit_policy[ctx->phase] != NGX_HTTP_WAF_POLICY_TRIM) {
             return 0;
         }
 
-        place = (off_t) limit;
+        len = cap;
     }
 
-    if (need != (size_t) -1 && place > (off_t) need) {
-        place = (off_t) need;
+    if (limit != NGX_HTTP_WAF_AGENT_WHOLE && len > (off_t) limit) {
+        len = (off_t) limit;
     }
 
-    return place > ctx->ph->body_placed_len;
+    return len;
+}
+
+
+/*
+ * Writes the body prefix the agent asked for into the attachment file and
+ * describes it in loc. The checksum covers the whole body as the client sent
+ * it: the placed copy already has it, otherwise it is computed on the way.
+ */
+
+ngx_int_t
+ngx_http_waf_body_attach(ngx_http_waf_ctx_t *ctx, int fd, size_t limit,
+    ngx_http_waf_locator_t *loc)
+{
+    off_t                    total, place, left, taken, pos;
+    size_t                   avail, n;
+    ssize_t                  rd;
+    u_char                   chunk[NGX_HTTP_WAF_ATTACH_CHUNK];
+    ngx_buf_t               *b;
+    ngx_uint_t               hashing;
+    ngx_chain_t             *cl;
+    ngx_http_request_t      *r = ctx->request;
+    ngx_http_waf_sha256_t    sha;
+    ngx_http_waf_locator_t  *placed;
+
+    place = ngx_http_waf_body_attach_len(ctx, limit, &total);
+
+    if (place == 0) {
+        return NGX_DECLINED;
+    }
+
+    placed = ctx->ph->locator;
+
+    if (placed != NULL && placed->has_sha256) {
+        ngx_memcpy(loc->sha256, placed->sha256, 32);
+        loc->has_sha256 = 1;
+        hashing = 0;
+
+    } else {
+        ngx_http_waf_sha256_init(&sha);
+        hashing = 1;
+    }
+
+    left  = hashing ? total : place;
+    taken = 0;
+
+    for (cl = ngx_http_waf_body_source(ctx); cl != NULL && left > 0;
+         cl = cl->next)
+    {
+        b = cl->buf;
+
+        if (b->in_file) {
+
+            for (pos = b->file_pos; pos < b->file_last && left > 0; ) {
+
+                avail = (size_t) ngx_min((off_t) sizeof(chunk),
+                                         ngx_min(b->file_last - pos, left));
+
+                rd = ngx_read_file(b->file, chunk, avail, pos);
+                if (rd <= 0) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                                  "waf: reading the body file \"%V\" for the "
+                                  "agent failed", &b->file->name);
+                    return NGX_ERROR;
+                }
+
+                if (hashing) {
+                    ngx_http_waf_sha256_update(&sha, chunk, (size_t) rd);
+                }
+
+                if (taken < place) {
+                    n = (size_t) ngx_min((off_t) rd, place - taken);
+
+                    if (ngx_http_waf_attach_write(fd, chunk, n) != NGX_OK) {
+                        return NGX_ERROR;
+                    }
+
+                    taken += (off_t) n;
+                }
+
+                pos  += rd;
+                left -= rd;
+            }
+
+            continue;
+        }
+
+        avail = (size_t) ngx_min((off_t) (b->last - b->pos), left);
+
+        if (hashing) {
+            ngx_http_waf_sha256_update(&sha, b->pos, avail);
+        }
+
+        if (taken < place) {
+            n = (size_t) ngx_min((off_t) avail, place - taken);
+
+            if (ngx_http_waf_attach_write(fd, b->pos, n) != NGX_OK) {
+                return NGX_ERROR;
+            }
+
+            taken += (off_t) n;
+        }
+
+        left -= (off_t) avail;
+    }
+
+    if (hashing) {
+        ngx_http_waf_sha256_final(&sha, loc->sha256);
+        loc->has_sha256 = 1;
+    }
+
+    loc->size          = taken;
+    loc->declared_size = total;
+    loc->complete      = (taken == total) ? 1 : 0;
+
+    if (ctx->phase == NGX_HTTP_WAF_PHASE_RESPONSE) {
+        ngx_http_waf_body_attach_response(ctx, loc, total);
+        ngx_http_waf_body_encoding_out(r, loc);
+
+    } else {
+        ngx_http_waf_body_encoding(r, loc);
+    }
+
+    loc->truncated = loc->complete ? 0 : 1;
+
+    return NGX_OK;
+}
+
+
+/*
+ * A response is held, or copied by the journal, only up to what the phase
+ * needs, so the bytes in hand are a prefix unless the last buffer came. The
+ * whole length is then the journal's count or the held chain; until then it
+ * is unknown, the object is not complete, and a checksum of the prefix would
+ * pass for the checksum of the response -- it is left out.
+ */
+
+static void
+ngx_http_waf_body_attach_response(ngx_http_waf_ctx_t *ctx,
+    ngx_http_waf_locator_t *loc, off_t held)
+{
+    off_t                whole;
+    ngx_http_request_t  *r = ctx->request;
+
+    whole = -1;
+
+    if (ctx->rsp_last) {
+        whole = ctx->rsp_journal ? ctx->rsp_journal_total : held;
+    }
+
+    if (whole >= 0) {
+        loc->declared_size = whole;
+
+    } else if (r->headers_out.content_length_n > 0) {
+        loc->declared_size = r->headers_out.content_length_n;
+    }
+
+    loc->complete = (whole >= 0 && loc->size == whole) ? 1 : 0;
+
+    if (!loc->complete) {
+        loc->has_sha256 = 0;
+    }
 }
 
 
@@ -3170,93 +3362,4 @@ ngx_http_waf_obj_suffix_reserved(ngx_str_t *suffix)
     }
 
     return 0;
-}
-
-
-static ngx_uint_t
-ngx_http_waf_reload_places(ngx_http_waf_ctx_t *ctx,
-    ngx_http_waf_loc_conf_t *wlcf)
-{
-    ngx_uint_t  i;
-
-    for (i = 0; i < NGX_HTTP_WAF_META_COUNT; i++) {
-        if (ngx_http_waf_reload_need(ctx, wlcf, i)) {
-            return 1;
-        }
-    }
-
-    return ctx->ph->body_ready
-           && ngx_http_waf_reload_need(ctx, wlcf, NGX_HTTP_WAF_OBJ_BODY);
-}
-
-
-ngx_int_t
-ngx_http_waf_store_reload(ngx_http_waf_ctx_t *ctx)
-{
-    ngx_int_t                 rc;
-    ngx_uint_t                i;
-    ngx_http_waf_loc_conf_t  *wlcf;
-
-    if (ctx->ph->store_reloaded) {
-        return NGX_OK;
-    }
-
-    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-
-    if (ctx->rid_hex[0] == '-'
-        && ngx_http_waf_reload_places(ctx, wlcf)
-        && ngx_http_waf_rid_assign(ctx) != NGX_OK)
-    {
-        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
-                      "waf: no free slot to name store objects, the record "
-                      "goes without them");
-
-        ctx->ph->store_reloaded = 1;
-        return NGX_OK;
-    }
-
-    ctx->ph->store_raw      = 1;
-    ctx->ph->reloading      = 1;
-    ctx->ph->reload_issuing = 1;
-
-    for (i = 0; i < NGX_HTTP_WAF_META_COUNT; i++) {
-        if (!ngx_http_waf_reload_need(ctx, wlcf, i)) {
-            continue;
-        }
-
-        ctx->ph->store_raw = ngx_http_waf_reload_raw(ctx, wlcf, i);
-
-        if (ngx_http_waf_meta_reload_one(ctx, i) != NGX_OK) {
-            ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
-                          "waf: failed to reload %V for the agent",
-                          &ngx_http_waf_objs[i].name);
-        }
-    }
-
-    ctx->ph->store_raw = 1;
-
-    if (ngx_http_waf_reload_need(ctx, wlcf, NGX_HTTP_WAF_OBJ_BODY)
-        && ctx->ph->body_ready)
-    {
-        rc = ngx_http_waf_body_place(ctx);
-
-        if (rc == NGX_AGAIN) {
-            ctx->ph->reload_issuing = 0;
-            return NGX_AGAIN;
-        }
-    }
-
-    ctx->ph->reload_issuing = 0;
-
-    if (ctx->ph->meta_pending != 0
-        || (ctx->ph->body_op != NULL && !ctx->ph->body_settled))
-    {
-        return NGX_AGAIN;
-    }
-
-    ctx->ph->store_raw      = 0;
-    ctx->ph->store_reloaded = 1;
-    ctx->ph->reloading      = 0;
-
-    return NGX_OK;
 }

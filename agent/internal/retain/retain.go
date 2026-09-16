@@ -146,6 +146,10 @@ func (p *Pool) clean() {
 
 	for batch := range p.sweep {
 		for _, item := range batch {
+			if item.key == "" {
+				continue
+			}
+
 			if err := store.del(item.addr, item.key); err != nil {
 				p.log.Warn("archive: store cleanup failed",
 					"key", item.key, "error", err.Error())
@@ -172,22 +176,37 @@ func (p *Pool) move(store *redisPool, d audit.Decision, section audit.Store,
 		return reasonError, moved{}
 	}
 
-	loc, ok := section.Locate(kind)
-	if !ok {
-		p.log.Warn("archive: locator has no address", "ray", d.Ray, "kind", kind)
-		return reasonError, moved{}
-	}
+	var (
+		data      []byte
+		addr, key string
+	)
 
-	addr := p.cfg.node(loc.Hint)
+	if attached, ok := d.Attached[kind]; ok {
+		// The object rode with the record: nothing to fetch, no key to
+		// clean up afterwards.
+		data = attached
 
-	data, err := store.get(addr, loc.Key)
-	if errors.Is(err, ErrMissing) {
-		return reasonExpired, moved{}
-	}
-	if err != nil {
-		p.log.Warn("archive: store read failed",
-			"ray", d.Ray, "kind", kind, "node", addr, "error", err.Error())
-		return reasonError, moved{}
+	} else {
+		loc, ok := section.Locate(kind)
+		if !ok {
+			p.log.Warn("archive: locator has no address", "ray", d.Ray, "kind", kind)
+			return reasonError, moved{}
+		}
+
+		addr = p.cfg.node(loc.Hint)
+		key = loc.Key
+
+		var err error
+
+		data, err = store.get(addr, key)
+		if errors.Is(err, ErrMissing) {
+			return reasonExpired, moved{}
+		}
+		if err != nil {
+			p.log.Warn("archive: store read failed",
+				"ray", d.Ray, "kind", kind, "node", addr, "error", err.Error())
+			return reasonError, moved{}
+		}
 	}
 
 	if len(data) == 0 {
@@ -206,11 +225,7 @@ func (p *Pool) move(store *redisPool, d audit.Decision, section audit.Store,
 		return reasonEmpty, moved{}
 	}
 
-	trimmed := false
-	if terms.Limit > 0 && int64(len(data)) > terms.Limit {
-		data = data[:terms.Limit]
-		trimmed = true
-	}
+	data, trimmed := cutToLimit(kind, data, terms.Limit)
 
 	object := objectName(d, kind)
 
@@ -232,7 +247,7 @@ func (p *Pool) move(store *redisPool, d audit.Decision, section audit.Store,
 	return "", moved{
 		object:  object,
 		expires: expires,
-		key:     loc.Key,
+		key:     key,
 		addr:    addr,
 		size:    len(data),
 		trimmed: trimmed,

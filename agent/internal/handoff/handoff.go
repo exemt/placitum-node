@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 const (
@@ -13,9 +14,16 @@ const (
 	MaxBytes = 8 << 20
 
 	readBuffer = 32 << 20
+
+	// maxDescriptors is how many passed descriptors one datagram may carry.
+	// The module sends at most one, the file with the record's attachments;
+	// anything beyond that is closed unread.
+	maxDescriptors = 4
 )
 
-type Handler func([]byte)
+// Handler gets one datagram: the record and, when the module attached objects
+// to it, the open file holding them. The handler owns the file and closes it.
+type Handler func(raw []byte, attach *os.File)
 
 type Opts struct {
 	Max        int
@@ -73,20 +81,26 @@ func ServeOpts(path string, o Opts, handle Handler) (func() error, error) {
 		defer close(done)
 
 		buf := make([]byte, o.Max)
+		oob := make([]byte, syscall.CmsgSpace(maxDescriptors*4))
 
 		for {
-			n, err := c.Read(buf)
+			n, oobn, _, _, err := c.ReadMsgUnix(buf, oob)
 			if err != nil {
 				return
 			}
 
+			attach := descriptor(oob[:oobn])
+
 			if n == 0 {
+				if attach != nil {
+					_ = attach.Close()
+				}
 				continue
 			}
 
 			payload := make([]byte, n)
 			copy(payload, buf[:n])
-			handle(payload)
+			handle(payload, attach)
 		}
 	}()
 
@@ -96,4 +110,38 @@ func ServeOpts(path string, o Opts, handle Handler) (func() error, error) {
 		_ = os.Remove(path)
 		return err
 	}, nil
+}
+
+// descriptor takes the first passed descriptor out of the control messages
+// and closes the rest: a leaked descriptor would keep the module's file alive
+// for as long as the agent runs.
+func descriptor(oob []byte) *os.File {
+	if len(oob) == 0 {
+		return nil
+	}
+
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return nil
+	}
+
+	var first *os.File
+
+	for _, m := range msgs {
+		fds, err := syscall.ParseUnixRights(&m)
+		if err != nil {
+			continue
+		}
+
+		for _, fd := range fds {
+			if first == nil {
+				first = os.NewFile(uintptr(fd), "waf-record")
+				continue
+			}
+
+			_ = syscall.Close(fd)
+		}
+	}
+
+	return first
 }

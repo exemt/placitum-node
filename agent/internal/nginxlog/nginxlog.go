@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -208,7 +209,11 @@ func Serve(nc *nats.Conn, path, writer string, io *flow.Counter,
 
 	stop, err := handoff.ServeOpts(path,
 		handoff.Opts{Max: MaxBytes, ReadBuffer: readBuffer},
-		func(raw []byte) {
+		func(raw []byte, attach *os.File) {
+			if attach != nil {
+				_ = attach.Close()
+			}
+
 			line, ok := Parse(raw, time.Now().UTC())
 			if !ok {
 				return

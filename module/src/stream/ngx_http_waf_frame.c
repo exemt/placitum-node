@@ -1473,9 +1473,10 @@ ngx_http_waf_frame_begin(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d,
 
     ngx_memzero(ph, sizeof(ngx_http_waf_phase_ctx_t));
 
-    ph->body_policy    = NGX_HTTP_WAF_POLICY_UNSET;
-    ph->store_reloaded = 1;
-    ph->store_cleanup  = 1;
+    ph->body_policy   = NGX_HTTP_WAF_POLICY_UNSET;
+    ph->agent_settled = 1;
+    ph->store_cleanup = 1;
+    ph->attach_fd     = -1;
 
     ngx_http_waf_phase_enter(ctx, d->phase);
 
@@ -1662,10 +1663,10 @@ ngx_http_waf_frame_journal(ngx_http_waf_frame_t *fc,
     d->cleared += d->held;
     d->held     = 0;
 
-    ctx->ph->journal        = 1;
-    ctx->ph->body_ready     = 1;
-    ctx->ph->store_reloaded = 0;
-    ctx->state              = NGX_HTTP_WAF_ST_DONE;
+    ctx->ph->journal       = 1;
+    ctx->ph->body_ready    = 1;
+    ctx->ph->agent_settled = 1;
+    ctx->state             = NGX_HTTP_WAF_ST_DONE;
 
     rc = ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_OVERRIDES);
 
@@ -2095,8 +2096,8 @@ ngx_http_waf_frame_swap(ngx_http_waf_frame_t *fc, ngx_http_waf_body_op_t *op)
         budget = swlcf->shoot[d->phase].preview[NGX_HTTP_WAF_OBJ_BODY];
 
         if (budget != 0
-            && (swlcf->shoot[d->phase].preview_source_sent
-                & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY)))
+            && swlcf->shoot[d->phase].preview_source[NGX_HTTP_WAF_OBJ_BODY]
+               == NGX_HTTP_WAF_SOURCE_SENT)
         {
             keep = op->data.len < budget ? op->data.len : budget;
 
@@ -2191,9 +2192,10 @@ ngx_http_waf_frame_end(ngx_http_waf_frame_t *fc)
 
     ngx_memzero(&ctx->phases[phase], sizeof(ngx_http_waf_phase_ctx_t));
 
-    ctx->phases[phase].body_policy    = NGX_HTTP_WAF_POLICY_UNSET;
-    ctx->phases[phase].store_reloaded = 1;
-    ctx->phases[phase].store_cleanup  = 1;
+    ctx->phases[phase].body_policy   = NGX_HTTP_WAF_POLICY_UNSET;
+    ctx->phases[phase].agent_settled = 1;
+    ctx->phases[phase].store_cleanup = 1;
+    ctx->phases[phase].attach_fd     = -1;
 }
 
 

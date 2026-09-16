@@ -167,6 +167,10 @@ func (p *parking) complete(pool *Pool, store *redisPool, kind, reason string,
 	pool.emit(d)
 
 	for _, item := range trash {
+		if item.key == "" {
+			continue
+		}
+
 		if err := store.del(item.addr, item.key); err != nil {
 			pool.log.Warn("archive: store cleanup failed",
 				"ray", d.Ray, "key", item.key, "error", err.Error())

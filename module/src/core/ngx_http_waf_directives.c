@@ -30,16 +30,10 @@ static void ngx_http_waf_archive_reset(ngx_http_waf_shoot_conf_t *sh);
 static char *ngx_http_waf_archive_apply(ngx_conf_t *cf,
     ngx_http_waf_shoot_conf_t *sh, ngx_uint_t mask, ngx_uint_t off,
     ngx_uint_t when, time_t ttl, size_t *limits);
-static char *ngx_http_waf_archive_reload(ngx_conf_t *cf,
-    ngx_http_waf_shoot_conf_t *sh);
-static char *ngx_http_waf_preview_reload(ngx_conf_t *cf,
-    ngx_http_waf_shoot_conf_t *sh);
 static ngx_int_t ngx_http_waf_obj_bit(ngx_str_t *name, ngx_uint_t *bit);
 static ngx_uint_t ngx_http_waf_bit_obj(ngx_uint_t bit);
 static ngx_int_t ngx_http_waf_arg_phase(ngx_conf_t *cf, ngx_str_t *arg,
     ngx_uint_t *phases);
-static char *ngx_http_waf_no_reload_in(ngx_conf_t *cf, ngx_str_t *dir,
-    ngx_uint_t phases);
 static char *ngx_http_waf_obj_in_phase(ngx_conf_t *cf, ngx_str_t *dir,
     ngx_uint_t phases, ngx_uint_t obj);
 
@@ -125,6 +119,13 @@ static ngx_http_waf_kw_t  ngx_http_waf_kw_obj[] = {
 };
 
 
+static ngx_http_waf_kw_t  ngx_http_waf_kw_source[] = {
+    { ngx_string("original"), NGX_HTTP_WAF_SOURCE_ORIGINAL },
+    { ngx_string("sent"),     NGX_HTTP_WAF_SOURCE_SENT     },
+    { ngx_null_string, 0 }
+};
+
+
 static ngx_http_waf_kw_t  ngx_http_waf_kw_archive_when[] = {
     { ngx_string("allow"), 1u << NGX_HTTP_WAF_V_ALLOW },
     { ngx_string("deny"),  1u << NGX_HTTP_WAF_V_DENY  },
@@ -185,15 +186,13 @@ ngx_http_waf_archive_reset(ngx_http_waf_shoot_conf_t *sh)
 {
     ngx_uint_t  i;
 
-    sh->archive_reload  = 0;
     sh->archive_set     = 0;
     sh->archive_cleared = 1;
 
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-        sh->archive_when[i]         = NGX_CONF_UNSET_UINT;
-        sh->archive_ttl[i]          = NGX_CONF_UNSET;
-        sh->archive_limit[i]        = NGX_CONF_UNSET_SIZE;
-        sh->archive_reload_limit[i] = NGX_CONF_UNSET_SIZE;
+        sh->archive_when[i]  = NGX_CONF_UNSET_UINT;
+        sh->archive_ttl[i]   = NGX_CONF_UNSET;
+        sh->archive_limit[i] = NGX_CONF_UNSET_SIZE;
     }
 
     ngx_memzero(sh->lists[NGX_HTTP_WAF_LIST_ARCHIVE],
@@ -333,25 +332,6 @@ ngx_http_waf_arg_phase(ngx_conf_t *cf, ngx_str_t *arg, ngx_uint_t *phases)
                        "frame:s2c as the first word; \"%V\" is not a phase",
                        arg);
     return NGX_ERROR;
-}
-
-
-static char *
-ngx_http_waf_no_reload_in(ngx_conf_t *cf, ngx_str_t *dir, ngx_uint_t phases)
-{
-    if ((phases & (NGX_HTTP_WAF_PH_BIT(NGX_HTTP_WAF_PHASE_FRAME_C2S)
-                   | NGX_HTTP_WAF_PH_BIT(NGX_HTTP_WAF_PHASE_FRAME_S2C)))
-        == 0)
-    {
-        return NGX_CONF_OK;
-    }
-
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "%V reload: a frame has no masks and its whole payload "
-                       "is buffered; size the archive or preview directly "
-                       "(waf_archive frame body=..., up to waf_body_limit) "
-                       "instead of reload", dir);
-    return NGX_CONF_ERROR;
 }
 
 
@@ -1811,24 +1791,13 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         && args[2].len == 6
         && ngx_strncmp(args[2].data, "reload", 6) == 0)
     {
-        if (ngx_http_waf_no_reload_in(cf, &args[0], phases) != NGX_CONF_OK) {
-            return NGX_CONF_ERROR;
-        }
-
-        for (ph = 0; ph < NGX_HTTP_WAF_NPHASE; ph++) {
-
-            if (!(phases & NGX_HTTP_WAF_PH_BIT(ph))) {
-                continue;
-            }
-
-            if (ngx_http_waf_archive_reload(cf, &wlcf->shoot[ph])
-                != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-        }
-
-        return NGX_CONF_OK;
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_archive: \"reload\" is gone; write the size "
+                           "on the object (body=64k) and name the archive's "
+                           "own lists (waf_archive request headers "
+                           "mask=authorization): whatever the capture cannot "
+                           "give rides to the agent with the record");
+        return NGX_CONF_ERROR;
     }
 
     mask = 0;
@@ -1861,8 +1830,7 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                     }
 
                     ngx_http_waf_archive_reset(&wlcf->shoot[ph]);
-                    wlcf->shoot[ph].archive        = 0;
-                    wlcf->shoot[ph].archive_reload = 0;
+                    wlcf->shoot[ph].archive = 0;
                 }
 
                 return NGX_CONF_OK;
@@ -1991,6 +1959,17 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
+        if (name.len == 6 && ngx_strncmp(name.data, "source", 6) == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf_archive: source= is not an option; the "
+                               "archive masks by its own lists "
+                               "(waf_archive request headers "
+                               "mask=authorization, or mask=none for none), "
+                               "and the module takes the original whenever "
+                               "those lists need it");
+            return NGX_CONF_ERROR;
+        }
+
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "waf: unknown option \"%V\" in waf_archive", &name);
         return NGX_CONF_ERROR;
@@ -2042,10 +2021,6 @@ ngx_http_waf_archive_apply(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
         sh->archive = 0;
     }
 
-    if (sh->archive_reload == NGX_CONF_UNSET_UINT) {
-        sh->archive_reload = 0;
-    }
-
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
 
         if (!(off & NGX_HTTP_WAF_OBJ_BIT(i))) {
@@ -2061,7 +2036,6 @@ ngx_http_waf_archive_apply(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
 
         sh->archive_set |= NGX_HTTP_WAF_OBJ_BIT(i);
         sh->archive &= ~NGX_HTTP_WAF_OBJ_BIT(i);
-        sh->archive_reload &= ~NGX_HTTP_WAF_OBJ_BIT(i);
         sh->archive_when[i]  = NGX_CONF_UNSET_UINT;
         sh->archive_ttl[i]   = NGX_CONF_UNSET;
         sh->archive_limit[i] = NGX_CONF_UNSET_SIZE;
@@ -2086,173 +2060,6 @@ ngx_http_waf_archive_apply(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
         sh->archive_when[i]  = when;
         sh->archive_ttl[i]   = ttl;
         sh->archive_limit[i] = limits[i];
-    }
-
-
-    return NGX_CONF_OK;
-}
-
-
-static char *
-ngx_http_waf_archive_reload(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh)
-{
-    time_t      ttl;
-    ssize_t     size;
-    ngx_int_t   secs;
-    ngx_str_t  *args, name, value;
-    ngx_uint_t  i, bit, obj, mask, when;
-    size_t      limits[NGX_HTTP_WAF_OBJ_COUNT];
-
-    args = cf->args->elts;
-    mask = 0;
-    when = NGX_CONF_UNSET_UINT;
-    ttl  = NGX_CONF_UNSET;
-
-    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-        limits[i] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
-    }
-
-    for (i = 3; i < cf->args->nelts; i++) {
-
-        if (ngx_http_waf_split(&args[i], &name, &value) != NGX_OK) {
-
-            if (ngx_http_waf_opt_keyword(cf, ngx_http_waf_kw_obj, &args[i],
-                                         &bit) != NGX_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-            if (mask & bit) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf_archive: \"%V\" is already listed",
-                                   &args[i]);
-                return NGX_CONF_ERROR;
-            }
-
-            obj = ngx_http_waf_bit_obj(bit);
-            mask |= bit;
-            limits[obj] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
-            continue;
-        }
-
-        if (ngx_http_waf_obj_bit(&name, &bit) == NGX_OK) {
-
-            if (mask & bit) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf_archive: \"%V\" is already listed",
-                                   &name);
-                return NGX_CONF_ERROR;
-            }
-
-            obj = ngx_http_waf_bit_obj(bit);
-
-            if (value.len == 7
-                && ngx_strncmp(value.data, "capture", 7) == 0)
-            {
-                mask |= bit;
-                limits[obj] = NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE;
-                continue;
-            }
-
-            size = ngx_parse_size(&value);
-
-            if (size == NGX_ERROR || size <= 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf_archive: invalid size \"%V\" for "
-                                   "reload \"%V\"; write \"=capture\", "
-                                   "a size, or omit \"=\" for the whole "
-                                   "object",
-                                   &value, &name);
-                return NGX_CONF_ERROR;
-            }
-
-            mask |= bit;
-            limits[obj] = (size_t) size;
-            continue;
-        }
-
-        if (name.len == 3 && ngx_strncmp(name.data, "ttl", 3) == 0) {
-            secs = ngx_parse_time(&value, 1);
-
-            if (secs == NGX_ERROR || secs <= 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf_archive: invalid ttl \"%V\"; omit it "
-                                   "to keep objects forever", &value);
-                return NGX_CONF_ERROR;
-            }
-
-            ttl = (time_t) secs;
-            continue;
-        }
-
-        if (name.len == 4 && ngx_strncmp(name.data, "when", 4) == 0) {
-            when = 0;
-
-            if (ngx_http_waf_opt_flags(cf, ngx_http_waf_kw_archive_when,
-                                       &value, &when) != NGX_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-            if (when == 0) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf_archive: when= names no outcome; say "
-                                   "\"none\" to turn archiving off");
-                return NGX_CONF_ERROR;
-            }
-
-            continue;
-        }
-
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "waf: unknown option \"%V\" in waf_archive", &name);
-        return NGX_CONF_ERROR;
-    }
-
-    if (mask == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "waf_archive: reload names no objects");
-        return NGX_CONF_ERROR;
-    }
-
-    if (sh->archive == NGX_CONF_UNSET_UINT) {
-        sh->archive = 0;
-    }
-
-    if (sh->archive_reload == NGX_CONF_UNSET_UINT) {
-        sh->archive_reload = 0;
-    }
-
-    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-
-        if (!(mask & NGX_HTTP_WAF_OBJ_BIT(i))) {
-            continue;
-        }
-
-        if (sh->archive_reload & NGX_HTTP_WAF_OBJ_BIT(i)) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf_archive: reload \"%V\" is already "
-                               "configured on this level",
-                               ngx_http_waf_obj_name(i));
-            return NGX_CONF_ERROR;
-        }
-
-        sh->archive_set |= NGX_HTTP_WAF_OBJ_BIT(i);
-        sh->archive |= NGX_HTTP_WAF_OBJ_BIT(i);
-        sh->archive_reload |= NGX_HTTP_WAF_OBJ_BIT(i);
-        sh->archive_reload_limit[i] = limits[i];
-
-        if (limits[i] != NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE) {
-            sh->archive_limit[i] = limits[i];
-        }
-
-        if (when != NGX_CONF_UNSET_UINT) {
-            sh->archive_when[i] = when;
-        }
-
-        if (ttl != NGX_CONF_UNSET) {
-            sh->archive_ttl[i] = ttl;
-        }
     }
 
     return NGX_CONF_OK;
@@ -2449,28 +2256,19 @@ ngx_http_waf_preview(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     if (cf->args->nelts >= 3
         && args[2].len == 6
-        && ngx_strncmp(args[2].data, "reload", 6) == 0
-        && ngx_http_waf_no_reload_in(cf, &args[0], phases) != NGX_CONF_OK)
+        && ngx_strncmp(args[2].data, "reload", 6) == 0)
     {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_preview: \"reload\" is gone; the record is "
+                           "cut from the request itself at any size, and its "
+                           "own lists (waf_preview request headers "
+                           "mask=cookie) replace the capture lists");
         return NGX_CONF_ERROR;
     }
 
     for (ph = 0; ph < NGX_HTTP_WAF_NPHASE; ph++) {
 
         if (!(phases & NGX_HTTP_WAF_PH_BIT(ph))) {
-            continue;
-        }
-
-        if (cf->args->nelts >= 3
-            && args[2].len == 6
-            && ngx_strncmp(args[2].data, "reload", 6) == 0)
-        {
-            if (ngx_http_waf_preview_reload(cf, &wlcf->shoot[ph])
-                != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
             continue;
         }
 
@@ -2490,21 +2288,20 @@ ngx_http_waf_preview_set(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
     ngx_uint_t phases)
 {
     ngx_str_t  *args, name, value;
-    ngx_uint_t  i, bit, obj, seen;
+    ngx_uint_t  i, bit, obj, named, source;
 
-    args = cf->args->elts;
-    seen = 0;
+    args   = cf->args->elts;
+    named  = 0;
+    source = NGX_CONF_UNSET_UINT;
 
     if (cf->args->nelts == 3
         && args[2].len == 4
         && ngx_strncmp(args[2].data, "none", 4) == 0)
     {
-        sh->preview_reload = 0;
-
         for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-            sh->preview[i]              = 0;
-            sh->preview_item[i]         = NGX_CONF_UNSET_SIZE;
-            sh->preview_reload_limit[i] = NGX_CONF_UNSET_SIZE;
+            sh->preview[i]        = 0;
+            sh->preview_item[i]   = NGX_CONF_UNSET_SIZE;
+            sh->preview_source[i] = NGX_CONF_UNSET_UINT;
         }
 
         return NGX_CONF_OK;
@@ -2535,37 +2332,28 @@ ngx_http_waf_preview_set(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
                 return NGX_CONF_ERROR;
             }
 
-            if (sh->preview_reload == NGX_CONF_UNSET_UINT) {
-                sh->preview_reload = 0;
+            if (sh->preview[obj] != 0) {
+                named |= bit;
             }
 
-            seen = 1;
             continue;
         }
 
         if (name.len == 6 && ngx_strncmp(name.data, "source", 6) == 0) {
-            if (sh->preview_source_sent == NGX_CONF_UNSET_UINT) {
-                sh->preview_source_sent = 0;
-            }
 
-            if (value.len == 4 && ngx_strncmp(value.data, "sent", 4) == 0) {
-                sh->preview_source_sent |=
-                    NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY);
-
-            } else if (value.len == 8
-                       && ngx_strncmp(value.data, "original", 8) == 0)
-            {
-                sh->preview_source_sent &=
-                    ~NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY);
-
-            } else {
+            if (source != NGX_CONF_UNSET_UINT) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf_preview: source= is \"sent\" or "
-                                   "\"original\", not \"%V\"", &value);
+                                   "waf_preview: source= is named twice");
                 return NGX_CONF_ERROR;
             }
 
-            seen = 1;
+            if (ngx_http_waf_opt_keyword(cf, ngx_http_waf_kw_source, &value,
+                                         &source)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
             continue;
         }
 
@@ -2585,127 +2373,42 @@ ngx_http_waf_preview_set(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
         return NGX_CONF_ERROR;
     }
 
-    if (!seen) {
+    if (named == 0 && source == NGX_CONF_UNSET_UINT) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "waf_preview: no objects listed; say \"none\" to "
                            "turn previews off");
         return NGX_CONF_ERROR;
     }
 
-    return NGX_CONF_OK;
-}
-
-
-static char *
-ngx_http_waf_preview_reload(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh)
-{
-    ssize_t     size;
-    ngx_str_t  *args, name, value;
-    ngx_uint_t  i, bit, obj, mask;
-    size_t      limits[NGX_HTTP_WAF_OBJ_COUNT];
-
-    args = cf->args->elts;
-    mask = 0;
-
-    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-        limits[i] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
+    if (source == NGX_CONF_UNSET_UINT) {
+        return NGX_CONF_OK;
     }
 
-    for (i = 3; i < cf->args->nelts; i++) {
-
-        if (ngx_http_waf_split(&args[i], &name, &value) != NGX_OK) {
-
-            if (ngx_http_waf_opt_keyword(cf, ngx_http_waf_kw_obj, &args[i],
-                                         &bit) != NGX_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-            if (mask & bit) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf_preview: \"%V\" is already listed",
-                                   &args[i]);
-                return NGX_CONF_ERROR;
-            }
-
-            obj = ngx_http_waf_bit_obj(bit);
-            mask |= bit;
-            limits[obj] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
-            continue;
-        }
-
-        if (ngx_http_waf_obj_bit(&name, &bit) != NGX_OK) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: unknown option \"%V\" in waf_preview",
-                               &name);
-            return NGX_CONF_ERROR;
-        }
-
-        if (mask & bit) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf_preview: \"%V\" is already listed",
-                               &name);
-            return NGX_CONF_ERROR;
-        }
-
-        obj = ngx_http_waf_bit_obj(bit);
-
-        if (value.len == 7 && ngx_strncmp(value.data, "capture", 7) == 0) {
-            mask |= bit;
-            limits[obj] = NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE;
-            continue;
-        }
-
-        size = ngx_parse_size(&value);
-
-        if (size == NGX_ERROR || size <= 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf_preview: invalid size \"%V\" for reload "
-                               "\"%V\"", &value, &name);
-            return NGX_CONF_ERROR;
-        }
-
-        mask |= bit;
-        limits[obj] = (size_t) size;
-    }
-
-    if (mask == 0) {
+    if (named == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "waf_preview: reload names no objects");
+                           "waf_preview: source= applies to the objects "
+                           "named on the same line, and this line names "
+                           "none");
         return NGX_CONF_ERROR;
     }
 
-    if (sh->preview_reload == NGX_CONF_UNSET_UINT) {
-        sh->preview_reload = 0;
+    /*
+     * The source is a property of the body alone: the delivered version after
+     * a rewrite, or what came in. Headers and the query string have no second
+     * version, and what the record shows of them is set by its lists.
+     */
+
+    if (named != NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_preview: source= is for the body alone "
+                           "(body=8k source=sent); headers and args take "
+                           "their own name lists instead");
+        return NGX_CONF_ERROR;
     }
 
-    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
+    sh->preview_source[NGX_HTTP_WAF_OBJ_BODY] = source;
 
-        if (!(mask & NGX_HTTP_WAF_OBJ_BIT(i))) {
-            continue;
-        }
-
-        if (sh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(i)) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf_preview: reload \"%V\" is already "
-                               "configured on this level",
-                               ngx_http_waf_obj_name(i));
-            return NGX_CONF_ERROR;
-        }
-
-        sh->preview_reload |= NGX_HTTP_WAF_OBJ_BIT(i);
-        sh->preview_reload_limit[i] = limits[i];
-
-        if (sh->preview[i] == NGX_CONF_UNSET_SIZE) {
-            if (limits[i] == NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE
-                || limits[i] == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE)
-            {
-                sh->preview[i] = 1;
-            } else {
-                sh->preview[i] = limits[i];
-            }
-        }
-    }
+    (void) phases;
 
     return NGX_CONF_OK;
 }

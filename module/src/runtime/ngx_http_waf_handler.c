@@ -247,7 +247,6 @@ ngx_http_waf_access_handler(ngx_http_request_t *r)
 
     case NGX_HTTP_WAF_ST_READING_BODY:
     case NGX_HTTP_WAF_ST_PLACING_META:
-    case NGX_HTTP_WAF_ST_RELOADING:
     case NGX_HTTP_WAF_ST_FETCHING_FORM:
         return NGX_DONE;
 
@@ -879,7 +878,7 @@ ngx_http_waf_body_ready(ngx_http_request_t *r)
 
     r->preserve_body = 1;
 
-    if (ctx->ph->reload_after_body) {
+    if (ctx->ph->agent_after_body) {
         ngx_http_waf_body_resumed(ctx, NGX_OK);
         return;
     }
@@ -905,34 +904,10 @@ ngx_http_waf_form_resumed(ngx_http_waf_ctx_t *ctx)
 void
 ngx_http_waf_body_resumed(ngx_http_waf_ctx_t *ctx, ngx_int_t rc)
 {
-    if (ctx->ph->reload_after_body) {
-        ctx->ph->reload_after_body = 0;
-
-        rc = ngx_http_waf_store_reload(ctx);
-
-        if (rc == NGX_AGAIN) {
-            ctx->state = NGX_HTTP_WAF_ST_RELOADING;
-            ngx_http_waf_return_to_phases(ctx);
-            return;
-        }
-
+    if (ctx->ph->agent_after_body) {
+        ctx->ph->agent_after_body = 0;
+        ctx->ph->agent_settled    = 1;
         ctx->state = NGX_HTTP_WAF_ST_FINISH;
-        ngx_http_waf_return_to_phases(ctx);
-        return;
-    }
-
-    if (ctx->ph->reloading) {
-        if (ctx->ph->reload_issuing
-            || ctx->ph->meta_pending != 0
-            || (ctx->ph->body_op != NULL && !ctx->ph->body_settled))
-        {
-            return;
-        }
-
-        ctx->ph->store_raw      = 0;
-        ctx->ph->store_reloaded = 1;
-        ctx->ph->reloading      = 0;
-        ctx->state          = NGX_HTTP_WAF_ST_FINISH;
         ngx_http_waf_return_to_phases(ctx);
         return;
     }
@@ -1306,24 +1281,17 @@ ngx_http_waf_fail_policy(ngx_http_waf_ctx_t *ctx)
 ngx_int_t
 ngx_http_waf_finish(ngx_http_waf_ctx_t *ctx, ngx_uint_t how)
 {
-    ngx_int_t  rc;
-
     ctx->finish_how = how;
 
-    if (!ctx->ph->store_reloaded) {
+    if (!ctx->ph->agent_settled) {
 
-        if (ngx_http_waf_store_reload_needs_body(ctx)) {
-            ctx->ph->reload_after_body = 1;
-            ctx->state             = NGX_HTTP_WAF_ST_NEED_BODY;
+        if (ngx_http_waf_agent_needs_body(ctx)) {
+            ctx->ph->agent_after_body = 1;
+            ctx->state = NGX_HTTP_WAF_ST_NEED_BODY;
             return ngx_http_waf_access_handler(ctx->request);
         }
 
-        rc = ngx_http_waf_store_reload(ctx);
-
-        if (rc == NGX_AGAIN) {
-            ctx->state = NGX_HTTP_WAF_ST_RELOADING;
-            return NGX_DONE;
-        }
+        ctx->ph->agent_settled = 1;
     }
 
     return ngx_http_waf_finish_done(ctx);

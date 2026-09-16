@@ -756,8 +756,8 @@ ngx_http_waf_rewrite_swap(ngx_http_waf_ctx_t *ctx, ngx_http_waf_body_op_t *op)
 
         wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
 
-        if (wlcf->shoot[ctx->phase].preview_source_sent
-            & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY))
+        if (wlcf->shoot[ctx->phase].preview_source[NGX_HTTP_WAF_OBJ_BODY]
+            == NGX_HTTP_WAF_SOURCE_SENT)
         {
             ctx->ph->preview_sent[NGX_HTTP_WAF_OBJ_BODY] = op->data;
         }
@@ -961,7 +961,8 @@ ngx_http_waf_response_journal_start(ngx_http_waf_ctx_t *ctx)
     ctx->hold_last   = &ctx->hold;
 
     need = ngx_http_waf_preview_body_budget(ctx);
-    one  = ngx_http_waf_store_reload_size(ctx, NGX_HTTP_WAF_OBJ_BODY);
+    one  = ngx_http_waf_archive_wants(ctx, NGX_HTTP_WAF_OBJ_BODY,
+                                      NGX_HTTP_WAF_V_ALLOW);
 
     if (one > need) {
         need = one;
@@ -1069,19 +1070,10 @@ ngx_http_waf_response_journal_body(ngx_http_waf_ctx_t *ctx, ngx_chain_t *in)
 static void
 ngx_http_waf_response_journal_finish(ngx_http_waf_ctx_t *ctx)
 {
-    ngx_http_request_t  *r = ctx->request;
-
-    ctx->rsp_journal_done = 1;
-    ctx->ph->body_ready   = 1;
-    ctx->state            = NGX_HTTP_WAF_ST_DONE;
-
-    if (ngx_http_waf_store_reload(ctx) == NGX_AGAIN) {
-        ctx->state            = NGX_HTTP_WAF_ST_RELOADING;
-        ctx->waiting          = 1;
-        ctx->rsp_journal_held = 1;
-        r->main->count++;
-        return;
-    }
+    ctx->rsp_journal_done  = 1;
+    ctx->ph->body_ready    = 1;
+    ctx->ph->agent_settled = 1;
+    ctx->state             = NGX_HTTP_WAF_ST_DONE;
 
     ngx_http_waf_log_verdict(ctx);
 }
@@ -1090,20 +1082,10 @@ ngx_http_waf_response_journal_finish(ngx_http_waf_ctx_t *ctx)
 static void
 ngx_http_waf_response_journal_resume(ngx_http_waf_ctx_t *ctx)
 {
-    ngx_http_request_t  *r = ctx->request;
-
     ctx->waiting = 0;
     ctx->state   = NGX_HTTP_WAF_ST_DONE;
 
     ngx_http_waf_log_verdict(ctx);
-
-    if (!ctx->rsp_journal_held) {
-        return;
-    }
-
-    ctx->rsp_journal_held = 0;
-
-    ngx_http_finalize_request(r, NGX_DONE);
 }
 
 

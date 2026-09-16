@@ -131,7 +131,6 @@ typedef enum {
     NGX_HTTP_WAF_ST_NEED_BODY,
     NGX_HTTP_WAF_ST_READING_BODY,
     NGX_HTTP_WAF_ST_PLACING_META,
-    NGX_HTTP_WAF_ST_RELOADING,
     NGX_HTTP_WAF_ST_FETCHING_FORM,
     NGX_HTTP_WAF_ST_FINISH,
     NGX_HTTP_WAF_ST_WAITING,
@@ -238,7 +237,7 @@ typedef enum {
 
 #define NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE  0
 
-#define NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE  ((size_t) -2)
+#define NGX_HTTP_WAF_AGENT_WHOLE  ((size_t) -1)
 
 
 typedef struct ngx_http_waf_locator_s     ngx_http_waf_locator_t;
@@ -530,7 +529,8 @@ typedef struct {
 typedef enum {
     NGX_HTTP_WAF_SOURCE_NONE = 0,
     NGX_HTTP_WAF_SOURCE_STORE,
-    NGX_HTTP_WAF_SOURCE_ORIGINAL
+    NGX_HTTP_WAF_SOURCE_ORIGINAL,
+    NGX_HTTP_WAF_SOURCE_SENT
 } ngx_http_waf_source_e;
 
 typedef struct {
@@ -793,7 +793,12 @@ typedef struct {
     ngx_uint_t                 meta_pending;
     ngx_uint_t                 meta_placed;
 
-    ngx_uint_t                 raw;
+    ngx_uint_t                 meta_truncated;
+
+    ngx_uint_t                 attached;
+    ngx_uint_t                 attach_raw;
+    ngx_http_waf_locator_t    *attach_loc[NGX_HTTP_WAF_OBJ_COUNT];
+    int                        attach_fd;
 
     off_t                      body_placed_len;
 
@@ -814,11 +819,9 @@ typedef struct {
     unsigned                   meta_in_put:1;
     unsigned                   meta_settled:1;
     unsigned                   store_cleanup:1;
-    unsigned                   store_raw:1;
-    unsigned                   store_reloaded:1;
-    unsigned                   reloading:1;
-    unsigned                   reload_issuing:1;
-    unsigned                   reload_after_body:1;
+    unsigned                   agent_settled:1;
+    unsigned                   agent_after_body:1;
+    unsigned                   attach_planned:1;
 
     unsigned                   journal:1;
 
@@ -872,7 +875,6 @@ struct ngx_http_waf_ctx_s {
 
     unsigned                   rsp_journal:1;
     unsigned                   rsp_journal_done:1;
-    unsigned                   rsp_journal_held:1;
     size_t                     rsp_journal_need;
     off_t                      rsp_journal_total;
 
@@ -1018,16 +1020,12 @@ typedef struct {
     ngx_uint_t                 archive_when[NGX_HTTP_WAF_OBJ_COUNT];
     time_t                     archive_ttl[NGX_HTTP_WAF_OBJ_COUNT];
     size_t                     archive_limit[NGX_HTTP_WAF_OBJ_COUNT];
-    ngx_uint_t                 archive_reload;
-    size_t                     archive_reload_limit[NGX_HTTP_WAF_OBJ_COUNT];
+    ngx_uint_t                 archive_original;
 
     size_t                     preview[NGX_HTTP_WAF_OBJ_COUNT];
-    ngx_uint_t                 preview_reload;
-    size_t                     preview_reload_limit[NGX_HTTP_WAF_OBJ_COUNT];
+    ngx_uint_t                 preview_source[NGX_HTTP_WAF_OBJ_COUNT];
 
     size_t                     preview_item[NGX_HTTP_WAF_OBJ_COUNT];
-
-    ngx_uint_t                 preview_source_sent;
 
     ngx_array_t               *lists[NGX_HTTP_WAF_LIST_COUNT]
                                     [NGX_HTTP_WAF_META_COUNT]
@@ -1364,6 +1362,13 @@ void       ngx_http_waf_log_verdict(ngx_http_waf_ctx_t *ctx);
 ngx_uint_t ngx_http_waf_result_status(ngx_http_waf_ctx_t *ctx);
 
 void       ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx);
+
+ngx_int_t  ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx);
+void       ngx_http_waf_attach_close(ngx_http_waf_ctx_t *ctx);
+int        ngx_http_waf_attach_fd(ngx_http_waf_ctx_t *ctx);
+ngx_int_t  ngx_http_waf_attach_write(int fd, u_char *data, size_t len);
+ngx_http_waf_locator_t *ngx_http_waf_audit_locator(ngx_http_waf_ctx_t *ctx,
+               ngx_uint_t obj);
 
 void       ngx_http_waf_audit_flush_deferred(ngx_http_waf_ctx_t *ctx);
 

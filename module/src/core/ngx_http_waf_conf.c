@@ -55,15 +55,13 @@ static char *ngx_http_waf_check_body_limit(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf);
 static char *ngx_http_waf_check_capture_limit(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase);
-static char *ngx_http_waf_reload_wider(ngx_conf_t *cf, ngx_uint_t phase,
-    const char *dir, ngx_uint_t obj, size_t limit, size_t cap);
-static char *ngx_http_waf_check_archive_reload(ngx_conf_t *cf,
+static char *ngx_http_waf_check_archive_sizes(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase);
-static char *ngx_http_waf_check_preview_reload(ngx_conf_t *cf,
+static char *ngx_http_waf_check_preview_sizes(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase);
-static char *ngx_http_waf_check_lists_over_capture(ngx_conf_t *cf,
-    ngx_http_waf_shoot_conf_t *sh, ngx_uint_t kind, ngx_uint_t named,
-    ngx_uint_t reload, const char *dir);
+static char *ngx_http_waf_check_held_size(ngx_conf_t *cf,
+    ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase, const char *dir,
+    ngx_uint_t obj, size_t limit);
 static char *ngx_http_waf_check_size_ceiling(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase, const char *dir,
     ngx_uint_t obj, size_t limit);
@@ -255,21 +253,17 @@ ngx_http_waf_create_loc_conf(ngx_conf_t *cf)
     for (ph = 0; ph < NGX_HTTP_WAF_NPHASE; ph++) {
         sh = &wlcf->shoot[ph];
 
-        sh->capture        = NGX_CONF_UNSET_UINT;
-        sh->archive        = NGX_CONF_UNSET_UINT;
-        sh->archive_reload = NGX_CONF_UNSET_UINT;
-        sh->preview_reload = NGX_CONF_UNSET_UINT;
-        sh->preview_source_sent = NGX_CONF_UNSET_UINT;
+        sh->capture = NGX_CONF_UNSET_UINT;
+        sh->archive = NGX_CONF_UNSET_UINT;
 
         for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-            sh->capture_limit[i]        = NGX_CONF_UNSET_SIZE;
-            sh->preview[i]              = NGX_CONF_UNSET_SIZE;
-            sh->preview_item[i]         = NGX_CONF_UNSET_SIZE;
-            sh->archive_when[i]         = NGX_CONF_UNSET_UINT;
-            sh->archive_ttl[i]          = NGX_CONF_UNSET;
-            sh->archive_limit[i]        = NGX_CONF_UNSET_SIZE;
-            sh->archive_reload_limit[i] = NGX_CONF_UNSET_SIZE;
-            sh->preview_reload_limit[i] = NGX_CONF_UNSET_SIZE;
+            sh->capture_limit[i]  = NGX_CONF_UNSET_SIZE;
+            sh->preview[i]        = NGX_CONF_UNSET_SIZE;
+            sh->preview_item[i]   = NGX_CONF_UNSET_SIZE;
+            sh->preview_source[i] = NGX_CONF_UNSET_UINT;
+            sh->archive_when[i]   = NGX_CONF_UNSET_UINT;
+            sh->archive_ttl[i]    = NGX_CONF_UNSET;
+            sh->archive_limit[i]  = NGX_CONF_UNSET_SIZE;
         }
     }
 
@@ -553,12 +547,12 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     for (i = 0; i < NGX_HTTP_WAF_NPHASE; i++) {
 
-        rv = ngx_http_waf_check_archive_reload(cf, conf, i);
+        rv = ngx_http_waf_check_archive_sizes(cf, conf, i);
         if (rv != NGX_CONF_OK) {
             return rv;
         }
 
-        rv = ngx_http_waf_check_preview_reload(cf, conf, i);
+        rv = ngx_http_waf_check_preview_sizes(cf, conf, i);
         if (rv != NGX_CONF_OK) {
             return rv;
         }
@@ -833,9 +827,7 @@ ngx_http_waf_check_size_ceiling(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
 {
     size_t  ceiling;
 
-    if (limit == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE
-        || limit == NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE)
-    {
+    if (limit == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE) {
         return NGX_CONF_OK;
     }
 
@@ -854,42 +846,69 @@ ngx_http_waf_check_size_ceiling(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
 }
 
 
+/*
+ * Outside the request phase the module holds exactly the body it captures: a
+ * response body is gone to the client past the capture slice, so the agent
+ * cannot be given more than that. Headers are in memory whole on every phase,
+ * and the request body is in hand until the end of the request, so those ride
+ * to the agent with the record at any size within the read ceilings.
+ */
+
 static char *
-ngx_http_waf_reload_wider(ngx_conf_t *cf, ngx_uint_t phase, const char *dir,
-    ngx_uint_t obj, size_t limit, size_t cap)
+ngx_http_waf_check_held_size(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
+    ngx_uint_t phase, const char *dir, ngx_uint_t obj, size_t limit)
 {
-    if (phase == NGX_HTTP_WAF_PHASE_REQUEST) {
+    size_t                      cap;
+    ngx_uint_t                  bit;
+    ngx_http_waf_shoot_conf_t  *sh = &conf->shoot[phase];
+
+    bit = NGX_HTTP_WAF_OBJ_BIT(obj);
+
+    /* headers stay in memory whole; only the body is a stream */
+
+    if (obj != NGX_HTTP_WAF_OBJ_BODY) {
         return NGX_CONF_OK;
     }
 
-    if (limit == NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE) {
-        return NGX_CONF_OK;
+    if (!(sh->capture & bit)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: %s %V %V needs \"waf_capture %V %V\": past "
+                           "the request phase the module holds only what it "
+                           "captures",
+                           dir, ngx_http_waf_phase_name(phase),
+                           ngx_http_waf_obj_name(obj),
+                           ngx_http_waf_phase_name(phase),
+                           ngx_http_waf_obj_name(obj));
+        return NGX_CONF_ERROR;
     }
 
-    if (limit != NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE
+    cap = sh->capture_limit[obj];
+
+    if (!ngx_http_waf_phase_is_frame(phase)
         && cap != NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE
-        && limit <= cap)
+        && (limit == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE || limit > cap))
     {
-        return NGX_CONF_OK;
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: %s %V %V is wider than capture, and past the "
+                           "request phase the module holds only the capture "
+                           "slice; keep it within capture or widen "
+                           "waf_capture %V %V",
+                           dir, ngx_http_waf_phase_name(phase),
+                           ngx_http_waf_obj_name(obj),
+                           ngx_http_waf_phase_name(phase),
+                           ngx_http_waf_obj_name(obj));
+        return NGX_CONF_ERROR;
     }
 
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "waf: %s reload %V is wider than capture, and outside "
-                       "the request phase there is nothing to reload from: "
-                       "write reload %V=capture or widen waf_capture %V",
-                       dir, ngx_http_waf_obj_name(obj),
-                       ngx_http_waf_obj_name(obj),
-                       ngx_http_waf_phase_name(phase));
-    return NGX_CONF_ERROR;
+    return NGX_CONF_OK;
 }
 
 
 static char *
-ngx_http_waf_check_archive_reload(ngx_conf_t *cf,
+ngx_http_waf_check_archive_sizes(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase)
 {
-    ngx_uint_t                  i, bit, captured, reloading, inspected;
-    size_t                      limit, cap;
+    ngx_uint_t                  i, bit, inspected;
     ngx_http_waf_shoot_conf_t  *sh = &conf->shoot[phase];
 
     inspected = ngx_http_waf_phase_inspected(conf, phase);
@@ -901,152 +920,37 @@ ngx_http_waf_check_archive_reload(ngx_conf_t *cf,
             continue;
         }
 
-        captured = (sh->capture & bit) != 0;
-        reloading = (sh->archive_reload & bit) != 0;
-        limit = sh->archive_limit[i];
-        cap = sh->capture_limit[i];
-
-        if (reloading) {
-            limit = sh->archive_reload_limit[i];
-
-            if (limit == NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE && !captured) {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf: waf_archive reload %V=capture needs "
-                                   "that object in waf_capture",
-                                   ngx_http_waf_obj_name(i));
-                return NGX_CONF_ERROR;
-            }
-
-            if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_archive",
-                                                i, limit)
-                != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-            if (inspected
-                && ngx_http_waf_reload_wider(cf, phase, "waf_archive", i,
-                                             limit, cap)
-                   != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-            continue;
-        }
-
-        if (!inspected) {
-
-            if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_archive",
-                                                i, limit)
-                != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-            continue;
-        }
-
-        if (!captured) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: waf_archive %V is wider than capture; "
-                               "write reload %V=... or keep it within capture",
-                               ngx_http_waf_obj_name(i),
-                               ngx_http_waf_obj_name(i));
-            return NGX_CONF_ERROR;
-        }
-
-        if (!ngx_http_waf_phase_is_frame(phase)
-            && limit != NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE
-            && cap != NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE
-            && limit > cap)
-        {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: waf_archive %V is wider than capture; "
-                               "write reload %V=... or keep it within capture",
-                               ngx_http_waf_obj_name(i),
-                               ngx_http_waf_obj_name(i));
-            return NGX_CONF_ERROR;
-        }
-
         if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_archive", i,
-                                            limit)
+                                            sh->archive_limit[i])
             != NGX_CONF_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+
+        if (inspected
+            && phase != NGX_HTTP_WAF_PHASE_REQUEST
+            && ngx_http_waf_check_held_size(cf, conf, phase, "waf_archive", i,
+                                            sh->archive_limit[i])
+               != NGX_CONF_OK)
         {
             return NGX_CONF_ERROR;
         }
     }
 
-    return ngx_http_waf_check_lists_over_capture(cf, sh,
-                                                 NGX_HTTP_WAF_LIST_ARCHIVE,
-                                                 sh->archive,
-                                                 sh->archive_reload,
-                                                 "waf_archive");
-}
+    /*
+     * Where the agent takes each object from is settled here, once: own lists
+     * the capture view cannot give mean the original. The request only adds
+     * inspector asks on top of it.
+     */
 
-
-static char *
-ngx_http_waf_check_lists_over_capture(ngx_conf_t *cf,
-    ngx_http_waf_shoot_conf_t *sh, ngx_uint_t kind, ngx_uint_t named,
-    ngx_uint_t reload, const char *dir)
-{
-    ngx_str_t     *name, *hit;
-    ngx_uint_t     i, n, axis;
-    ngx_array_t   *own, *deny;
-    const char    *word;
+    sh->archive_original = 0;
 
     for (i = 0; i < NGX_HTTP_WAF_META_COUNT; i++) {
 
-        if (!(named & NGX_HTTP_WAF_OBJ_BIT(i))
-            || (reload & NGX_HTTP_WAF_OBJ_BIT(i)))
+        if (ngx_http_waf_lists_own(sh, NGX_HTTP_WAF_LIST_ARCHIVE, i)
+            && !ngx_http_waf_lists_cover(sh, NGX_HTTP_WAF_LIST_ARCHIVE, i))
         {
-            continue;
-        }
-
-        deny = sh->lists[NGX_HTTP_WAF_LIST_CAPTURE][i][NGX_HTTP_WAF_AXIS_DENY];
-
-        if (deny == NULL || deny->nelts == 0) {
-            continue;
-        }
-
-        for (axis = NGX_HTTP_WAF_AXIS_ALLOW; axis <= NGX_HTTP_WAF_AXIS_MASK;
-             axis++)
-        {
-            own = sh->lists[kind][i][axis];
-
-            if (own == NULL || own->nelts == 0) {
-                continue;
-            }
-
-            name = own->elts;
-            hit  = deny->elts;
-
-            for (n = 0; n < own->nelts; n++) {
-                ngx_uint_t  d;
-
-                for (d = 0; d < deny->nelts; d++) {
-
-                    if (name[n].len != hit[d].len
-                        || ngx_strncasecmp(name[n].data, hit[d].data,
-                                           name[n].len) != 0)
-                    {
-                        continue;
-                    }
-
-                    word = (axis == NGX_HTTP_WAF_AXIS_ALLOW) ? "allow" : "mask";
-
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                       "waf: %s %V %s= names \"%V\", which "
-                                       "waf_capture deny= drops before the "
-                                       "store; write %s reload %V=capture "
-                                       "to take the original, or drop the "
-                                       "name from the list",
-                                       dir, ngx_http_waf_obj_name(i), word,
-                                       &name[n], dir,
-                                       ngx_http_waf_obj_name(i));
-                    return NGX_CONF_ERROR;
-                }
-            }
+            sh->archive_original |= NGX_HTTP_WAF_OBJ_BIT(i);
         }
     }
 
@@ -1055,14 +959,14 @@ ngx_http_waf_check_lists_over_capture(ngx_conf_t *cf,
 
 
 static char *
-ngx_http_waf_check_preview_reload(ngx_conf_t *cf,
+ngx_http_waf_check_preview_sizes(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase)
 {
-    ngx_uint_t                  i, bit, captured, reloading, inspected;
-    size_t                      cap;
+    ngx_uint_t                  i, bit, named, inspected;
     ngx_http_waf_shoot_conf_t  *sh = &conf->shoot[phase];
 
     inspected = ngx_http_waf_phase_inspected(conf, phase);
+    named     = 0;
 
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
         bit = NGX_HTTP_WAF_OBJ_BIT(i);
@@ -1071,47 +975,21 @@ ngx_http_waf_check_preview_reload(ngx_conf_t *cf,
             continue;
         }
 
-        captured = (sh->capture & bit) != 0;
-        reloading = (sh->preview_reload & bit) != 0;
-        cap = sh->capture_limit[i];
+        named |= bit;
 
-        if (reloading) {
-            if (sh->preview_reload_limit[i]
-                    == NGX_HTTP_WAF_RELOAD_LIMIT_CAPTURE
-                && !captured)
-            {
+        if (ngx_http_waf_phase_is_frame(phase)) {
+
+            if (inspected && !(sh->capture & bit)) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf: waf_preview reload %V=capture needs "
-                                   "that object in waf_capture",
+                                   "waf: waf_preview %V %V needs "
+                                   "\"waf_capture %V %V\" on a side with "
+                                   "inspectors",
+                                   ngx_http_waf_phase_name(phase),
+                                   ngx_http_waf_obj_name(i),
+                                   ngx_http_waf_phase_name(phase),
                                    ngx_http_waf_obj_name(i));
                 return NGX_CONF_ERROR;
             }
-
-            if (inspected
-                && ngx_http_waf_reload_wider(cf, phase, "waf_preview", i,
-                                             sh->preview_reload_limit[i], cap)
-                   != NGX_CONF_OK)
-            {
-                return NGX_CONF_ERROR;
-            }
-
-            continue;
-        }
-
-        if (!inspected) {
-            continue;
-        }
-
-        if (!captured) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: waf_preview %V is wider than capture; "
-                               "write reload %V=... or keep it within capture",
-                               ngx_http_waf_obj_name(i),
-                               ngx_http_waf_obj_name(i));
-            return NGX_CONF_ERROR;
-        }
-
-        if (ngx_http_waf_phase_is_frame(phase)) {
 
             if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_preview",
                                                 i, sh->preview[i])
@@ -1123,32 +1001,19 @@ ngx_http_waf_check_preview_reload(ngx_conf_t *cf,
             continue;
         }
 
-        if (cap != NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE
-            && sh->preview[i] > cap)
+        if (inspected
+            && phase != NGX_HTTP_WAF_PHASE_REQUEST
+            && ngx_http_waf_check_held_size(cf, conf, phase, "waf_preview", i,
+                                            sh->preview[i])
+               != NGX_CONF_OK)
         {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: waf_preview %V is wider than capture; "
-                               "write reload %V=... or keep it within capture",
-                               ngx_http_waf_obj_name(i),
-                               ngx_http_waf_obj_name(i));
             return NGX_CONF_ERROR;
         }
     }
 
-    {
-        ngx_uint_t  named = 0;
+    (void) named;
 
-        for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-            if (sh->preview[i] != 0) {
-                named |= NGX_HTTP_WAF_OBJ_BIT(i);
-            }
-        }
-
-        return ngx_http_waf_check_lists_over_capture(cf, sh,
-                                                     NGX_HTTP_WAF_LIST_PREVIEW,
-                                                     named, sh->preview_reload,
-                                                     "waf_preview");
-    }
+    return NGX_CONF_OK;
 }
 
 
@@ -1303,25 +1168,21 @@ ngx_http_waf_merge_archive(ngx_http_waf_shoot_conf_t *sh,
         && sh->archive_set == 0)
     {
         if (psh->archive == NGX_CONF_UNSET_UINT) {
-            sh->archive        = 0;
-            sh->archive_reload = 0;
+            sh->archive = 0;
 
             for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-                sh->archive_when[i]         = NGX_HTTP_WAF_ARCHIVE_WHEN_ALL;
-                sh->archive_ttl[i]          = NGX_HTTP_WAF_ARCHIVE_TTL_FOREVER;
-                sh->archive_limit[i]        = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
-                sh->archive_reload_limit[i] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
+                sh->archive_when[i]   = NGX_HTTP_WAF_ARCHIVE_WHEN_ALL;
+                sh->archive_ttl[i]    = NGX_HTTP_WAF_ARCHIVE_TTL_FOREVER;
+                sh->archive_limit[i]  = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
             }
 
         } else {
-            sh->archive        = psh->archive;
-            sh->archive_reload = psh->archive_reload;
+            sh->archive = psh->archive;
 
             for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-                sh->archive_when[i]         = psh->archive_when[i];
-                sh->archive_ttl[i]          = psh->archive_ttl[i];
-                sh->archive_limit[i]        = psh->archive_limit[i];
-                sh->archive_reload_limit[i] = psh->archive_reload_limit[i];
+                sh->archive_when[i]   = psh->archive_when[i];
+                sh->archive_ttl[i]    = psh->archive_ttl[i];
+                sh->archive_limit[i]  = psh->archive_limit[i];
             }
         }
 
@@ -1329,10 +1190,6 @@ ngx_http_waf_merge_archive(ngx_http_waf_shoot_conf_t *sh,
 
         if (sh->archive == NGX_CONF_UNSET_UINT) {
             sh->archive = 0;
-        }
-
-        if (sh->archive_reload == NGX_CONF_UNSET_UINT) {
-            sh->archive_reload = 0;
         }
 
         for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
@@ -1351,11 +1208,6 @@ ngx_http_waf_merge_archive(ngx_http_waf_shoot_conf_t *sh,
                     sh->archive_limit[i] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
                 }
 
-                if (sh->archive_reload_limit[i] == NGX_CONF_UNSET_SIZE) {
-                    sh->archive_reload_limit[i] =
-                        NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
-                }
-
                 continue;
             }
 
@@ -1363,11 +1215,9 @@ ngx_http_waf_merge_archive(ngx_http_waf_shoot_conf_t *sh,
                 || psh->archive == NGX_CONF_UNSET_UINT)
             {
                 sh->archive &= ~bit;
-                sh->archive_reload &= ~bit;
-                sh->archive_when[i]         = NGX_HTTP_WAF_ARCHIVE_WHEN_ALL;
-                sh->archive_ttl[i]          = NGX_HTTP_WAF_ARCHIVE_TTL_FOREVER;
-                sh->archive_limit[i]        = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
-                sh->archive_reload_limit[i] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
+                sh->archive_when[i]   = NGX_HTTP_WAF_ARCHIVE_WHEN_ALL;
+                sh->archive_ttl[i]    = NGX_HTTP_WAF_ARCHIVE_TTL_FOREVER;
+                sh->archive_limit[i]  = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
                 continue;
             }
 
@@ -1377,16 +1227,9 @@ ngx_http_waf_merge_archive(ngx_http_waf_shoot_conf_t *sh,
                 sh->archive &= ~bit;
             }
 
-            if (psh->archive_reload & bit) {
-                sh->archive_reload |= bit;
-            } else {
-                sh->archive_reload &= ~bit;
-            }
-
-            sh->archive_when[i]         = psh->archive_when[i];
-            sh->archive_ttl[i]          = psh->archive_ttl[i];
-            sh->archive_limit[i]        = psh->archive_limit[i];
-            sh->archive_reload_limit[i] = psh->archive_reload_limit[i];
+            sh->archive_when[i]   = psh->archive_when[i];
+            sh->archive_ttl[i]    = psh->archive_ttl[i];
+            sh->archive_limit[i]  = psh->archive_limit[i];
         }
     }
 
@@ -1418,28 +1261,15 @@ ngx_http_waf_merge_preview(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
                                   NGX_HTTP_WAF_DEFAULT_PREVIEW);
         ngx_conf_merge_size_value(sh->preview_item[i], psh->preview_item[i],
                                   NGX_HTTP_WAF_PREVIEW_ITEM_NONE);
-        ngx_conf_merge_size_value(sh->preview_reload_limit[i],
-                                  psh->preview_reload_limit[i],
-                                  NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE);
-    }
 
-    if (sh->preview_reload == NGX_CONF_UNSET_UINT) {
-        ngx_conf_merge_uint_value(sh->preview_reload, psh->preview_reload,
-                                  0);
-    } else {
-        for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-            if (named[i]) {
-                continue;
-            }
-
-            if (psh->preview_reload & NGX_HTTP_WAF_OBJ_BIT(i)) {
-                sh->preview_reload |= NGX_HTTP_WAF_OBJ_BIT(i);
-            }
+        if (named[i] && sh->preview_source[i] == NGX_CONF_UNSET_UINT) {
+            sh->preview_source[i] = NGX_HTTP_WAF_SOURCE_STORE;
         }
-    }
 
-    ngx_conf_merge_uint_value(sh->preview_source_sent,
-                              psh->preview_source_sent, 0);
+        ngx_conf_merge_uint_value(sh->preview_source[i],
+                                  psh->preview_source[i],
+                                  NGX_HTTP_WAF_SOURCE_STORE);
+    }
 
     ngx_http_waf_merge_lists(sh, psh, NGX_HTTP_WAF_LIST_PREVIEW);
 

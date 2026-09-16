@@ -18,6 +18,12 @@ static ngx_socket_t        ngx_http_waf_agent_fd = (ngx_socket_t) -1;
 static struct sockaddr_un  ngx_http_waf_agent_addr;
 static socklen_t           ngx_http_waf_agent_addrlen;
 
+static ngx_uint_t          ngx_http_waf_agent_dropped;
+static time_t              ngx_http_waf_agent_dropped_at;
+
+static ssize_t ngx_http_waf_agent_send(ngx_http_waf_ctx_t *ctx, u_char *json,
+    size_t len, int attach);
+
 
 ngx_uint_t
 ngx_http_waf_audit_verdict(ngx_http_waf_ctx_t *ctx)
@@ -482,10 +488,7 @@ ngx_http_waf_audit_http(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
     ngx_http_waf_jw_int(jw, (ngx_int_t) headers_count);
 
     ngx_http_waf_jw_lit(jw, ",\"body_size\":");
-    ngx_http_waf_jw_int(jw,
-                        (ctx->ph->locator != NULL)
-                            ? (ngx_int_t) ctx->ph->locator->size
-                            : 0);
+    ngx_http_waf_jw_int(jw, (ngx_int_t) ngx_http_waf_body_seen(ctx));
 
     if (content_type.len != 0) {
         ngx_http_waf_jw_lit(jw, ",\"content_type\":");
@@ -1081,14 +1084,13 @@ ngx_http_waf_frame_audit_wanted(ngx_http_waf_ctx_t *ctx)
 static void
 ngx_http_waf_audit_store(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
 {
-    ngx_uint_t  i, used, keep;
+    ngx_uint_t  i, bit, flags, used, keep;
 
-    used = 0;
+    used = (ngx_http_waf_archive_mask(ctx) != 0);
 
-    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
+    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT && !used; i++) {
         if (ngx_http_waf_store_locator(ctx, i) != NULL) {
             used = 1;
-            break;
         }
     }
 
@@ -1096,26 +1098,32 @@ ngx_http_waf_audit_store(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
         return;
     }
 
+    (void) ngx_http_waf_attach_prepare(ctx);
+
     keep = ngx_http_waf_archive_mask(ctx);
 
-    ngx_http_waf_jw_lit(jw, ",\"store\":{\"headers\":");
-    ngx_http_waf_locator_write(jw,
-        ngx_http_waf_store_locator(ctx, NGX_HTTP_WAF_OBJ_HEADERS),
-        (keep & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_HEADERS))
-            ? NGX_HTTP_WAF_LOC_ADDRESS : 0);
+    ngx_http_waf_jw_lit(jw, ",\"store\":{");
 
-    ngx_http_waf_jw_lit(jw, ",\"args\":");
-    ngx_http_waf_locator_write(jw,
-        ngx_http_waf_store_locator(ctx, NGX_HTTP_WAF_OBJ_ARGS),
-        (keep & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_ARGS))
-            ? NGX_HTTP_WAF_LOC_ADDRESS : 0);
+    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
+        bit   = NGX_HTTP_WAF_OBJ_BIT(i);
+        flags = (i == NGX_HTTP_WAF_OBJ_BODY) ? NGX_HTTP_WAF_LOC_BODY : 0;
 
-    ngx_http_waf_jw_lit(jw, ",\"body\":");
-    ngx_http_waf_locator_write(jw,
-        ngx_http_waf_store_locator(ctx, NGX_HTTP_WAF_OBJ_BODY),
-        NGX_HTTP_WAF_LOC_BODY
-        | ((keep & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY))
-               ? NGX_HTTP_WAF_LOC_ADDRESS : 0));
+        if (ctx->ph->attached & bit) {
+            flags |= NGX_HTTP_WAF_LOC_ATTACH;
+
+        } else if (keep & bit) {
+            flags |= NGX_HTTP_WAF_LOC_ADDRESS;
+        }
+
+        if (i != 0) {
+            ngx_http_waf_jw_lit(jw, ",");
+        }
+
+        ngx_http_waf_jw_str(jw, ngx_http_waf_obj_name(i));
+        ngx_http_waf_jw_lit(jw, ":");
+        ngx_http_waf_locator_write(jw, ngx_http_waf_audit_locator(ctx, i),
+                                   flags);
+    }
 
     if (keep != 0) {
         ngx_http_waf_archive_write(jw, ctx, keep);
@@ -1346,30 +1354,103 @@ ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx)
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "waf: agent event overflow, ray %*s",
                       (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
+        ngx_http_waf_attach_close(ctx);
         return;
     }
 
-    n = sendto(ngx_http_waf_agent_fd, json, ngx_http_waf_jw_len(&jw),
-               MSG_DONTWAIT,
-               (struct sockaddr *) &ngx_http_waf_agent_addr,
-               ngx_http_waf_agent_addrlen);
+    n = ngx_http_waf_agent_send(ctx, json, ngx_http_waf_jw_len(&jw),
+                                ngx_http_waf_attach_fd(ctx));
+
+    ngx_http_waf_attach_close(ctx);
 
     if (n == -1) {
-        if (ngx_socket_errno == EMSGSIZE) {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, ngx_socket_errno,
-                          "waf: agent event of %uz bytes does not fit a "
-                          "datagram; lower the preview budgets",
-                          ngx_http_waf_jw_len(&jw));
-            return;
-        }
-
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, ngx_socket_errno,
-                       "waf: agent socket send dropped");
         return;
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "waf: agent verdict %uz bytes", (size_t) n);
+}
+
+
+/*
+ * One datagram per record. The attachment file, when there is one, goes in
+ * the ancillary data of the same message, so the record and its objects reach
+ * the agent together or not at all. A drop is counted and reported once a
+ * second: a queue the agent does not drain loses evidence, not just a line.
+ */
+
+static ssize_t
+ngx_http_waf_agent_send(ngx_http_waf_ctx_t *ctx, u_char *json, size_t len,
+    int attach)
+{
+    ssize_t          n;
+    time_t           now;
+    struct iovec     iov;
+    struct msghdr    msg;
+#if (NGX_LINUX)
+    struct cmsghdr  *cmsg;
+    union {
+        struct cmsghdr  align;
+        u_char          data[CMSG_SPACE(sizeof(int))];
+    } control;
+#endif
+
+    iov.iov_base = json;
+    iov.iov_len  = len;
+
+    ngx_memzero(&msg, sizeof(struct msghdr));
+
+    msg.msg_name    = &ngx_http_waf_agent_addr;
+    msg.msg_namelen = ngx_http_waf_agent_addrlen;
+    msg.msg_iov     = &iov;
+    msg.msg_iovlen  = 1;
+
+#if (NGX_LINUX)
+    if (attach != -1) {
+        ngx_memzero(&control, sizeof(control));
+
+        msg.msg_control    = control.data;
+        msg.msg_controllen = sizeof(control.data);
+
+        cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type  = SCM_RIGHTS;
+        cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+        ngx_memcpy(CMSG_DATA(cmsg), &attach, sizeof(int));
+    }
+#else
+    (void) attach;
+#endif
+
+    n = sendmsg(ngx_http_waf_agent_fd, &msg, MSG_DONTWAIT);
+
+    if (n != -1) {
+        return n;
+    }
+
+    if (ngx_socket_errno == EMSGSIZE) {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log,
+                      ngx_socket_errno,
+                      "waf: agent event of %uz bytes does not fit a "
+                      "datagram; lower the preview budgets", len);
+        return -1;
+    }
+
+    now = ngx_time();
+    ngx_http_waf_agent_dropped++;
+
+    if (now != ngx_http_waf_agent_dropped_at) {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log,
+                      ngx_socket_errno,
+                      "waf: agent socket dropped %ui record(s) since the "
+                      "last note; the agent is not draining its socket",
+                      ngx_http_waf_agent_dropped);
+
+        ngx_http_waf_agent_dropped    = 0;
+        ngx_http_waf_agent_dropped_at = now;
+    }
+
+    return -1;
 }
 
 

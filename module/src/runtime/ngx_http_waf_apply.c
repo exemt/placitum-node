@@ -1303,8 +1303,8 @@ ngx_http_waf_send_swap_body(ngx_http_waf_ctx_t *ctx, ngx_http_waf_body_op_t *op)
 
     wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
 
-    if (wlcf->shoot[ctx->phase].preview_source_sent
-        & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY))
+    if (wlcf->shoot[ctx->phase].preview_source[NGX_HTTP_WAF_OBJ_BODY]
+        == NGX_HTTP_WAF_SOURCE_SENT)
     {
         ctx->ph->preview_sent[NGX_HTTP_WAF_OBJ_BODY] = op->data;
     }

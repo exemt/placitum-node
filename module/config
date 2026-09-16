@@ -17,6 +17,7 @@ WAF_SRCS=" \
     $ngx_addon_dir/src/runtime/ngx_http_waf_verdict.c \
     $ngx_addon_dir/src/runtime/ngx_http_waf_apply.c \
     $ngx_addon_dir/src/runtime/ngx_http_waf_audit.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_attach.c \
     $ngx_addon_dir/src/runtime/ngx_http_waf_preview.c \
     $ngx_addon_dir/src/runtime/ngx_http_waf_response.c \
     $ngx_addon_dir/src/runtime/ngx_http_waf_slot.c \

@@ -17,11 +17,18 @@ var Suffix = map[string]string{
 	"body":    "body",
 }
 
+// StoreAttach marks a locator whose bytes rode with the record: the module
+// wrote them into the file passed over the agent socket, at Offset and Size.
+const StoreAttach = "attach"
+
 type Locator struct {
 	Store  string `json:"store"`
 	Driver string `json:"driver"`
 	Key    string `json:"key"`
 	Hint   string `json:"hint"`
+
+	Offset int64 `json:"offset"`
+	Size   int64 `json:"size"`
 }
 
 type Terms struct {
@@ -84,6 +91,21 @@ func (s Store) Locate(kind string) (Locator, bool) {
 	}
 
 	return loc, loc.Key != ""
+}
+
+// Attach reads the locator of an object that rode with the record.
+func (s Store) Attach(kind string) (Locator, bool) {
+	raw, ok := s.Locators[kind]
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return Locator{}, false
+	}
+
+	var loc Locator
+	if err := json.Unmarshal(raw, &loc); err != nil {
+		return Locator{}, false
+	}
+
+	return loc, loc.Store == StoreAttach
 }
 
 func (s Store) Render() ([]byte, error) {
@@ -163,10 +185,10 @@ func (s Store) Render() ([]byte, error) {
 var locatorOrder = []string{
 	"unavailable", "size", "declared_size", "sha256",
 	"complete", "truncated", "encoding", "enc",
-	"store", "driver", "key", "expires_at", "hint",
+	"store", "driver", "key", "expires_at", "hint", "offset",
 }
 
-var locatorAddress = []string{"store", "driver", "key", "expires_at", "hint"}
+var locatorAddress = []string{"store", "driver", "key", "expires_at", "hint", "offset"}
 
 func Readdress(raw json.RawMessage, store, driver, key string,
 	expiresAt int64) (json.RawMessage, error) {

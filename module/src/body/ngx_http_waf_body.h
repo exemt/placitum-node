@@ -36,6 +36,8 @@ struct ngx_http_waf_locator_s {
 
     ngx_str_t                  hint;
 
+    off_t                      offset;
+
     ngx_uint_t                 unavailable;
 
     unsigned                   has_sha256:1;
@@ -167,15 +169,35 @@ size_t     ngx_http_waf_needs_size(void);
 void       ngx_http_waf_needs_write(ngx_http_waf_jw_t *jw,
                ngx_http_waf_ctx_t *ctx, ngx_http_waf_inspector_t *insp);
 
-ngx_int_t  ngx_http_waf_store_reload(ngx_http_waf_ctx_t *ctx);
-ngx_uint_t ngx_http_waf_store_reload_needs_body(ngx_http_waf_ctx_t *ctx);
+ngx_uint_t ngx_http_waf_agent_needs_body(ngx_http_waf_ctx_t *ctx);
 
-size_t     ngx_http_waf_store_reload_size(ngx_http_waf_ctx_t *ctx,
+size_t     ngx_http_waf_archive_wants(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj,
+               ngx_uint_t verdict);
+ngx_uint_t ngx_http_waf_archive_names(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj);
+ngx_uint_t ngx_http_waf_archive_original(ngx_http_waf_ctx_t *ctx,
                ngx_uint_t obj);
 
+ngx_uint_t ngx_http_waf_lists_own(ngx_http_waf_shoot_conf_t *sh,
+               ngx_uint_t kind, ngx_uint_t obj);
+ngx_uint_t ngx_http_waf_lists_cover(ngx_http_waf_shoot_conf_t *sh,
+               ngx_uint_t kind, ngx_uint_t obj);
+ngx_uint_t ngx_http_waf_store_serves(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj);
+
+ngx_int_t  ngx_http_waf_meta_collect(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj,
+               size_t limit, ngx_uint_t raw, ngx_str_t *out,
+               ngx_uint_t *truncated);
+
+off_t      ngx_http_waf_body_attach_len(ngx_http_waf_ctx_t *ctx, size_t limit,
+               off_t *total);
+ngx_int_t  ngx_http_waf_body_attach(ngx_http_waf_ctx_t *ctx, int fd,
+               size_t limit, ngx_http_waf_locator_t *loc);
+
 ngx_chain_t *ngx_http_waf_body_chain(ngx_http_waf_ctx_t *ctx);
+off_t        ngx_http_waf_body_seen(ngx_http_waf_ctx_t *ctx);
 
 ngx_uint_t ngx_http_waf_obj_suffix_reserved(ngx_str_t *suffix);
+
+char      *ngx_http_waf_obj_names(ngx_uint_t mask);
 
 size_t     ngx_http_waf_store_size(ngx_http_waf_ctx_t *ctx);
 
@@ -187,6 +209,7 @@ void       ngx_http_waf_store_write(ngx_http_waf_jw_t *jw,
 
 #define NGX_HTTP_WAF_LOC_BODY     0x01
 #define NGX_HTTP_WAF_LOC_ADDRESS  0x02
+#define NGX_HTTP_WAF_LOC_ATTACH   0x04
 
 void       ngx_http_waf_locator_write(ngx_http_waf_jw_t *jw,
                ngx_http_waf_locator_t *loc, ngx_uint_t flags);

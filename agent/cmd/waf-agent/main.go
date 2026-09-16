@@ -204,12 +204,30 @@ func run() error {
 		log.Info("archive off")
 	}
 
-	stopHandoff, err := handoff.Serve(sock, func(raw []byte) {
+	stopHandoff, err := handoff.Serve(sock, func(raw []byte, attach *os.File) {
+		if attach != nil {
+			defer attach.Close()
+		}
+
 		d, err := audit.Decode(raw)
 		auditIO.Add(uint64(len(raw)), 0, err != nil, 0)
 		if err != nil {
 			log.Warn("verdict decode failed", "error", err)
 			return
+		}
+
+		if attach != nil {
+			var size int64
+
+			if st, err := attach.Stat(); err == nil {
+				size = st.Size()
+			}
+
+			d.Attached, err = audit.Attachments(raw, attach, size)
+			if err != nil {
+				log.Warn("record attachments unreadable", "ray", d.Ray,
+					"error", err.Error())
+			}
 		}
 
 		if d.Node == "" {

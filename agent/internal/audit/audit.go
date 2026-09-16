@@ -68,6 +68,10 @@ type Decision struct {
 
 	Archive map[string]Terms
 
+	// Attached holds the objects that rode with the record instead of
+	// waiting in the exchange, by kind.
+	Attached map[string][]byte
+
 	Raw []byte
 }
 
