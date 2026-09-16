@@ -1,0 +1,63 @@
+ngx_addon_name=ngx_http_waf_module
+
+WAF_SRCS=" \
+    $ngx_addon_dir/src/ngx_http_waf_module.c \
+    $ngx_addon_dir/src/core/ngx_http_waf_conf.c \
+    $ngx_addon_dir/src/core/ngx_http_waf_directives.c \
+    $ngx_addon_dir/src/core/ngx_http_waf_graph.c \
+    $ngx_addon_dir/src/codec/ngx_http_waf_json.c \
+    $ngx_addon_dir/src/codec/ngx_http_waf_msg_req.c \
+    $ngx_addon_dir/src/codec/ngx_http_waf_msg_reply.c \
+    $ngx_addon_dir/src/body/ngx_http_waf_body.c \
+    $ngx_addon_dir/src/body/ngx_http_waf_sha256.c \
+    $ngx_addon_dir/src/body/drv_none.c \
+    $ngx_addon_dir/src/body/drv_inline.c \
+    $ngx_addon_dir/src/body/drv_redis.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_handler.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_verdict.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_apply.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_audit.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_preview.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_response.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_slot.c \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_variables.c \
+    $ngx_addon_dir/src/bus/ngx_http_waf_bus.c \
+    $ngx_addon_dir/src/bus/ngx_http_waf_bus_nats.c \
+    $ngx_addon_dir/src/net/ngx_http_waf_link.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_shm.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_breaker.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_rate.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_dataset.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_select.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_ds_live.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_ds_stream.c \
+    $ngx_addon_dir/src/local/ngx_http_waf_frame_cache.c \
+    $ngx_addon_dir/src/stream/ngx_http_waf_frame.c \
+"
+
+WAF_DEPS=" \
+    $ngx_addon_dir/src/ngx_http_waf.h \
+    $ngx_addon_dir/src/bus/ngx_http_waf_bus.h \
+    $ngx_addon_dir/src/net/ngx_http_waf_link.h \
+    $ngx_addon_dir/src/codec/ngx_http_waf_codec.h \
+    $ngx_addon_dir/src/local/ngx_http_waf_local.h \
+    $ngx_addon_dir/src/body/ngx_http_waf_body.h \
+    $ngx_addon_dir/src/runtime/ngx_http_waf_preview.h \
+"
+
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP
+    ngx_module_name=$ngx_addon_name
+    ngx_module_srcs="$WAF_SRCS"
+    ngx_module_deps="$WAF_DEPS"
+    ngx_module_incs="$ngx_addon_dir/src"
+    ngx_module_libs=
+
+    . auto/module
+else
+    # nginx older than 1.9.11 has no dynamic module support; static link only.
+    HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $WAF_SRCS"
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $WAF_DEPS"
+    CFLAGS="$CFLAGS -I$ngx_addon_dir/src"
+fi

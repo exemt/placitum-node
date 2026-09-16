@@ -1,0 +1,15 @@
+{
+  "error": "bad_request",
+  "status": <!--# echo var="waf_deny_status" default="400" -->,
+  "message": "The request could not be understood. Please check the request format.",
+<!--# if expr="$waf_deny_scope" -->
+  "scope": "<!--# echo var='waf_deny_scope' default='' -->",
+<!--# endif -->
+<!--# if expr="$waf_deny_subject" -->
+  "subject": "<!--# echo var='waf_deny_subject' default='' -->",
+<!--# endif -->
+<!--# if expr="$waf_deny_retry" -->
+  "retry_after": <!--# echo var="waf_deny_retry" default="0" -->,
+<!--# endif -->
+  "ray": "<!--# echo var='waf_deny_ray' default='' -->"
+}
