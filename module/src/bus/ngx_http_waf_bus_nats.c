@@ -89,6 +89,8 @@ static void      ngx_http_waf_nats_deliver(ngx_http_waf_nats_t *nats,
 static ngx_int_t ngx_http_waf_nats_handshake(ngx_http_waf_nats_t *nats);
 static ngx_int_t ngx_http_waf_nats_hello_build(ngx_http_waf_nats_t *nats,
     ngx_cycle_t *cycle);
+static ngx_int_t ngx_http_waf_nats_json(ngx_pool_t *pool, ngx_str_t *src,
+    ngx_str_t *dst);
 static ngx_int_t ngx_http_waf_nats_pub(ngx_http_waf_nats_t *nats,
     ngx_str_t *subject, ngx_str_t *reply, ngx_str_t *payload);
 
@@ -635,12 +637,24 @@ ngx_http_waf_nats_hello_build(ngx_http_waf_nats_t *nats, ngx_cycle_t *cycle)
 {
     u_char                    *p, *buf, *last;
     size_t                     size;
+    ngx_str_t                  name, user, pass, token;
     ngx_uint_t                 i;
     ngx_http_waf_dataset_t    *ds;
     ngx_http_waf_main_conf_t  *wmcf = nats->wmcf;
 
-    size = 256 + wmcf->bus_name.len + wmcf->bus_user.len + wmcf->bus_pass.len
-           + wmcf->bus_token.len + 2 * nats->bus->inbox.len;
+    if (ngx_http_waf_nats_json(cycle->pool, &wmcf->bus_name, &name) != NGX_OK
+        || ngx_http_waf_nats_json(cycle->pool, &wmcf->bus_user, &user)
+           != NGX_OK
+        || ngx_http_waf_nats_json(cycle->pool, &wmcf->bus_pass, &pass)
+           != NGX_OK
+        || ngx_http_waf_nats_json(cycle->pool, &wmcf->bus_token, &token)
+           != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    size = 256 + name.len + user.len + pass.len + token.len
+           + 2 * nats->bus->inbox.len;
 
     if (wmcf->datasets != NULL) {
         ds = wmcf->datasets->elts;
@@ -662,15 +676,15 @@ ngx_http_waf_nats_hello_build(ngx_http_waf_nats_t *nats, ngx_cycle_t *cycle)
                      "\"tls_required\":false,\"lang\":\"c\","
                      "\"version\":\"" NGINX_VERSION "\",\"protocol\":1,"
                      "\"headers\":true,\"no_responders\":true,\"name\":\"%V\"",
-                     &wmcf->bus_name);
+                     &name);
 
-    if (wmcf->bus_user.len != 0) {
+    if (user.len != 0) {
         p = ngx_slprintf(p, last, ",\"user\":\"%V\",\"pass\":\"%V\"",
-                         &wmcf->bus_user, &wmcf->bus_pass);
+                         &user, &pass);
     }
 
-    if (wmcf->bus_token.len != 0) {
-        p = ngx_slprintf(p, last, ",\"auth_token\":\"%V\"", &wmcf->bus_token);
+    if (token.len != 0) {
+        p = ngx_slprintf(p, last, ",\"auth_token\":\"%V\"", &token);
     }
 
     p = ngx_slprintf(p, last,
@@ -703,6 +717,32 @@ ngx_http_waf_nats_hello_build(ngx_http_waf_nats_t *nats, ngx_cycle_t *cycle)
 
     nats->hello.data = buf;
     nats->hello.len  = (size_t) (p - buf);
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_waf_nats_json(ngx_pool_t *pool, ngx_str_t *src, ngx_str_t *dst)
+{
+    u_char  *p;
+    size_t   extra;
+
+    extra = (size_t) ngx_escape_json(NULL, src->data, src->len);
+
+    if (extra == 0) {
+        *dst = *src;
+        return NGX_OK;
+    }
+
+    p = ngx_pnalloc(pool, src->len + extra);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    dst->data = p;
+    dst->len  = (size_t) ((u_char *) ngx_escape_json(p, src->data, src->len)
+                          - p);
 
     return NGX_OK;
 }
