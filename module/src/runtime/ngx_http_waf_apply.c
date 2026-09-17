@@ -44,8 +44,6 @@ static ngx_int_t ngx_http_waf_cookie_set(ngx_http_waf_ctx_t *ctx,
 static ngx_int_t ngx_http_waf_debug_header(ngx_http_waf_ctx_t *ctx);
 static ngx_http_waf_deny_response_t *ngx_http_waf_deny_entry(
     ngx_http_waf_ctx_t *ctx);
-ngx_http_waf_deny_response_t *ngx_http_waf_deny_entry_pub(
-    ngx_http_waf_ctx_t *ctx);
 
 
 static ngx_str_t  ngx_http_waf_score_code = ngx_string("SCORE_THRESHOLD");
@@ -274,12 +272,15 @@ static ngx_int_t
 ngx_http_waf_header_in_set(ngx_http_request_t *r, ngx_str_t *name,
     ngx_str_t *value)
 {
-    ngx_uint_t        i;
+    ngx_uint_t        i, found;
     ngx_list_part_t  *part;
     ngx_table_elt_t  *h;
 
-    part = &r->headers_in.headers.part;
-    h    = part->elts;
+    part  = &r->headers_in.headers.part;
+    h     = part->elts;
+    found = 0;
+
+    /* upstream modules send every copy, whatever its hash */
 
     for (i = 0; ; i++) {
 
@@ -293,14 +294,18 @@ ngx_http_waf_header_in_set(ngx_http_request_t *r, ngx_str_t *name,
             i    = 0;
         }
 
-        if (h[i].hash == 0 || h[i].key.len != name->len) {
+        if (h[i].key.len != name->len
+            || ngx_strncasecmp(h[i].key.data, name->data, name->len) != 0)
+        {
             continue;
         }
 
-        if (ngx_strncasecmp(h[i].key.data, name->data, name->len) == 0) {
-            h[i].value = *value;
-            return NGX_OK;
-        }
+        h[i].value = *value;
+        found = 1;
+    }
+
+    if (found) {
+        return NGX_OK;
     }
 
     h = ngx_list_push(&r->headers_in.headers);
@@ -318,6 +323,7 @@ ngx_http_waf_header_in_set(ngx_http_request_t *r, ngx_str_t *name,
     h->hash  = ngx_hash_key(h->lowcase_key, name->len);
     h->key   = *name;
     h->value = *value;
+    h->next  = NULL;
 
     return NGX_OK;
 }
@@ -494,10 +500,15 @@ ngx_http_waf_deny_entry(ngx_http_waf_ctx_t *ctx)
     dr = ngx_http_waf_deny_response_find(wmcf, name);
 
     if (dr == NULL && name != &wlcf->deny_response_default) {
-        ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
-                      "waf: deny response \"%V\" is not declared, "
-                      "falling back to \"%V\"", name,
-                      &wlcf->deny_response_default);
+
+        if (!ctx->ph->deny_warned) {
+            ctx->ph->deny_warned = 1;
+
+            ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
+                          "waf: deny response \"%V\" is not declared, "
+                          "falling back to \"%V\"", name,
+                          &wlcf->deny_response_default);
+        }
 
         dr = ngx_http_waf_deny_response_find(wmcf,
                                              &wlcf->deny_response_default);
@@ -838,8 +849,6 @@ ngx_http_waf_send_fail(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj,
     wlcf  = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
     insp  = &((ngx_http_waf_inspector_t *) wmcf->inspectors.elts)[index];
     reply = &ctx->ph->replies[index];
-
-    ctx->send_body_failed = 1;
 
     deny = wlcf->exception[NGX_HTTP_WAF_PHASE_REQUEST][NGX_HTTP_WAF_EXC_BODY]
            == NGX_HTTP_WAF_POLICY_BLOCK;
@@ -1778,7 +1787,9 @@ ngx_http_waf_log_verdict(ngx_http_waf_ctx_t *ctx)
 
     ngx_http_waf_log_vars(ctx, &vars);
 
-    if (ctx->ph->fail != NGX_HTTP_WAF_CODE_NONE) {
+    if (ctx->ph->fail != NGX_HTTP_WAF_CODE_NONE
+        && ctx->ph->verdict == NGX_HTTP_WAF_V_ALLOW)
+    {
         ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
                       "waf: no verdict (%V) phase %V, rid %*s, ray %*s, "
                       "score %i, shadow %i, %M ms%V",

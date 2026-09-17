@@ -81,8 +81,9 @@ ngx_http_waf_msg_request(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
 
     ngx_http_waf_jw_init(&jw, buf, size);
 
-    left = (ngx_msec_int_t) (wlcf->deadline[ctx->phase]
-                             - (ngx_current_msec - ctx->started));
+    left = (ctx->ph->due != 0)
+               ? (ngx_msec_int_t) (ctx->ph->due - ngx_current_msec)
+               : (ngx_msec_int_t) wlcf->deadline[ctx->phase];
     if (left < 0) {
         left = 0;
     }

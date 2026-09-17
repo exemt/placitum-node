@@ -2,8 +2,17 @@
 #include "local/ngx_http_waf_local.h"
 
 
+#define NGX_HTTP_WAF_SESSION_TEXT                                             \
+    (NGX_HTTP_WAF_SESSION_SOURCE_MAX + NGX_HTTP_WAF_SESSION_KIND_MAX          \
+     + NGX_HTTP_WAF_SESSION_USER_MAX + NGX_HTTP_WAF_SESSION_ID_MAX            \
+     + NGX_HTTP_WAF_SESSION_GROUPS_MAX)
+
+
 static ngx_http_waf_reply_t *ngx_http_waf_pick(ngx_http_waf_ctx_t *ctx,
     ngx_uint_t verdict, ngx_uint_t *index);
+static ngx_int_t ngx_http_waf_session_copy(ngx_http_waf_ctx_t *ctx,
+    ngx_http_waf_session_t *dst, ngx_http_waf_session_t *src, u_char *buf);
+static u_char *ngx_http_waf_session_put(u_char *p, ngx_str_t *s);
 
 
 static ngx_str_t  ngx_http_waf_verdict_names[] = {
@@ -338,30 +347,8 @@ ngx_http_waf_actions_merge(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
         src[i].wave    = wave;
         src[i].passive = reply->passive;
 
-        if (ngx_http_waf_do_control(src[i].verb)
-            && ngx_http_waf_control_apply(ctx, &src[i]) != NGX_OK)
-        {
-            continue;
-        }
-
-        if (ngx_http_waf_do_audit(src[i].verb)
-            && ngx_http_waf_audit_ovr_apply(ctx, &src[i]) != NGX_OK)
-        {
-            continue;
-        }
-
-        if (ngx_http_waf_do_mark(src[i].verb)) {
-            (void) ngx_http_waf_markers_add(ctx, &src[i]);
-        }
-
-        if (ngx_http_waf_do_score(src[i].verb)
-            && ngx_http_waf_score_apply(ctx, &src[i]) != NGX_OK)
-        {
-            continue;
-        }
-
         live  = ctx->actions->elts;
-        found = 0;
+        found = ctx->actions->nelts;
 
         for (j = 0; j < ctx->actions->nelts; j++) {
 
@@ -406,20 +393,44 @@ ngx_http_waf_actions_merge(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
                 continue;
             }
 
-            live[j] = src[i];
-            found   = 1;
+            found = j;
             break;
         }
 
-        if (found) {
-            continue;
-        }
-
-        if (ctx->actions->nelts >= wlcf->actions_max) {
+        if (found == ctx->actions->nelts
+            && ctx->actions->nelts >= wlcf->actions_max)
+        {
             ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
                           "waf: action \"%V\" from inspector \"%V\" dropped: "
                           "waf_actions_max reached",
                           ngx_http_waf_do_name(src[i].verb), &insp->name);
+            continue;
+        }
+
+        if (ngx_http_waf_do_control(src[i].verb)
+            && ngx_http_waf_control_apply(ctx, &src[i]) != NGX_OK)
+        {
+            continue;
+        }
+
+        if (ngx_http_waf_do_audit(src[i].verb)
+            && ngx_http_waf_audit_ovr_apply(ctx, &src[i]) != NGX_OK)
+        {
+            continue;
+        }
+
+        if (ngx_http_waf_do_mark(src[i].verb)) {
+            (void) ngx_http_waf_markers_add(ctx, &src[i]);
+        }
+
+        if (ngx_http_waf_do_score(src[i].verb)
+            && ngx_http_waf_score_apply(ctx, &src[i]) != NGX_OK)
+        {
+            continue;
+        }
+
+        if (found != ctx->actions->nelts) {
+            live[found] = src[i];
             continue;
         }
 
@@ -450,7 +461,8 @@ ngx_http_waf_sessions_merge(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
     insp = &((ngx_http_waf_inspector_t *) wmcf->inspectors.elts)[index];
 
     if (ctx->sessions == NULL) {
-        ctx->sessions = ngx_array_create(ctx->request->pool, 2,
+        ctx->sessions = ngx_array_create(ngx_http_waf_ctx_pool(ctx),
+                                         NGX_HTTP_WAF_SESSIONS_MAX,
                                          sizeof(ngx_http_waf_session_t));
         if (ctx->sessions == NULL) {
             return;
@@ -489,8 +501,9 @@ ngx_http_waf_sessions_merge(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
                 continue;
             }
 
-            live[j] = src[i];
-            found   = 1;
+            (void) ngx_http_waf_session_copy(ctx, &live[j], &src[i],
+                                             live[j].source.data);
+            found = 1;
             break;
         }
 
@@ -511,8 +524,69 @@ ngx_http_waf_sessions_merge(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
             return;
         }
 
-        *slot = src[i];
+        if (ngx_http_waf_session_copy(ctx, slot, &src[i], NULL) != NGX_OK) {
+            ctx->sessions->nelts--;
+        }
     }
+}
+
+
+/*
+ * The session outlives a frame pool: the strings go into one buffer per
+ * entry, allocated once from the context pool and reused on replace.
+ */
+
+static ngx_int_t
+ngx_http_waf_session_copy(ngx_http_waf_ctx_t *ctx, ngx_http_waf_session_t *dst,
+    ngx_http_waf_session_t *src, u_char *buf)
+{
+    u_char  *p;
+
+    if (src->source.len + src->kind.len + src->user.len + src->id.len
+        + src->groups.len > NGX_HTTP_WAF_SESSION_TEXT)
+    {
+        return NGX_ERROR;
+    }
+
+    if (buf == NULL) {
+        buf = ngx_pnalloc(ngx_http_waf_ctx_pool(ctx),
+                          NGX_HTTP_WAF_SESSION_TEXT);
+        if (buf == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    *dst = *src;
+
+    p = buf;
+
+    dst->source.data = p;
+    p = ngx_http_waf_session_put(p, &src->source);
+
+    dst->kind.data = p;
+    p = ngx_http_waf_session_put(p, &src->kind);
+
+    dst->user.data = p;
+    p = ngx_http_waf_session_put(p, &src->user);
+
+    dst->id.data = p;
+    p = ngx_http_waf_session_put(p, &src->id);
+
+    dst->groups.data = p;
+    (void) ngx_http_waf_session_put(p, &src->groups);
+
+    return NGX_OK;
+}
+
+
+static u_char *
+ngx_http_waf_session_put(u_char *p, ngx_str_t *s)
+{
+    if (s->len == 0) {
+        return p;
+    }
+
+    return ngx_cpymem(p, s->data, s->len);
 }
 
 

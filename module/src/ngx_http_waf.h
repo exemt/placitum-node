@@ -122,6 +122,7 @@ typedef enum {
 
 typedef struct {
     ngx_str_t                  subject;
+    size_t                     size;
     ngx_msec_t                 expires;
 } ngx_http_waf_cont_t;
 
@@ -453,7 +454,6 @@ typedef struct {
 
 
 typedef struct {
-    ngx_http_waf_mask_t        mandatory;
     ngx_http_waf_mask_t        passive;
     ngx_http_waf_mask_t        vote;
     ngx_http_waf_mask_t        all;
@@ -461,7 +461,6 @@ typedef struct {
     ngx_http_waf_mask_t        off;
 
     ngx_uint_t                 body_need;
-    size_t                     body_preview;
 
     ngx_uint_t                 obj_need;
 } ngx_http_waf_wave_t;
@@ -750,6 +749,7 @@ typedef struct {
     ngx_uint_t                 wave;
 
     ngx_msec_t                 wave_published;
+    ngx_msec_t                 due;
 
     ngx_http_waf_reply_t      *replies;
     ngx_http_waf_mask_t        got;
@@ -826,6 +826,8 @@ typedef struct {
     unsigned                   logged:1;
 
     unsigned                   audit_deferred:1;
+
+    unsigned                   deny_warned:1;
 } ngx_http_waf_phase_ctx_t;
 
 
@@ -891,7 +893,6 @@ struct ngx_http_waf_ctx_s {
     ngx_uint_t                 send_body_index;
     unsigned                   send_fetched:1;
     unsigned                   send_body_done:1;
-    unsigned                   send_body_failed:1;
     unsigned                   req_body_rewritten:1;
 
     ngx_http_waf_cont_t       *cont;
@@ -917,7 +918,6 @@ struct ngx_http_waf_ctx_s {
 
     unsigned                   by_local:1;
     unsigned                   waiting:1;
-    unsigned                   done:1;
 
     unsigned                   audit_sampled:1;
     unsigned                   audit_keep:1;
@@ -1274,7 +1274,6 @@ size_t     ngx_http_waf_args_cap(ngx_http_request_t *r);
 void       ngx_http_waf_on_reply(ngx_http_waf_slot_t *slot, ngx_uint_t index,
                ngx_http_waf_reply_t *reply);
 void       ngx_http_waf_resume(ngx_http_waf_slot_t *slot);
-void       ngx_http_waf_fail(ngx_http_waf_slot_t *slot, ngx_uint_t code);
 
 void       ngx_http_waf_skip(ngx_http_waf_slot_t *slot, ngx_uint_t index,
                ngx_uint_t code);
@@ -1466,7 +1465,6 @@ ngx_http_waf_slot_t *ngx_http_waf_slot_acquire(ngx_http_waf_ctx_t *ctx);
 ngx_http_waf_slot_t *ngx_http_waf_slot_lookup(uint64_t rid);
 void                 ngx_http_waf_slot_release(ngx_http_waf_slot_t *slot);
 
-ngx_int_t            ngx_http_waf_rid_assign(ngx_http_waf_ctx_t *ctx);
 void                 ngx_http_waf_slot_detach(void *data);
 
 void       ngx_http_waf_rid_hex(uint64_t rid, u_char *dst);

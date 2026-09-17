@@ -216,9 +216,10 @@ static ngx_int_t
 ngx_http_waf_var_deny_name(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
-    ngx_str_t                *name;
-    ngx_http_waf_ctx_t       *ctx;
-    ngx_http_waf_loc_conf_t  *wlcf;
+    ngx_str_t                     *name;
+    ngx_http_waf_ctx_t            *ctx;
+    ngx_http_waf_loc_conf_t       *wlcf;
+    ngx_http_waf_deny_response_t  *dr;
 
     ctx = ngx_http_waf_get_ctx(r);
 
@@ -227,27 +228,13 @@ ngx_http_waf_var_deny_name(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+    dr = ngx_http_waf_deny_entry_pub(ctx);
 
-    if (ctx->exception_response.len != 0) {
-        name = &ctx->exception_response;
-
-    } else if (ctx->by_local) {
-        name = (ctx->local_response.len != 0)
-                   ? &ctx->local_response
-                   : &wlcf->deny_response_default;
-
-    } else if (ctx->ph->by_score) {
-        name = (wlcf->score_deny_response[ctx->phase].len != 0)
-                   ? &wlcf->score_deny_response[ctx->phase]
-                   : &wlcf->deny_response_default;
-
-    } else if (ctx->ph->decisive != NULL
-               && ctx->ph->decisive->response_name.len != 0)
-    {
-        name = &ctx->ph->decisive->response_name;
+    if (dr != NULL) {
+        name = &dr->name;
 
     } else {
+        wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
         name = &wlcf->deny_response_default;
     }
 

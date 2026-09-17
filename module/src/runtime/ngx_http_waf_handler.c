@@ -7,26 +7,40 @@
 static ngx_int_t ngx_http_waf_ctx_variable(ngx_http_request_t *r,
                      ngx_http_variable_value_t *v, uintptr_t data);
 
+static ngx_int_t ngx_http_waf_access(ngx_http_request_t *r);
 static ngx_int_t ngx_http_waf_handshake_guard(ngx_http_waf_ctx_t *ctx);
 static void      ngx_http_waf_ws_strip(ngx_http_waf_ctx_t *ctx,
                      ngx_array_t *strip);
+static ngx_uint_t ngx_http_waf_ws_strip_one(ngx_http_waf_ctx_t *ctx,
+                     ngx_table_elt_t *ext, ngx_array_t *strip, ngx_uint_t all,
+                     ngx_uint_t *kept);
 static ngx_int_t ngx_http_waf_local_deny(ngx_http_waf_ctx_t *ctx,
                      ngx_str_t *rule, ngx_str_t *response, ngx_uint_t code);
 static void      ngx_http_waf_breaker_account(ngx_http_waf_slot_t *slot,
                      uint64_t mask, ngx_uint_t timed_out);
 static void      ngx_http_waf_on_deadline(ngx_event_t *ev);
+static void      ngx_http_waf_deadline_arm(ngx_http_waf_ctx_t *ctx,
+                     ngx_http_waf_slot_t *slot);
+static void      ngx_http_waf_deadline_stop(ngx_http_waf_ctx_t *ctx);
+static void      ngx_http_waf_expire(ngx_http_waf_slot_t *slot);
+static void      ngx_http_waf_fail(ngx_http_waf_slot_t *slot);
 static void      ngx_http_waf_body_ready(ngx_http_request_t *r);
 
+static ngx_uint_t ngx_http_waf_exception_policy(ngx_http_waf_ctx_t *ctx,
+                     ngx_uint_t *exc);
+static void      ngx_http_waf_fail_pass(ngx_http_waf_ctx_t *ctx);
 static ngx_int_t ngx_http_waf_fail_policy(ngx_http_waf_ctx_t *ctx);
 static ngx_int_t ngx_http_waf_wave_needs_body(ngx_http_waf_ctx_t *ctx,
                      ngx_uint_t wave);
 static ngx_http_waf_slot_t *ngx_http_waf_ensure_slot(ngx_http_waf_ctx_t *ctx);
+static void      ngx_http_waf_slot_drop(ngx_http_waf_ctx_t *ctx);
 static void      ngx_http_waf_discard_body(ngx_http_waf_ctx_t *ctx);
 static ngx_uint_t ngx_http_waf_wave_closed(ngx_http_waf_ctx_t *ctx,
                      ngx_http_waf_slot_t *slot);
 static ngx_uint_t ngx_http_waf_wave_advances(ngx_http_waf_ctx_t *ctx,
                      ngx_http_waf_slot_t *slot);
 static void      ngx_http_waf_settle(ngx_http_waf_slot_t *slot);
+static void      ngx_http_waf_conclude(ngx_http_waf_slot_t *slot);
 static void      ngx_http_waf_rewrite_settle(ngx_http_waf_ctx_t *ctx,
                      ngx_http_waf_slot_t *slot);
 static void      ngx_http_waf_return_to_phases(ngx_http_waf_ctx_t *ctx);
@@ -34,6 +48,9 @@ static ngx_int_t ngx_http_waf_finish_done(ngx_http_waf_ctx_t *ctx);
 
 
 static ngx_str_t  ngx_http_waf_ctx_var_name = ngx_string("waf_internal_ctx");
+
+/* resumes nested in the access handler leave posted requests to its caller */
+static ngx_uint_t  ngx_http_waf_access_depth;
 
 
 static ngx_int_t
@@ -164,6 +181,28 @@ ngx_http_waf_vars_eval(ngx_http_waf_ctx_t *ctx)
 ngx_int_t
 ngx_http_waf_access_handler(ngx_http_request_t *r)
 {
+    ngx_int_t  rc;
+
+    ngx_http_waf_access_depth++;
+
+    rc = ngx_http_waf_access(r);
+
+    /* a 401 or 403 left to the phase checker is overridable by "satisfy any" */
+
+    if (rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+        ngx_http_finalize_request(r, rc);
+        rc = NGX_DONE;
+    }
+
+    ngx_http_waf_access_depth--;
+
+    return rc;
+}
+
+
+static ngx_int_t
+ngx_http_waf_access(ngx_http_request_t *r)
+{
     ngx_int_t                 rc;
     ngx_http_waf_ctx_t       *ctx;
     ngx_http_waf_loc_conf_t  *wlcf;
@@ -246,6 +285,17 @@ ngx_http_waf_access_handler(ngx_http_request_t *r)
         return NGX_DONE;
 
     case NGX_HTTP_WAF_ST_READING_BODY:
+
+        /* an internal redirect to the error page of a failed body read */
+
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "waf: the request body was not read, the error page "
+                      "goes uninspected, ray %*s",
+                      (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
+
+        ctx->state = NGX_HTTP_WAF_ST_DONE;
+        return NGX_DECLINED;
+
     case NGX_HTTP_WAF_ST_PLACING_META:
     case NGX_HTTP_WAF_ST_FETCHING_FORM:
         return NGX_DONE;
@@ -306,7 +356,6 @@ ngx_int_t
 ngx_http_waf_wave_start(ngx_http_waf_ctx_t *ctx, ngx_uint_t wave)
 {
     ngx_int_t                  rc;
-    ngx_msec_t                 budget;
     ngx_uint_t                 need;
     ngx_http_request_t        *r = ctx->request;
     ngx_http_waf_slot_t       *slot;
@@ -317,6 +366,13 @@ ngx_http_waf_wave_start(ngx_http_waf_ctx_t *ctx, ngx_uint_t wave)
     wmcf = ngx_http_get_module_main_conf(r, ngx_http_waf_module);
 
     ctx->ph->wave = wave;
+
+    if (ctx->phase == NGX_HTTP_WAF_PHASE_REQUEST
+        && !ctx->ph->body_ready && ngx_http_waf_wave_needs_body(ctx, wave))
+    {
+        ctx->state = NGX_HTTP_WAF_ST_NEED_BODY;
+        return ngx_http_waf_access(r);
+    }
 
     slot = ngx_http_waf_ensure_slot(ctx);
     if (slot == NULL) {
@@ -343,19 +399,33 @@ ngx_http_waf_wave_start(ngx_http_waf_ctx_t *ctx, ngx_uint_t wave)
         }
     }
 
-    if (!ctx->ph->body_ready && ngx_http_waf_wave_needs_body(ctx, wave)) {
+    if (ngx_http_waf_wave_needs_body(ctx, wave)) {
 
-        ctx->state = NGX_HTTP_WAF_ST_NEED_BODY;
+        if (!ctx->ph->body_ready) {
+            ctx->state = NGX_HTTP_WAF_ST_NEED_BODY;
 
-        if (ctx->phase == NGX_HTTP_WAF_PHASE_RESPONSE) {
-            return ngx_http_waf_response_body(ctx);
-        }
+            if (ctx->phase == NGX_HTTP_WAF_PHASE_RESPONSE) {
+                return ngx_http_waf_response_body(ctx);
+            }
 
-        if (ngx_http_waf_phase_is_frame(ctx->phase)) {
             return ngx_http_waf_frame_body(ctx);
         }
 
-        return ngx_http_waf_access_handler(r);
+        if (ctx->phase == NGX_HTTP_WAF_PHASE_REQUEST) {
+            rc = ngx_http_waf_body_place(ctx);
+
+            if (rc == NGX_AGAIN) {
+                ctx->state = NGX_HTTP_WAF_ST_PLACING_META;
+                return NGX_DONE;
+            }
+
+            if (rc != NGX_OK) {
+                ngx_http_waf_slot_release(slot);
+                ctx->ph->fail = NGX_HTTP_WAF_CODE_FAIL_BODY;
+                ctx->state    = NGX_HTTP_WAF_ST_FAILED;
+                return ngx_http_waf_fail_policy(ctx);
+            }
+        }
     }
 
     if (ctx->ph->replies == NULL && wmcf->inspectors.nelts != 0) {
@@ -367,6 +437,12 @@ ngx_http_waf_wave_start(ngx_http_waf_ctx_t *ctx, ngx_uint_t wave)
         }
     }
 
+    if (ctx->ph->due == 0) {
+        ctx->ph->due = ngx_current_msec + wlcf->deadline[ctx->phase];
+    }
+
+    slot->published = ngx_current_msec;
+
     if (ngx_http_waf_bus_publish_wave(ctx, slot) != NGX_OK) {
         ngx_http_waf_slot_release(slot);
         ctx->ph->fail = NGX_HTTP_WAF_CODE_FAIL_BUS;
@@ -374,7 +450,9 @@ ngx_http_waf_wave_start(ngx_http_waf_ctx_t *ctx, ngx_uint_t wave)
         return ngx_http_waf_fail_policy(ctx);
     }
 
-    ngx_http_waf_rate_charge_wave(ctx);
+    if (!ngx_http_waf_phase_is_frame(ctx->phase)) {
+        ngx_http_waf_rate_charge_wave(ctx);
+    }
 
     if (ngx_http_waf_wave_closed(ctx, slot)) {
 
@@ -385,25 +463,15 @@ ngx_http_waf_wave_start(ngx_http_waf_ctx_t *ctx, ngx_uint_t wave)
             return ngx_http_waf_wave_start(ctx, wave + 1);
         }
 
-        if (ctx->deadline.timer_set) {
-            ngx_del_timer(&ctx->deadline);
-        }
-
+        ngx_http_waf_deadline_stop(ctx);
         ngx_http_waf_slot_release(slot);
         ngx_http_waf_resolve_verdict(ctx);
+        ngx_http_waf_fail_pass(ctx);
 
         return ngx_http_waf_phase_apply(ctx);
     }
 
-    if (!ctx->deadline.timer_set) {
-        budget = wlcf->deadline[ctx->phase];
-
-        ctx->deadline.handler = ngx_http_waf_on_deadline;
-        ctx->deadline.data    = ctx;
-        ctx->deadline.log     = r->connection->log;
-
-        ngx_add_timer(&ctx->deadline, budget);
-    }
+    ngx_http_waf_deadline_arm(ctx, slot);
 
     if (!ngx_http_waf_phase_is_frame(ctx->phase)) {
         r->read_event_handler  = ngx_http_test_reading;
@@ -427,6 +495,7 @@ ngx_http_waf_wave_closed(ngx_http_waf_ctx_t *ctx, ngx_http_waf_slot_t *slot)
 static ngx_uint_t
 ngx_http_waf_wave_advances(ngx_http_waf_ctx_t *ctx, ngx_http_waf_slot_t *slot)
 {
+    ngx_int_t             threshold;
     ngx_http_waf_wave_t  *wave;
 
     if (ctx->ph->wave + 1 >= ngx_http_waf_wave_count(ctx)) {
@@ -434,6 +503,12 @@ ngx_http_waf_wave_advances(ngx_http_waf_ctx_t *ctx, ngx_http_waf_slot_t *slot)
     }
 
     if (ctx->ph->fail != NGX_HTTP_WAF_CODE_NONE) {
+        return 0;
+    }
+
+    threshold = ngx_http_waf_score_deny_at(ctx);
+
+    if (threshold > 0 && ctx->ph->score >= threshold) {
         return 0;
     }
 
@@ -500,7 +575,7 @@ ngx_http_waf_on_reply(ngx_http_waf_slot_t *slot, ngx_uint_t index,
 
     if (reply->verdict == NGX_HTTP_WAF_V_ERROR) {
 
-        if (bit & ngx_http_waf_wave_mandatory(ctx, wave)) {
+        if (bit & ngx_http_waf_wave_gating(ctx, wave)) {
             ctx->ph->fail = reply->overload
                                 ? NGX_HTTP_WAF_CODE_FAIL_OVERLOAD
                                 : NGX_HTTP_WAF_CODE_FAIL_INSPECTOR;
@@ -760,45 +835,45 @@ ngx_http_waf_settle(ngx_http_waf_slot_t *slot)
         return;
     }
 
-    ngx_http_waf_resume(slot);
+    ngx_http_waf_conclude(slot);
 }
 
 
 void
 ngx_http_waf_resume(ngx_http_waf_slot_t *slot)
 {
-    ngx_http_waf_ctx_t  *ctx = slot->ctx;
-
-    if (ctx == NULL) {
+    if (slot->ctx == NULL) {
         return;
     }
 
-    if (ctx->deadline.timer_set) {
-        ngx_del_timer(&ctx->deadline);
-    }
+    ngx_http_waf_rewrite_settle(slot->ctx, slot);
+    ngx_http_waf_conclude(slot);
+}
 
+
+static void
+ngx_http_waf_conclude(ngx_http_waf_slot_t *slot)
+{
+    ngx_http_waf_ctx_t  *ctx = slot->ctx;
+
+    ngx_http_waf_deadline_stop(ctx);
     ngx_http_waf_slot_release(slot);
     ngx_http_waf_resolve_verdict(ctx);
+    ngx_http_waf_fail_pass(ctx);
 
     ngx_http_waf_return_to_phases(ctx);
 }
 
 
-void
-ngx_http_waf_fail(ngx_http_waf_slot_t *slot, ngx_uint_t code)
+static void
+ngx_http_waf_fail(ngx_http_waf_slot_t *slot)
 {
     ngx_http_waf_ctx_t   *ctx = slot->ctx;
     ngx_http_waf_wave_t  *wave;
 
-    if (ctx == NULL) {
-        return;
-    }
-
     wave = ngx_http_waf_current_wave(ctx);
 
-    if (code == NGX_HTTP_WAF_CODE_FAIL_TIMEOUT) {
-        ngx_http_waf_breaker_account(slot, slot->awaited & ~slot->got, 1);
-    }
+    ngx_http_waf_breaker_account(slot, slot->awaited & ~slot->got, 1);
 
     if (wave != NULL
         && (slot->got & ngx_http_waf_wave_mandatory(ctx, wave))
@@ -811,7 +886,7 @@ ngx_http_waf_fail(ngx_http_waf_slot_t *slot, ngx_uint_t code)
                                   & ~slot->got));
 
     } else {
-        ctx->ph->fail = code;
+        ctx->ph->fail = NGX_HTTP_WAF_CODE_FAIL_TIMEOUT;
     }
 
     ngx_http_waf_resume(slot);
@@ -819,8 +894,80 @@ ngx_http_waf_fail(ngx_http_waf_slot_t *slot, ngx_uint_t code)
 
 
 static void
+ngx_http_waf_expire(ngx_http_waf_slot_t *slot)
+{
+    uint64_t                  bit;
+    ngx_uint_t                index;
+    ngx_http_waf_ctx_t       *ctx = slot->ctx;
+    ngx_http_waf_mask_t       pending, expired;
+    ngx_http_waf_wave_t      *wave;
+    ngx_http_waf_binding_t   *bind;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wave = ngx_http_waf_current_wave(ctx);
+    if (wave == NULL) {
+        ngx_http_waf_fail(slot);
+        return;
+    }
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    pending = slot->awaited & ~slot->got;
+    expired = 0;
+
+    while (pending) {
+        index    = ngx_http_waf_lowest_bit(pending);
+        bit      = 1ULL << index;
+        pending &= ~bit;
+
+        bind = ngx_http_waf_binding_find(wlcf, index, ctx->phase);
+
+        if (bind == NULL || bind->timeout == 0
+            || (ngx_msec_int_t) (slot->published + bind->timeout
+                                 - ngx_current_msec) > 0)
+        {
+            continue;
+        }
+
+        expired |= bit;
+
+        if (ctx->ph->replies != NULL) {
+            ctx->ph->replies[index].state = NGX_HTTP_WAF_ENTRY_TIMEOUT;
+        }
+    }
+
+    if (expired == 0) {
+        ngx_http_waf_deadline_arm(ctx, slot);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, ctx->request->connection->log, 0,
+                  "waf: inspectors %uxL did not answer within their timeout "
+                  "on wave %ui, rid %*s",
+                  (uint64_t) expired, ctx->ph->wave,
+                  (size_t) NGX_HTTP_WAF_RID_HEX_LEN, ctx->rid_hex);
+
+    ngx_http_waf_breaker_account(slot, expired, 1);
+
+    slot->got |= expired;
+
+    if (expired & ngx_http_waf_wave_mandatory(ctx, wave)) {
+        ctx->ph->fail = NGX_HTTP_WAF_CODE_FAIL_TIMEOUT;
+    }
+
+    if (ngx_http_waf_wave_closed(ctx, slot)) {
+        ngx_http_waf_settle(slot);
+        return;
+    }
+
+    ngx_http_waf_deadline_arm(ctx, slot);
+}
+
+
+static void
 ngx_http_waf_return_to_phases(ngx_http_waf_ctx_t *ctx)
 {
+    ngx_connection_t    *c;
     ngx_http_request_t  *r = ctx->request;
 
     if (ctx->phase == NGX_HTTP_WAF_PHASE_RESPONSE) {
@@ -835,10 +982,73 @@ ngx_http_waf_return_to_phases(ngx_http_waf_ctx_t *ctx)
 
     ctx->waiting = 0;
 
+    c = r->connection;
+
     r->read_event_handler  = ngx_http_block_reading;
     r->write_event_handler = ngx_http_core_run_phases;
 
     ngx_http_core_run_phases(r);
+
+    if (ngx_http_waf_access_depth == 0) {
+        ngx_http_run_posted_requests(c);
+    }
+}
+
+
+static void
+ngx_http_waf_deadline_arm(ngx_http_waf_ctx_t *ctx, ngx_http_waf_slot_t *slot)
+{
+    uint64_t                  bit;
+    ngx_msec_t                at, until;
+    ngx_uint_t                index;
+    ngx_msec_int_t            left;
+    ngx_http_waf_mask_t       pending;
+    ngx_http_waf_binding_t   *bind;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    at      = ctx->ph->due;
+    pending = slot->awaited & ~slot->got;
+
+    while (pending) {
+        index    = ngx_http_waf_lowest_bit(pending);
+        bit      = 1ULL << index;
+        pending &= ~bit;
+
+        bind = ngx_http_waf_binding_find(wlcf, index, ctx->phase);
+
+        if (bind == NULL || bind->timeout == 0) {
+            continue;
+        }
+
+        until = slot->published + bind->timeout;
+
+        if ((ngx_msec_int_t) (until - at) < 0) {
+            at = until;
+        }
+    }
+
+    if (ctx->deadline.timer_set) {
+        ngx_del_timer(&ctx->deadline);
+    }
+
+    ctx->deadline.handler = ngx_http_waf_on_deadline;
+    ctx->deadline.data    = ctx;
+    ctx->deadline.log     = ctx->request->connection->log;
+
+    left = (ngx_msec_int_t) (at - ngx_current_msec);
+
+    ngx_add_timer(&ctx->deadline, left > 0 ? (ngx_msec_t) left : 0);
+}
+
+
+static void
+ngx_http_waf_deadline_stop(ngx_http_waf_ctx_t *ctx)
+{
+    if (ctx->deadline.timer_set) {
+        ngx_del_timer(&ctx->deadline);
+    }
 }
 
 
@@ -848,8 +1058,17 @@ ngx_http_waf_on_deadline(ngx_event_t *ev)
     ngx_http_waf_ctx_t   *ctx = ev->data;
     ngx_http_waf_slot_t  *slot;
 
+    if (!ctx->waiting) {
+        return;
+    }
+
     slot = ngx_http_waf_slot_lookup(ctx->rid);
     if (slot == NULL) {
+        return;
+    }
+
+    if ((ngx_msec_int_t) (ctx->ph->due - ngx_current_msec) > 0) {
+        ngx_http_waf_expire(slot);
         return;
     }
 
@@ -859,14 +1078,13 @@ ngx_http_waf_on_deadline(ngx_event_t *ev)
                   ctx->ph->wave, (uint64_t) slot->awaited, (uint64_t) slot->got,
                   (size_t) NGX_HTTP_WAF_RID_HEX_LEN, ctx->rid_hex);
 
-    ngx_http_waf_fail(slot, NGX_HTTP_WAF_CODE_FAIL_TIMEOUT);
+    ngx_http_waf_fail(slot);
 }
 
 
 static void
 ngx_http_waf_body_ready(ngx_http_request_t *r)
 {
-    ngx_int_t            rc;
     ngx_http_waf_ctx_t  *ctx;
 
     ctx = ngx_http_waf_get_ctx(r);
@@ -878,24 +1096,17 @@ ngx_http_waf_body_ready(ngx_http_request_t *r)
 
     r->preserve_body = 1;
 
-    if (ctx->ph->agent_after_body) {
-        ngx_http_waf_body_resumed(ctx, NGX_OK);
-        return;
-    }
-
-    rc = ngx_http_waf_body_place(ctx);
-
-    if (rc == NGX_AGAIN) {
-        return;
-    }
-
-    ngx_http_waf_body_resumed(ctx, rc);
+    ngx_http_waf_body_resumed(ctx, NGX_OK);
 }
 
 
 void
 ngx_http_waf_form_resumed(ngx_http_waf_ctx_t *ctx)
 {
+    if (ctx->state != NGX_HTTP_WAF_ST_FETCHING_FORM) {
+        return;
+    }
+
     ctx->state = NGX_HTTP_WAF_ST_FINISH;
     ngx_http_waf_return_to_phases(ctx);
 }
@@ -904,6 +1115,13 @@ ngx_http_waf_form_resumed(ngx_http_waf_ctx_t *ctx)
 void
 ngx_http_waf_body_resumed(ngx_http_waf_ctx_t *ctx, ngx_int_t rc)
 {
+    if (ctx->state != NGX_HTTP_WAF_ST_NEED_BODY
+        && ctx->state != NGX_HTTP_WAF_ST_READING_BODY
+        && ctx->state != NGX_HTTP_WAF_ST_PLACING_META)
+    {
+        return;
+    }
+
     if (ctx->ph->agent_after_body) {
         ctx->ph->agent_after_body = 0;
         ctx->ph->agent_settled    = 1;
@@ -913,14 +1131,9 @@ ngx_http_waf_body_resumed(ngx_http_waf_ctx_t *ctx, ngx_int_t rc)
     }
 
     if (rc != NGX_OK) {
+        ngx_http_waf_slot_drop(ctx);
         ctx->ph->fail = NGX_HTTP_WAF_CODE_FAIL_BODY;
         ctx->state    = NGX_HTTP_WAF_ST_FAILED;
-
-    } else if (ctx->state == NGX_HTTP_WAF_ST_NEED_BODY
-               || ctx->state == NGX_HTTP_WAF_ST_READING_BODY
-               || ctx->state == NGX_HTTP_WAF_ST_PLACING_META)
-    {
-        ctx->state = NGX_HTTP_WAF_ST_NEXT_WAVE;
 
     } else {
         ctx->state = NGX_HTTP_WAF_ST_NEXT_WAVE;
@@ -1022,17 +1235,25 @@ ngx_http_waf_handshake_guard(ngx_http_waf_ctx_t *ctx)
 static void
 ngx_http_waf_ws_strip(ngx_http_waf_ctx_t *ctx, ngx_array_t *strip)
 {
-    u_char              *p, *start, *end, *name_end, *out, *o;
-    size_t               i, n;
-    ngx_str_t           *names, name;
-    ngx_uint_t           all, kept, removed;
+    ngx_str_t           *names;
+    ngx_uint_t           i, all, kept, removed;
     ngx_list_part_t     *part;
-    ngx_table_elt_t     *h, *ext;
+    ngx_table_elt_t     *h;
     ngx_http_request_t  *r = ctx->request;
 
-    part = &r->headers_in.headers.part;
-    h    = part->elts;
-    ext  = NULL;
+    names = strip->elts;
+    all   = 0;
+
+    for (i = 0; i < strip->nelts; i++) {
+        if (names[i].len == 3 && ngx_strncmp(names[i].data, "all", 3) == 0) {
+            all = 1;
+        }
+    }
+
+    part    = &r->headers_in.headers.part;
+    h       = part->elts;
+    kept    = 0;
+    removed = 0;
 
     for (i = 0; ; i++) {
 
@@ -1046,38 +1267,48 @@ ngx_http_waf_ws_strip(ngx_http_waf_ctx_t *ctx, ngx_array_t *strip)
             i    = 0;
         }
 
-        if (h[i].hash != 0
-            && h[i].key.len == sizeof("Sec-WebSocket-Extensions") - 1
-            && ngx_strncasecmp(h[i].key.data,
+        if (h[i].key.len != sizeof("Sec-WebSocket-Extensions") - 1
+            || ngx_strncasecmp(h[i].key.data,
                                (u_char *) "Sec-WebSocket-Extensions",
-                               h[i].key.len) == 0)
+                               h[i].key.len) != 0
+            || h[i].value.len == 0)
         {
-            ext = &h[i];
-            break;
+            continue;
         }
+
+        removed += ngx_http_waf_ws_strip_one(ctx, &h[i], strip, all, &kept);
     }
 
-    if (ext == NULL || ext->value.len == 0) {
+    if (removed == 0) {
         return;
     }
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                  "waf: stripped %ui websocket extension(s) from the "
+                  "handshake, %ui left, ray %*s", removed, kept,
+                  (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
+}
+
+
+static ngx_uint_t
+ngx_http_waf_ws_strip_one(ngx_http_waf_ctx_t *ctx, ngx_table_elt_t *ext,
+    ngx_array_t *strip, ngx_uint_t all, ngx_uint_t *kept)
+{
+    u_char              *p, *start, *end, *name_end, *out, *o;
+    ngx_str_t           *names, name;
+    ngx_uint_t           i, n, left, removed;
+    ngx_http_request_t  *r = ctx->request;
 
     names = strip->elts;
     n     = strip->nelts;
-    all   = 0;
-
-    for (i = 0; i < n; i++) {
-        if (names[i].len == 3 && ngx_strncmp(names[i].data, "all", 3) == 0) {
-            all = 1;
-        }
-    }
 
     out = ngx_pnalloc(r->pool, ext->value.len);
     if (out == NULL) {
-        return;
+        return 0;
     }
 
     o       = out;
-    kept    = 0;
+    left    = 0;
     removed = 0;
     p       = ext->value.data;
     end     = ext->value.data + ext->value.len;
@@ -1126,12 +1357,12 @@ ngx_http_waf_ws_strip(ngx_http_waf_ctx_t *ctx, ngx_array_t *strip)
                 removed++;
 
             } else {
-                if (kept != 0) {
+                if (left != 0) {
                     *o++ = ',';
                 }
 
                 o = ngx_cpymem(o, start, p - start);
-                kept++;
+                left++;
             }
         }
 
@@ -1140,19 +1371,16 @@ ngx_http_waf_ws_strip(ngx_http_waf_ctx_t *ctx, ngx_array_t *strip)
         }
     }
 
+    *kept += left;
+
     if (removed == 0) {
-        return;
+        return 0;
     }
 
-    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                  "waf: stripped %ui websocket extension(s) from the "
-                  "handshake, %ui left, ray %*s", removed, kept,
-                  (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
-
-    if (kept != 0) {
+    if (left != 0) {
         ext->value.data = out;
         ext->value.len  = o - out;
-        return;
+        return removed;
     }
 
     ngx_str_set(&ext->key, "X-WAF-Stripped-Extensions");
@@ -1160,11 +1388,13 @@ ngx_http_waf_ws_strip(ngx_http_waf_ctx_t *ctx, ngx_array_t *strip)
     ext->lowcase_key = ngx_pnalloc(r->pool, ext->key.len);
     if (ext->lowcase_key == NULL) {
         ext->hash = 0;
-        return;
+        return removed;
     }
 
     ngx_strlow(ext->lowcase_key, ext->key.data, ext->key.len);
     ext->hash = ngx_hash_key(ext->lowcase_key, ext->key.len);
+
+    return removed;
 }
 
 
@@ -1236,43 +1466,91 @@ ngx_http_waf_ensure_slot(ngx_http_waf_ctx_t *ctx)
 }
 
 
-static ngx_int_t
-ngx_http_waf_fail_policy(ngx_http_waf_ctx_t *ctx)
+static void
+ngx_http_waf_slot_drop(ngx_http_waf_ctx_t *ctx)
 {
-    ngx_uint_t                exc, policy, reason;
+    ngx_http_waf_slot_t  *slot;
+
+    if (ctx->slot == NGX_HTTP_WAF_SLOT_NIL) {
+        return;
+    }
+
+    slot = ngx_http_waf_slot_lookup(ctx->rid);
+
+    if (slot != NULL) {
+        ngx_http_waf_slot_release(slot);
+    }
+
+    ctx->slot = NGX_HTTP_WAF_SLOT_NIL;
+}
+
+
+static ngx_uint_t
+ngx_http_waf_exception_policy(ngx_http_waf_ctx_t *ctx, ngx_uint_t *exc)
+{
+    ngx_uint_t                policy;
     ngx_http_waf_loc_conf_t  *wlcf;
 
     wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
 
-    reason     = ctx->ph->fail;
-    ctx->state = NGX_HTTP_WAF_ST_DONE;
+    *exc   = ngx_http_waf_exc_of(ctx->ph->fail);
+    policy = wlcf->exception[ctx->phase][*exc];
 
-    exc = NGX_HTTP_WAF_EXC_TIMEOUT;
-
-    exc    = ngx_http_waf_exc_of(reason);
-    policy = wlcf->exception[ctx->phase][exc];
-
-    if (exc == NGX_HTTP_WAF_EXC_BODY
+    if (*exc == NGX_HTTP_WAF_EXC_BODY
         && ctx->ph->body_policy != NGX_HTTP_WAF_POLICY_UNSET)
     {
         policy = ctx->ph->body_policy;
     }
 
+    return policy;
+}
+
+
+static void
+ngx_http_waf_fail_pass(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_uint_t  exc;
+
+    if (ctx->state != NGX_HTTP_WAF_ST_FAILED
+        || ngx_http_waf_exception_policy(ctx, &exc)
+           != NGX_HTTP_WAF_POLICY_PASS)
+    {
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                  "waf: no verdict (%V), policy pass",
+                  ngx_http_waf_code_name(ctx->ph->fail));
+
+    ctx->state = NGX_HTTP_WAF_ST_ALLOW;
+}
+
+
+static ngx_int_t
+ngx_http_waf_fail_policy(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_uint_t                exc, policy;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+
+    ctx->state = NGX_HTTP_WAF_ST_DONE;
+
+    policy = ngx_http_waf_exception_policy(ctx, &exc);
+
     ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
                   "waf: no verdict (%V), policy %s",
-                  ngx_http_waf_code_name(reason),
+                  ngx_http_waf_code_name(ctx->ph->fail),
                   policy == NGX_HTTP_WAF_POLICY_PASS ? "pass" : "block");
 
-    if (policy != NGX_HTTP_WAF_POLICY_PASS) {
-        ctx->ph->code         = reason;
-        ctx->ph->fail_blocked = 1;
-
-        ctx->exception_response = wlcf->exception_response[ctx->phase][exc];
-    }
-
     if (policy == NGX_HTTP_WAF_POLICY_PASS) {
-        return ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_OVERRIDES);
+        return ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_APPLY);
     }
+
+    ctx->ph->code         = ctx->ph->fail;
+    ctx->ph->fail_blocked = 1;
+
+    ctx->exception_response = wlcf->exception_response[ctx->phase][exc];
 
     return ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_FAIL);
 }
@@ -1281,6 +1559,9 @@ ngx_http_waf_fail_policy(ngx_http_waf_ctx_t *ctx)
 ngx_int_t
 ngx_http_waf_finish(ngx_http_waf_ctx_t *ctx, ngx_uint_t how)
 {
+    ngx_http_waf_deadline_stop(ctx);
+    ngx_http_waf_slot_drop(ctx);
+
     ctx->finish_how = how;
 
     if (!ctx->ph->agent_settled) {
@@ -1288,7 +1569,7 @@ ngx_http_waf_finish(ngx_http_waf_ctx_t *ctx, ngx_uint_t how)
         if (ngx_http_waf_agent_needs_body(ctx)) {
             ctx->ph->agent_after_body = 1;
             ctx->state = NGX_HTTP_WAF_ST_NEED_BODY;
-            return ngx_http_waf_access_handler(ctx->request);
+            return ngx_http_waf_access(ctx->request);
         }
 
         ctx->ph->agent_settled = 1;
@@ -1303,6 +1584,8 @@ ngx_http_waf_finish_done(ngx_http_waf_ctx_t *ctx)
 {
     ngx_int_t  rc;
 
+    ctx->state = NGX_HTTP_WAF_ST_DONE;
+
     if (ngx_http_waf_phase_is_frame(ctx->phase)) {
         return ngx_http_waf_frame_finish(ctx, ctx->finish_how);
     }
@@ -1310,19 +1593,15 @@ ngx_http_waf_finish_done(ngx_http_waf_ctx_t *ctx)
     switch (ctx->finish_how) {
 
     case NGX_HTTP_WAF_FINISH_APPLY:
-        rc = ngx_http_waf_form_fetch(ctx);
+        ctx->state = NGX_HTTP_WAF_ST_FETCHING_FORM;
 
-        if (rc == NGX_AGAIN) {
-            ctx->state = NGX_HTTP_WAF_ST_FETCHING_FORM;
+        if (ngx_http_waf_form_fetch(ctx) == NGX_AGAIN
+            || ngx_http_waf_send_fetch(ctx) == NGX_AGAIN)
+        {
             return NGX_DONE;
         }
 
-        rc = ngx_http_waf_send_fetch(ctx);
-
-        if (rc == NGX_AGAIN) {
-            ctx->state = NGX_HTTP_WAF_ST_FETCHING_FORM;
-            return NGX_DONE;
-        }
+        ctx->state = NGX_HTTP_WAF_ST_DONE;
 
         rc = ngx_http_waf_apply(ctx);
 

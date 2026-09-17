@@ -406,7 +406,7 @@ ngx_http_waf_resume_forget(ngx_http_waf_ctx_t *ctx, ngx_uint_t index)
     ctx->resume_asked &= ~(1ULL << index);
 
     if (ctx->cont != NULL) {
-        ngx_str_null(&ctx->cont[index].subject);
+        ctx->cont[index].subject.len = 0;
     }
 }
 
@@ -416,12 +416,13 @@ ngx_http_waf_resume_keep(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
     ngx_str_t *subject, ngx_msec_t ttl)
 {
     u_char                    *p;
+    ngx_http_waf_cont_t       *cont;
     ngx_http_waf_main_conf_t  *wmcf;
 
     wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
 
     if (ctx->cont == NULL) {
-        ctx->cont = ngx_pcalloc(ctx->request->pool,
+        ctx->cont = ngx_pcalloc(ngx_http_waf_ctx_pool(ctx),
                                 wmcf->inspectors.nelts
                                     * sizeof(ngx_http_waf_cont_t));
         if (ctx->cont == NULL) {
@@ -429,16 +430,22 @@ ngx_http_waf_resume_keep(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
         }
     }
 
-    p = ngx_pnalloc(ctx->request->pool, subject->len);
-    if (p == NULL) {
-        return NGX_ERROR;
+    cont = &ctx->cont[index];
+
+    if (subject->len > cont->size) {
+        p = ngx_pnalloc(ngx_http_waf_ctx_pool(ctx), subject->len);
+        if (p == NULL) {
+            return NGX_ERROR;
+        }
+
+        cont->subject.data = p;
+        cont->size         = subject->len;
     }
 
-    ngx_memcpy(p, subject->data, subject->len);
+    ngx_memcpy(cont->subject.data, subject->data, subject->len);
 
-    ctx->cont[index].subject.data = p;
-    ctx->cont[index].subject.len  = subject->len;
-    ctx->cont[index].expires      = ngx_current_msec + ttl;
+    cont->subject.len = subject->len;
+    cont->expires     = ngx_current_msec + ttl;
 
     return NGX_OK;
 }
@@ -504,9 +511,7 @@ ngx_http_waf_waves_build(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
                         w->body_need = NGX_HTTP_WAF_BODY_FULL;
 
                     } else {
-                        w->body_need    = NGX_HTTP_WAF_BODY_PREVIEW;
-                        w->body_preview =
-                            sh->capture_limit[NGX_HTTP_WAF_OBJ_BODY];
+                        w->body_need = NGX_HTTP_WAF_BODY_PREVIEW;
                     }
                 }
 
@@ -523,11 +528,7 @@ ngx_http_waf_waves_build(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
                 w->passive |= bit;
 
             } else if (b[i].mode == NGX_HTTP_WAF_MODE_VOTE) {
-                w->mandatory |= bit;
-                w->vote      |= bit;
-
-            } else {
-                w->mandatory |= bit;
+                w->vote |= bit;
             }
         }
     }

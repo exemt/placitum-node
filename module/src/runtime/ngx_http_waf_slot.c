@@ -15,7 +15,6 @@ typedef struct {
 
     ngx_uint_t             nslots;
     ngx_uint_t             free_head;
-    ngx_uint_t             used;
 
     uint64_t               seq;
 } ngx_http_waf_slot_table_t;
@@ -61,7 +60,6 @@ ngx_http_waf_slot_table_init(ngx_cycle_t *cycle, ngx_uint_t nslots)
 
     t->nslots      = nslots;
     t->free_head   = 0;
-    t->used        = 0;
 
     t->seq = (((uint64_t) ngx_random() << 32) ^ (uint64_t) ngx_pid)
              & NGX_HTTP_WAF_SLOT_GEN_MASK;
@@ -97,6 +95,10 @@ ngx_http_waf_slot_acquire(ngx_http_waf_ctx_t *ctx)
     ngx_http_waf_slot_table_t  *t = &ngx_http_waf_slots;
 
     if (t->free_head == NGX_HTTP_WAF_SLOT_NIL) {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "waf: all %ui wait slots are busy (waf_max_inflight), "
+                      "ray %*s", t->nslots,
+                      (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
         return NULL;
     }
 
@@ -104,7 +106,6 @@ ngx_http_waf_slot_acquire(ngx_http_waf_ctx_t *ctx)
     slot  = &t->slots[index];
 
     t->free_head = slot->next_free;
-    t->used++;
 
     slot->next_free = NGX_HTTP_WAF_SLOT_NIL;
     slot->gen       = ngx_http_waf_next_gen(t);
@@ -129,27 +130,6 @@ ngx_http_waf_slot_acquire(ngx_http_waf_ctx_t *ctx)
     cln->data    = ctx;
 
     return slot;
-}
-
-
-ngx_int_t
-ngx_http_waf_rid_assign(ngx_http_waf_ctx_t *ctx)
-{
-    ngx_http_waf_slot_t  *slot;
-
-    if (ctx->slot != NGX_HTTP_WAF_SLOT_NIL) {
-        return NGX_OK;
-    }
-
-    slot = ngx_http_waf_slot_acquire(ctx);
-
-    if (slot == NULL) {
-        return NGX_ERROR;
-    }
-
-    ngx_http_waf_slot_release(slot);
-
-    return NGX_OK;
 }
 
 
@@ -203,7 +183,6 @@ ngx_http_waf_slot_release(ngx_http_waf_slot_t *slot)
     slot->next_free = t->free_head;
 
     t->free_head = index;
-    t->used--;
 }
 
 
