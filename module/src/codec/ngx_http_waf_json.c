@@ -1,7 +1,12 @@
 #include "codec/ngx_http_waf_codec.h"
 
 
+static ngx_int_t ngx_http_waf_jp_unit(ngx_http_waf_jp_t *jp, u_char *unit,
+    size_t *n);
 static ngx_int_t ngx_http_waf_jp_hex4(ngx_http_waf_jp_t *jp, uint32_t *out);
+static ngx_int_t ngx_http_waf_jp_string_skip(ngx_http_waf_jp_t *jp);
+static ngx_int_t ngx_http_waf_jp_key_skip(ngx_http_waf_jp_t *jp);
+static ngx_int_t ngx_http_waf_jp_number_skip(ngx_http_waf_jp_t *jp);
 
 
 static ngx_inline u_char *
@@ -30,6 +35,71 @@ ngx_http_waf_utf8_encode(u_char *p, uint32_t u)
 }
 
 
+/*
+ * Length of the well-formed UTF-8 sequence at p, or 0 with *bad set to the
+ * length of its ill-formed prefix, the part one U+FFFD stands for.
+ */
+
+static size_t
+ngx_http_waf_utf8_valid(const u_char *p, size_t n, size_t *bad)
+{
+    u_char  c, lo, hi;
+    size_t  i, need;
+
+    c = p[0];
+
+    if (c < 0x80) {
+        return 1;
+    }
+
+    lo = 0x80;
+    hi = 0xbf;
+
+    if (c >= 0xc2 && c <= 0xdf) {
+        need = 1;
+
+    } else if (c == 0xe0) {
+        need = 2;
+        lo = 0xa0;
+
+    } else if (c >= 0xe1 && c <= 0xef) {
+        need = 2;
+
+        if (c == 0xed) {
+            hi = 0x9f;
+        }
+
+    } else if (c == 0xf0) {
+        need = 3;
+        lo = 0x90;
+
+    } else if (c >= 0xf1 && c <= 0xf3) {
+        need = 3;
+
+    } else if (c == 0xf4) {
+        need = 3;
+        hi = 0x8f;
+
+    } else {
+        *bad = 1;
+        return 0;
+    }
+
+    for (i = 1; i <= need; i++) {
+
+        if (i == n || p[i] < lo || p[i] > hi) {
+            *bad = i;
+            return 0;
+        }
+
+        lo = 0x80;
+        hi = 0xbf;
+    }
+
+    return need + 1;
+}
+
+
 void
 ngx_http_waf_jw_init(ngx_http_waf_jw_t *jw, u_char *buf, size_t size)
 {
@@ -55,14 +125,33 @@ ngx_http_waf_jw_raw(ngx_http_waf_jw_t *jw, const u_char *data, size_t len)
 void
 ngx_http_waf_jw_string(ngx_http_waf_jw_t *jw, const u_char *data, size_t len)
 {
-    u_char           c;
-    size_t           i;
+    u_char               c;
+    size_t               i, n, bad;
     static const u_char  hex[] = "0123456789abcdef";
 
     ngx_http_waf_jw_raw(jw, (const u_char *) "\"", 1);
 
-    for (i = 0; i < len; i++) {
+    i = 0;
+
+    while (i < len) {
         c = data[i];
+
+        if (c >= 0x80) {
+            n = ngx_http_waf_utf8_valid(&data[i], len - i, &bad);
+
+            if (n != 0) {
+                ngx_http_waf_jw_raw(jw, &data[i], n);
+                i += n;
+
+            } else {
+                ngx_http_waf_jw_raw(jw, (const u_char *) "\xef\xbf\xbd", 3);
+                i += bad;
+            }
+
+            continue;
+        }
+
+        i++;
 
         if (c == '"' || c == '\\') {
             if (jw->end - jw->pos < 2) {
@@ -130,6 +219,7 @@ ngx_http_waf_jp_init(ngx_http_waf_jp_t *jp, ngx_str_t *payload,
     jp->end   = payload->data + payload->len;
     jp->pool  = pool;
     jp->error = NULL;
+    jp->first = 0;
 }
 
 
@@ -161,6 +251,7 @@ ngx_http_waf_jp_open(ngx_http_waf_jp_t *jp, u_char open)
     }
 
     jp->pos++;
+    jp->first = 1;
 
     return NGX_OK;
 }
@@ -192,17 +283,26 @@ ngx_http_waf_jp_next(ngx_http_waf_jp_t *jp, u_char close)
 
     if (*jp->pos == close) {
         jp->pos++;
+        jp->first = 0;
         return NGX_DONE;
     }
 
-    if (*jp->pos == ',') {
-        jp->pos++;
-        ngx_http_waf_jp_ws(jp);
+    if (jp->first) {
+        jp->first = 0;
+        return NGX_OK;
+    }
 
-        if (jp->pos < jp->end && *jp->pos == close) {
-            jp->error = "trailing comma";
-            return NGX_ERROR;
-        }
+    if (*jp->pos != ',') {
+        jp->error = "expected comma";
+        return NGX_ERROR;
+    }
+
+    jp->pos++;
+    ngx_http_waf_jp_ws(jp);
+
+    if (jp->pos < jp->end && *jp->pos == close) {
+        jp->error = "trailing comma";
+        return NGX_ERROR;
     }
 
     return NGX_OK;
@@ -254,9 +354,24 @@ ngx_http_waf_jp_element(ngx_http_waf_jp_t *jp)
 
 
 ngx_int_t
+ngx_http_waf_jp_end(ngx_http_waf_jp_t *jp)
+{
+    ngx_http_waf_jp_ws(jp);
+
+    if (jp->pos != jp->end) {
+        jp->error = "trailing data after the document";
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
 ngx_http_waf_jp_string(ngx_http_waf_jp_t *jp, ngx_str_t *out)
 {
-    u_char  *dst;
+    u_char  *p, *dst;
+    size_t   size;
 
     ngx_http_waf_jp_ws(jp);
 
@@ -265,38 +380,43 @@ ngx_http_waf_jp_string(ngx_http_waf_jp_t *jp, ngx_str_t *out)
         return NGX_ERROR;
     }
 
-    dst = ngx_pnalloc(jp->pool, (size_t) (jp->end - jp->pos));
+    for (p = jp->pos + 1; p < jp->end; p++) {
+
+        if (*p == '"') {
+            break;
+        }
+
+        if (*p == '\\' && ++p == jp->end) {
+            break;
+        }
+    }
+
+    if (p == jp->end) {
+        jp->error = "unterminated string";
+        return NGX_ERROR;
+    }
+
+    /* no escape decodes to more bytes than it takes on the wire */
+
+    size = (size_t) (p - jp->pos - 1);
+
+    dst = ngx_pnalloc(jp->pool, size);
     if (dst == NULL) {
         jp->error = "no memory";
         return NGX_ERROR;
     }
 
-    return ngx_http_waf_jp_string_buf(jp, dst,
-                                      (size_t) (jp->end - jp->pos), out);
+    return ngx_http_waf_jp_string_buf(jp, dst, size, out);
 }
 
 
 static ngx_int_t
 ngx_http_waf_jp_string_skip(ngx_http_waf_jp_t *jp)
 {
-    while (jp->pos < jp->end) {
+    ngx_str_t  dummy;
 
-        if (*jp->pos == '\\') {
-            jp->pos += 2;
-            continue;
-        }
-
-        if (*jp->pos == '"') {
-            jp->pos++;
-            return NGX_OK;
-        }
-
-        jp->pos++;
-    }
-
-    jp->error = "unterminated string";
-
-    return NGX_ERROR;
+    return ngx_http_waf_jp_string_buf(jp, NULL, 0, &dummy) == NGX_ERROR
+               ? NGX_ERROR : NGX_OK;
 }
 
 
@@ -304,8 +424,9 @@ ngx_int_t
 ngx_http_waf_jp_string_buf(ngx_http_waf_jp_t *jp, u_char *buf, size_t size,
     ngx_str_t *out)
 {
-    u_char    *dst, *last, *p;
-    uint32_t   cp, low;
+    u_char      unit[4];
+    size_t      n, room;
+    ngx_uint_t  full;
 
     ngx_http_waf_jp_ws(jp);
 
@@ -316,76 +437,115 @@ ngx_http_waf_jp_string_buf(ngx_http_waf_jp_t *jp, u_char *buf, size_t size,
 
     jp->pos++;
 
-    dst  = buf;
-    last = buf + size;
-    p    = dst;
+    room = size;
+    full = 0;
 
-    while (jp->pos < jp->end) {
+    for ( ;; ) {
+
+        if (jp->pos == jp->end) {
+            jp->error = "unterminated string";
+            return NGX_ERROR;
+        }
 
         if (*jp->pos == '"') {
             jp->pos++;
-
-            out->data = dst;
-            out->len  = (size_t) (p - dst);
-
-            return NGX_OK;
-        }
-
-        if (*jp->pos < 0x20) {
-            jp->error = "control character in string";
-            return NGX_ERROR;
-        }
-
-        if (*jp->pos != '\\') {
-
-            if (p == last) {
-                ngx_str_null(out);
-
-                return ngx_http_waf_jp_string_skip(jp) == NGX_OK
-                           ? NGX_DECLINED : NGX_ERROR;
-            }
-
-            *p++ = *jp->pos++;
-            continue;
-        }
-
-        if ((size_t) (last - p) < 4) {
-            ngx_str_null(out);
-
-            return ngx_http_waf_jp_string_skip(jp) == NGX_OK
-                       ? NGX_DECLINED : NGX_ERROR;
-        }
-
-        jp->pos++;
-
-        if (jp->pos == jp->end) {
             break;
         }
 
-        switch (*jp->pos) {
-        case '"':  *p++ = '"';  jp->pos++; continue;
-        case '\\': *p++ = '\\'; jp->pos++; continue;
-        case '/':  *p++ = '/';  jp->pos++; continue;
-        case 'b':  *p++ = '\b'; jp->pos++; continue;
-        case 'f':  *p++ = '\f'; jp->pos++; continue;
-        case 'n':  *p++ = '\n'; jp->pos++; continue;
-        case 'r':  *p++ = '\r'; jp->pos++; continue;
-        case 't':  *p++ = '\t'; jp->pos++; continue;
-        case 'u':  break;
-        default:
-            jp->error = "unknown escape sequence";
+        if (ngx_http_waf_jp_unit(jp, unit, &n) != NGX_OK) {
             return NGX_ERROR;
         }
 
-        jp->pos++;
+        if (full || room < n) {
+            full = 1;
+            continue;
+        }
 
-        if (ngx_http_waf_jp_hex4(jp, &cp) != NGX_OK) {
+        ngx_memcpy(buf + (size - room), unit, n);
+        room -= n;
+    }
+
+    if (full) {
+        ngx_str_null(out);
+        return NGX_DECLINED;
+    }
+
+    out->data = buf;
+    out->len  = size - room;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_waf_jp_unit(ngx_http_waf_jp_t *jp, u_char *unit, size_t *n)
+{
+    u_char    c, *save;
+    size_t    bad;
+    uint32_t  cp, low;
+
+    c = *jp->pos;
+
+    if (c < 0x20) {
+        jp->error = "control character in string";
+        return NGX_ERROR;
+    }
+
+    if (c >= 0x80) {
+        *n = ngx_http_waf_utf8_valid(jp->pos, (size_t) (jp->end - jp->pos),
+                                     &bad);
+        if (*n == 0) {
+            jp->error = "invalid UTF-8 in string";
             return NGX_ERROR;
         }
 
-        if (cp >= 0xd800 && cp <= 0xdbff
-            && jp->end - jp->pos >= 6
-            && jp->pos[0] == '\\' && jp->pos[1] == 'u')
+        ngx_memcpy(unit, jp->pos, *n);
+        jp->pos += *n;
+
+        return NGX_OK;
+    }
+
+    jp->pos++;
+    *n = 1;
+
+    if (c != '\\') {
+        unit[0] = c;
+        return NGX_OK;
+    }
+
+    if (jp->pos == jp->end) {
+        jp->error = "unterminated string";
+        return NGX_ERROR;
+    }
+
+    c = *jp->pos++;
+
+    switch (c) {
+    case '"':  unit[0] = '"';  return NGX_OK;
+    case '\\': unit[0] = '\\'; return NGX_OK;
+    case '/':  unit[0] = '/';  return NGX_OK;
+    case 'b':  unit[0] = '\b'; return NGX_OK;
+    case 'f':  unit[0] = '\f'; return NGX_OK;
+    case 'n':  unit[0] = '\n'; return NGX_OK;
+    case 'r':  unit[0] = '\r'; return NGX_OK;
+    case 't':  unit[0] = '\t'; return NGX_OK;
+    case 'u':  break;
+    default:
+        jp->error = "unknown escape sequence";
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_waf_jp_hex4(jp, &cp) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (cp >= 0xdc00 && cp <= 0xdfff) {
+        cp = 0xfffd;
+
+    } else if (cp >= 0xd800 && cp <= 0xdbff) {
+        save = jp->pos;
+
+        if (jp->end - jp->pos >= 6 && jp->pos[0] == '\\' && jp->pos[1] == 'u')
         {
             jp->pos += 2;
 
@@ -397,17 +557,18 @@ ngx_http_waf_jp_string_buf(ngx_http_waf_jp_t *jp, u_char *buf, size_t size,
                 cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
 
             } else {
-                p = ngx_http_waf_utf8_encode(p, cp);
-                cp = low;
+                jp->pos = save;
+                cp = 0xfffd;
             }
-        }
 
-        p = ngx_http_waf_utf8_encode(p, cp);
+        } else {
+            cp = 0xfffd;
+        }
     }
 
-    jp->error = "unterminated string";
+    *n = (size_t) (ngx_http_waf_utf8_encode(unit, cp) - unit);
 
-    return NGX_ERROR;
+    return NGX_OK;
 }
 
 
@@ -453,7 +614,7 @@ ngx_int_t
 ngx_http_waf_jp_int(ngx_http_waf_jp_t *jp, ngx_int_t *out)
 {
     u_char     c;
-    uint64_t   v;
+    uint64_t   v, d;
     ngx_uint_t digits, negative;
 
     ngx_http_waf_jp_ws(jp);
@@ -475,12 +636,19 @@ ngx_http_waf_jp_int(ngx_http_waf_jp_t *jp, ngx_int_t *out)
             break;
         }
 
-        if (v > (uint64_t) NGX_MAX_INT_T_VALUE / 10) {
+        if (digits == 1 && v == 0) {
+            jp->error = "leading zero in number";
+            return NGX_ERROR;
+        }
+
+        d = (uint64_t) (c - '0');
+
+        if (v > ((uint64_t) NGX_MAX_INT_T_VALUE - d) / 10) {
             jp->error = "number out of range";
             return NGX_ERROR;
         }
 
-        v = v * 10 + (uint64_t) (c - '0');
+        v = v * 10 + d;
         digits++;
         jp->pos++;
     }
@@ -548,12 +716,88 @@ ngx_http_waf_jp_null(ngx_http_waf_jp_t *jp)
 }
 
 
+static ngx_int_t
+ngx_http_waf_jp_key_skip(ngx_http_waf_jp_t *jp)
+{
+    if (ngx_http_waf_jp_string_skip(jp) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    ngx_http_waf_jp_ws(jp);
+
+    if (jp->pos == jp->end || *jp->pos != ':') {
+        jp->error = "expected colon after member name";
+        return NGX_ERROR;
+    }
+
+    jp->pos++;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_waf_jp_digits(ngx_http_waf_jp_t *jp)
+{
+    u_char  *start;
+
+    start = jp->pos;
+
+    while (jp->pos < jp->end && *jp->pos >= '0' && *jp->pos <= '9') {
+        jp->pos++;
+    }
+
+    if (jp->pos == start) {
+        jp->error = "invalid number";
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_waf_jp_number_skip(ngx_http_waf_jp_t *jp)
+{
+    if (jp->pos < jp->end && *jp->pos == '-') {
+        jp->pos++;
+    }
+
+    if (jp->pos < jp->end && *jp->pos == '0') {
+        jp->pos++;
+
+    } else if (ngx_http_waf_jp_digits(jp) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (jp->pos < jp->end && *jp->pos == '.') {
+        jp->pos++;
+
+        if (ngx_http_waf_jp_digits(jp) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    if (jp->pos < jp->end && (*jp->pos == 'e' || *jp->pos == 'E')) {
+        jp->pos++;
+
+        if (jp->pos < jp->end && (*jp->pos == '+' || *jp->pos == '-')) {
+            jp->pos++;
+        }
+
+        if (ngx_http_waf_jp_digits(jp) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
 ngx_int_t
 ngx_http_waf_jp_skip(ngx_http_waf_jp_t *jp)
 {
-    u_char      c;
-    ngx_str_t   dummy;
-    ngx_int_t   n;
+    u_char      c, stack[NGX_HTTP_WAF_JSON_MAX_DEPTH];
     ngx_uint_t  b, depth;
 
     depth = 0;
@@ -572,34 +816,33 @@ ngx_http_waf_jp_skip(ngx_http_waf_jp_t *jp)
 
         case '{':
         case '[':
-            if (++depth > NGX_HTTP_WAF_JSON_MAX_DEPTH) {
+            if (depth == NGX_HTTP_WAF_JSON_MAX_DEPTH) {
                 jp->error = "message nested too deeply";
                 return NGX_ERROR;
             }
 
-            jp->pos++;
-            continue;
+            stack[depth++] = (u_char) (c == '{' ? '}' : ']');
 
-        case '}':
-        case ']':
-            if (depth == 0) {
-                jp->error = "unbalanced brackets";
+            jp->pos++;
+            ngx_http_waf_jp_ws(jp);
+
+            if (jp->pos < jp->end && *jp->pos == stack[depth - 1]) {
+                jp->pos++;
+                depth--;
+                break;
+            }
+
+            if (c == '{' && ngx_http_waf_jp_key_skip(jp) != NGX_OK) {
                 return NGX_ERROR;
             }
 
-            jp->pos++;
-            depth--;
-            break;
-
-        case ',':
-        case ':':
-            jp->pos++;
             continue;
 
         case '"':
-            if (ngx_http_waf_jp_string(jp, &dummy) != NGX_OK) {
+            if (ngx_http_waf_jp_string_skip(jp) != NGX_OK) {
                 return NGX_ERROR;
             }
+
             break;
 
         case 't':
@@ -607,6 +850,7 @@ ngx_http_waf_jp_skip(ngx_http_waf_jp_t *jp)
             if (ngx_http_waf_jp_bool(jp, &b) != NGX_OK) {
                 return NGX_ERROR;
             }
+
             break;
 
         case 'n':
@@ -614,6 +858,7 @@ ngx_http_waf_jp_skip(ngx_http_waf_jp_t *jp)
                 jp->error = "unexpected value";
                 return NGX_ERROR;
             }
+
             break;
 
         default:
@@ -622,30 +867,44 @@ ngx_http_waf_jp_skip(ngx_http_waf_jp_t *jp)
                 return NGX_ERROR;
             }
 
-            n = 0;
-
-            while (jp->pos < jp->end) {
-                c = *jp->pos;
-
-                if ((c >= '0' && c <= '9') || c == '-' || c == '+'
-                    || c == '.' || c == 'e' || c == 'E')
-                {
-                    jp->pos++;
-                    n++;
-                    continue;
-                }
-
-                break;
-            }
-
-            if (n == 0) {
-                jp->error = "unexpected character";
+            if (ngx_http_waf_jp_number_skip(jp) != NGX_OK) {
                 return NGX_ERROR;
             }
         }
 
-        if (depth == 0) {
-            return NGX_OK;
+        for ( ;; ) {
+
+            if (depth == 0) {
+                return NGX_OK;
+            }
+
+            ngx_http_waf_jp_ws(jp);
+
+            if (jp->pos == jp->end) {
+                jp->error = "truncated value";
+                return NGX_ERROR;
+            }
+
+            if (*jp->pos == stack[depth - 1]) {
+                jp->pos++;
+                depth--;
+                continue;
+            }
+
+            if (*jp->pos != ',') {
+                jp->error = "expected comma";
+                return NGX_ERROR;
+            }
+
+            jp->pos++;
+
+            if (stack[depth - 1] == '}'
+                && ngx_http_waf_jp_key_skip(jp) != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            break;
         }
     }
 }

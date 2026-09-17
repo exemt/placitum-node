@@ -236,10 +236,9 @@ ngx_http_waf_msg_resume(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
 static void
 ngx_http_waf_msg_response(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
 {
-    ngx_uint_t           i, first;
-    ngx_list_part_t     *part;
-    ngx_table_elt_t     *h;
-    ngx_http_request_t  *r = ctx->request;
+    ngx_uint_t     i, first;
+    ngx_array_t   *headers;
+    ngx_keyval_t  *h;
 
     if (ctx->phase != NGX_HTTP_WAF_PHASE_RESPONSE) {
         return;
@@ -262,28 +261,14 @@ ngx_http_waf_msg_response(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
 
     ngx_http_waf_jw_lit(jw, ",\"headers\":[");
 
-    part  = &r->headers_out.headers.part;
-    h     = part->elts;
-    first = 1;
+    headers = ngx_http_waf_response_headers(ctx);
+    first   = 1;
 
-    for (i = 0; ; i++) {
+    for (i = 0; headers != NULL && i < headers->nelts; i++) {
+        h = &((ngx_keyval_t *) headers->elts)[i];
 
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-
-            part = part->next;
-            h    = part->elts;
-            i    = 0;
-        }
-
-        if (h[i].hash == 0) {
-            continue;
-        }
-
-        if (h[i].key.len == 10
-            && ngx_strncasecmp(h[i].key.data, (u_char *) "Set-Cookie", 10) == 0)
+        if (h->key.len == 10
+            && ngx_strncasecmp(h->key.data, (u_char *) "Set-Cookie", 10) == 0)
         {
             continue;
         }
@@ -296,9 +281,9 @@ ngx_http_waf_msg_response(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
             ngx_http_waf_jw_lit(jw, ",[");
         }
 
-        ngx_http_waf_jw_str(jw, &h[i].key);
+        ngx_http_waf_jw_str(jw, &h->key);
         ngx_http_waf_jw_lit(jw, ",");
-        ngx_http_waf_jw_str(jw, &h[i].value);
+        ngx_http_waf_jw_str(jw, &h->value);
         ngx_http_waf_jw_lit(jw, "]");
     }
 
@@ -309,11 +294,10 @@ ngx_http_waf_msg_response(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
 static size_t
 ngx_http_waf_msg_response_size(ngx_http_waf_ctx_t *ctx)
 {
-    size_t               size;
-    ngx_uint_t           i;
-    ngx_list_part_t     *part;
-    ngx_table_elt_t     *h;
-    ngx_http_request_t  *r = ctx->request;
+    size_t         size;
+    ngx_uint_t     i;
+    ngx_array_t   *headers;
+    ngx_keyval_t  *h;
 
     if (ctx->phase != NGX_HTTP_WAF_PHASE_RESPONSE) {
         return 0;
@@ -322,23 +306,13 @@ ngx_http_waf_msg_response_size(ngx_http_waf_ctx_t *ctx)
     size = sizeof(",\"response\":{\"status\":,\"upstream_ms\":,\"headers\":[]}")
            + 2 * NGX_INT_T_LEN;
 
-    part = &r->headers_out.headers.part;
-    h    = part->elts;
+    headers = ngx_http_waf_response_headers(ctx);
 
-    for (i = 0; ; i++) {
+    for (i = 0; headers != NULL && i < headers->nelts; i++) {
+        h = &((ngx_keyval_t *) headers->elts)[i];
 
-        if (i >= part->nelts) {
-            if (part->next == NULL) {
-                break;
-            }
-
-            part = part->next;
-            h    = part->elts;
-            i    = 0;
-        }
-
-        size += ngx_http_waf_msg_room(h[i].key.len)
-                + ngx_http_waf_msg_room(h[i].value.len)
+        size += ngx_http_waf_msg_room(h->key.len)
+                + ngx_http_waf_msg_room(h->value.len)
                 + sizeof(",[,]");
     }
 
@@ -350,16 +324,14 @@ char *
 ngx_http_waf_msg_req_validate(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
     ngx_http_waf_loc_conf_t *wlcf)
 {
-    size_t                     size, client, name, profile;
-    ngx_uint_t                 i;
+    size_t                     base, size, client, name, profile, audit;
+    ngx_uint_t                 i, phase;
     ngx_http_waf_var_t        *var;
     ngx_http_core_srv_conf_t  *cscf;
     ngx_http_core_loc_conf_t  *clcf;
     ngx_http_waf_inspector_t  *insp;
 
-    if (!wlcf->enable || wlcf->waves[NGX_HTTP_WAF_PHASE_REQUEST] == NULL
-        || wlcf->waves[NGX_HTTP_WAF_PHASE_REQUEST]->nelts == 0)
-    {
+    if (!wlcf->enable) {
         return NGX_CONF_OK;
     }
 
@@ -370,6 +342,7 @@ ngx_http_waf_msg_req_validate(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
 
     name    = 0;
     profile = 0;
+    audit   = 0;
     insp    = wmcf->inspectors.elts;
 
     for (i = 0; i < wmcf->inspectors.nelts; i++) {
@@ -377,51 +350,93 @@ ngx_http_waf_msg_req_validate(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
             name = insp[i].name.len;
         }
 
+        if (insp[i].audit_subject.len > audit) {
+            audit = insp[i].audit_subject.len;
+        }
+
         if (wlcf->profiles[i].len > profile) {
             profile = wlcf->profiles[i].len;
         }
     }
 
-    size = NGX_HTTP_WAF_MSG_OVERHEAD
+    base = NGX_HTTP_WAF_MSG_OVERHEAD
            + ngx_http_waf_msg_room(name)
            + ngx_http_waf_msg_room(wmcf->node_id.len)
            + ngx_http_waf_msg_room(cscf->server_name.len)
            + ngx_http_waf_msg_room(clcf->name.len)
            + ngx_http_waf_msg_room(profile)
+           + ngx_http_waf_msg_room(audit)
            + ngx_http_waf_msg_prior_size(wmcf, wlcf)
+           + ngx_http_waf_needs_size()
            + ngx_http_waf_store_max_size(wmcf, client)
            + sizeof(",\"sessions\":[]")
-           + NGX_HTTP_WAF_SESSIONS_MAX * NGX_HTTP_WAF_SESSION_JSON;
+           + NGX_HTTP_WAF_SESSIONS_MAX * NGX_HTTP_WAF_SESSION_JSON
+           + sizeof(",\"resume\":{\"want\":true,\"require\":false,"
+                    "\"token\":\"\"}")
+           + NGX_HTTP_WAF_RAY_HEX_LEN;
 
-    size += 2 * ngx_http_waf_msg_room(client);
-
-    if (wlcf->waves[NGX_HTTP_WAF_PHASE_FRAME_C2S] != NULL
-        && wlcf->waves[NGX_HTTP_WAF_PHASE_FRAME_C2S]->nelts != 0)
-    {
-        size += 256 + NGX_HTTP_WAF_RAY_HEX_LEN + ngx_http_waf_msg_room(client);
-    }
+    base += 2 * ngx_http_waf_msg_room(client);
 
     if (wmcf->vars != NULL) {
         var = wmcf->vars->elts;
 
         for (i = 0; i < wmcf->vars->nelts; i++) {
-            size += ngx_http_waf_msg_room(var[i].name.len)
+            base += ngx_http_waf_msg_room(var[i].name.len)
                     + ngx_http_waf_msg_room(NGX_HTTP_WAF_VAR_MAX) + 2;
         }
     }
 
-    if (size <= wmcf->bus_payload_max) {
-        return NGX_CONF_OK;
+    for (phase = 0; phase < NGX_HTTP_WAF_NPHASE; phase++) {
+
+        if (!ngx_http_waf_phase_inspected(wlcf, phase)) {
+            continue;
+        }
+
+        size = base;
+
+        if (phase != NGX_HTTP_WAF_PHASE_REQUEST) {
+            size += ngx_http_waf_store_max_size(wmcf, client);
+        }
+
+        /*
+         * Response headers that are not captured travel inline; nginx gives
+         * the module no bound for them, so the client header buffer does.
+         */
+
+        if (phase == NGX_HTTP_WAF_PHASE_RESPONSE) {
+            size += sizeof(",\"response\":{\"status\":,\"upstream_ms\":,"
+                           "\"headers\":[]}")
+                    + 2 * NGX_INT_T_LEN;
+
+            if (!(wlcf->shoot[phase].capture
+                  & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_HEADERS)))
+            {
+                size += 6 * client;
+            }
+        }
+
+        if (ngx_http_waf_phase_is_frame(phase)) {
+            size += 256 + NGX_HTTP_WAF_RAY_HEX_LEN
+                    + ngx_http_waf_msg_room(client);
+        }
+
+        if (size <= wmcf->bus_payload_max) {
+            continue;
+        }
+
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: an inspect message of the %V phase on this "
+                           "route may reach %uz bytes, which does not fit the "
+                           "%uz byte bus payload limit; lower "
+                           "large_client_header_buffers (%uz) or raise "
+                           "payload_max= in waf_bus",
+                           ngx_http_waf_phase_name(phase), size,
+                           wmcf->bus_payload_max, client);
+
+        return NGX_CONF_ERROR;
     }
 
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "waf: an inspect message on this route may reach %uz "
-                       "bytes, which does not fit the %uz byte bus payload "
-                       "limit; lower large_client_header_buffers (%uz) or "
-                       "raise payload_max= in waf_bus",
-                       size, wmcf->bus_payload_max, client);
-
-    return NGX_CONF_ERROR;
+    return NGX_CONF_OK;
 }
 
 
@@ -915,25 +930,32 @@ ngx_http_waf_msg_sessions(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
 static void
 ngx_http_waf_msg_groups(ngx_http_waf_jw_t *jw, ngx_str_t *groups)
 {
-    u_char  *p, *end, *mark;
+    u_char      *p, *end, *mark;
+    ngx_uint_t   first;
 
-    p   = groups->data;
-    end = groups->data + groups->len;
+    p     = groups->data;
+    end   = groups->data + groups->len;
+    first = 1;
 
     ngx_http_waf_jw_lit(jw, "[");
 
-    for (mark = p; p <= end; p++) {
+    for (mark = p; /* void */; p++) {
 
         if (p != end && *p != ',') {
             continue;
         }
 
         if (p != mark) {
-            if (mark != groups->data) {
+            if (!first) {
                 ngx_http_waf_jw_lit(jw, ",");
             }
 
             ngx_http_waf_jw_string(jw, mark, (size_t) (p - mark));
+            first = 0;
+        }
+
+        if (p == end) {
+            break;
         }
 
         mark = p + 1;

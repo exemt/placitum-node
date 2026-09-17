@@ -42,6 +42,7 @@ typedef struct {
     u_char      *end;
     ngx_pool_t  *pool;
     const char  *error;
+    unsigned     first:1;
 } ngx_http_waf_jp_t;
 
 
@@ -54,6 +55,8 @@ ngx_int_t  ngx_http_waf_jp_array(ngx_http_waf_jp_t *jp);
 ngx_int_t  ngx_http_waf_jp_member(ngx_http_waf_jp_t *jp, ngx_str_t *key);
 
 ngx_int_t  ngx_http_waf_jp_element(ngx_http_waf_jp_t *jp);
+
+ngx_int_t  ngx_http_waf_jp_end(ngx_http_waf_jp_t *jp);
 
 ngx_int_t  ngx_http_waf_jp_string(ngx_http_waf_jp_t *jp, ngx_str_t *out);
 

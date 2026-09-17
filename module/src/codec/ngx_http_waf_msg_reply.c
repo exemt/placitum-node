@@ -16,10 +16,18 @@ typedef struct {
 } ngx_http_waf_url_t;
 
 
+#define NGX_HTTP_WAF_SHOWN_MAX  64
+#define NGX_HTTP_WAF_SHOWN_LEN  (NGX_HTTP_WAF_SHOWN_MAX * 4 + 3)
+
+
 static ngx_int_t ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp,
-    ngx_http_waf_ctx_t *ctx, ngx_uint_t index);
+    ngx_str_t *subject, ngx_int_t *ttl);
+static ngx_int_t ngx_http_waf_reply_resume(ngx_http_waf_ctx_t *ctx,
+    ngx_uint_t index, ngx_str_t *subject, ngx_int_t ttl);
 static ngx_int_t ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp,
-    ngx_http_waf_reply_t *reply);
+    ngx_http_waf_ctx_t *ctx, ngx_uint_t index, ngx_http_waf_reply_t *reply);
+static ngx_int_t ngx_http_waf_reply_optional(ngx_http_waf_jp_t *jp,
+    ngx_http_waf_ctx_t *ctx, ngx_uint_t index, const char *field);
 static ngx_int_t ngx_http_waf_reply_response(ngx_http_waf_jp_t *jp,
     ngx_http_waf_reply_t *reply);
 static ngx_int_t ngx_http_waf_reply_redirect(ngx_http_waf_jp_t *jp,
@@ -39,7 +47,6 @@ static ngx_int_t ngx_http_waf_reply_actions(ngx_http_waf_jp_t *jp,
 static ngx_uint_t ngx_http_waf_group_clean(ngx_str_t *s);
 static ngx_uint_t ngx_http_waf_rewrite_key_clean(ngx_http_waf_ctx_t *ctx,
     ngx_uint_t obj, ngx_str_t *key);
-static ngx_uint_t ngx_http_waf_content_type_clean(ngx_str_t *s);
 static ngx_uint_t ngx_http_waf_code_clean(ngx_str_t *s);
 static ngx_uint_t ngx_http_waf_counter_clean(ngx_str_t *s);
 static ngx_uint_t ngx_http_waf_marker_clean(ngx_str_t *s);
@@ -49,6 +56,9 @@ static ngx_int_t ngx_http_waf_reply_cookies(ngx_http_waf_jp_t *jp,
 static ngx_int_t ngx_http_waf_reply_sessions(ngx_http_waf_jp_t *jp,
     ngx_http_waf_ctx_t *ctx, ngx_uint_t index, ngx_http_waf_reply_t *reply);
 static ngx_uint_t ngx_http_waf_text_clean(ngx_str_t *s, size_t max);
+static ngx_uint_t ngx_http_waf_cookie_value_clean(ngx_str_t *s);
+static ngx_uint_t ngx_http_waf_cookie_path_clean(ngx_str_t *s);
+static size_t ngx_http_waf_shown(u_char *buf, ngx_str_t *s);
 
 static ngx_uint_t ngx_http_waf_header_forbidden(ngx_str_t *name);
 static ngx_uint_t ngx_http_waf_token_clean(ngx_str_t *s);
@@ -153,8 +163,8 @@ ngx_int_t
 ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
     ngx_str_t *payload, ngx_http_waf_reply_t *reply, ngx_str_t *err)
 {
-    ngx_str_t                  key, value;
-    ngx_int_t                  rc, n;
+    ngx_str_t                  key, value, cont;
+    ngx_int_t                  rc, n, cont_ttl;
     ngx_uint_t                 verdict, version;
     ngx_http_waf_jp_t          jp;
     ngx_http_waf_loc_conf_t   *wlcf;
@@ -162,6 +172,11 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
     ngx_http_waf_main_conf_t  *wmcf;
 
     wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
+
+    if (index >= wmcf->inspectors.nelts) {
+        ngx_http_waf_reply_reject(err, "reply names no declared inspector");
+    }
+
     insp = &((ngx_http_waf_inspector_t *) wmcf->inspectors.elts)[index];
 
     if (payload->len > wmcf->reply_max) {
@@ -175,6 +190,9 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
 
     version = 0;
     verdict = NGX_CONF_UNSET_UINT;
+
+    ngx_str_null(&cont);
+    cont_ttl = 0;
 
     ngx_http_waf_jp_init(&jp, payload, ctx->request->pool);
 
@@ -261,7 +279,7 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
         }
 
         if (key.len == 6 && ngx_strncmp(key.data, "reason", 6) == 0) {
-            if (ngx_http_waf_reply_reason(&jp, reply) != NGX_OK) {
+            if (ngx_http_waf_reply_reason(&jp, ctx, index, reply) != NGX_OK) {
                 ngx_http_waf_reply_reject(err, "malformed reason");
             }
 
@@ -309,7 +327,7 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
         }
 
         if (key.len == 8 && ngx_strncmp(key.data, "continue", 8) == 0) {
-            if (ngx_http_waf_reply_continue(&jp, ctx, index) != NGX_OK) {
+            if (ngx_http_waf_reply_continue(&jp, &cont, &cont_ttl) != NGX_OK) {
                 ngx_http_waf_reply_reject(err, "malformed continue section");
             }
 
@@ -362,6 +380,10 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
         }
     }
 
+    if (ngx_http_waf_jp_end(&jp) != NGX_OK) {
+        ngx_http_waf_reply_reject(err, "trailing data after the reply object");
+    }
+
     if (version == 0) {
         ngx_http_waf_reply_reject(err, "field v is missing");
     }
@@ -372,6 +394,17 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
 
     if (verdict == NGX_CONF_UNSET_UINT) {
         ngx_http_waf_reply_reject(err, "field verdict is missing");
+    }
+
+    if (verdict == NGX_HTTP_WAF_V_REDIRECT
+        && ctx->phase != NGX_HTTP_WAF_PHASE_REQUEST)
+    {
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "waf: inspector \"%V\" redirects on the %V phase, where "
+                      "nobody is left to redirect; taken as allow",
+                      &insp->name, ngx_http_waf_phase_name(ctx->phase));
+
+        verdict = NGX_HTTP_WAF_V_ALLOW;
     }
 
     reply->verdict = verdict;
@@ -464,24 +497,22 @@ ngx_http_waf_msg_reply(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
         ngx_str_null(&reply->redirect_url);
     }
 
-    reply->received = 1;
+    if (cont.len != 0 && cont_ttl > 0
+        && ngx_http_waf_reply_resume(ctx, index, &cont, cont_ttl) != NGX_OK)
+    {
+        ngx_http_waf_reply_reject(err, "continuation could not be kept");
+    }
 
     return NGX_OK;
 }
 
 
 static ngx_int_t
-ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
-    ngx_uint_t index)
+ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp, ngx_str_t *subject,
+    ngx_int_t *ttl)
 {
-    ngx_int_t                  rc, n, ttl;
-    ngx_str_t                  key, subject;
-    ngx_uint_t                 i;
-    ngx_http_waf_inspector_t  *insp;
-    ngx_http_waf_main_conf_t  *wmcf;
-
-    ngx_str_null(&subject);
-    ttl = 0;
+    ngx_int_t  rc;
+    ngx_str_t  key;
 
     if (ngx_http_waf_jp_object(jp) != NGX_OK) {
         return NGX_ERROR;
@@ -491,7 +522,7 @@ ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
         rc = ngx_http_waf_jp_member(jp, &key);
 
         if (rc == NGX_DONE) {
-            break;
+            return NGX_OK;
         }
 
         if (rc != NGX_OK) {
@@ -499,7 +530,7 @@ ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
         }
 
         if (key.len == 7 && ngx_strncmp(key.data, "subject", 7) == 0) {
-            if (ngx_http_waf_jp_string(jp, &subject) != NGX_OK) {
+            if (ngx_http_waf_jp_string(jp, subject) != NGX_OK) {
                 return NGX_ERROR;
             }
 
@@ -507,11 +538,10 @@ ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
         }
 
         if (key.len == 6 && ngx_strncmp(key.data, "ttl_ms", 6) == 0) {
-            if (ngx_http_waf_jp_int(jp, &n) != NGX_OK) {
+            if (ngx_http_waf_jp_int(jp, ttl) != NGX_OK) {
                 return NGX_ERROR;
             }
 
-            ttl = n;
             continue;
         }
 
@@ -519,30 +549,34 @@ ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
             return NGX_ERROR;
         }
     }
+}
 
-    if (subject.len == 0 || ttl <= 0) {
-        return NGX_OK;
-    }
+
+static ngx_int_t
+ngx_http_waf_reply_resume(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
+    ngx_str_t *subject, ngx_int_t ttl)
+{
+    u_char                     shown[NGX_HTTP_WAF_SHOWN_LEN];
+    ngx_uint_t                 i;
+    ngx_http_waf_inspector_t  *insp;
+    ngx_http_waf_main_conf_t  *wmcf;
 
     wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
-    insp = wmcf->inspectors.elts;
-    insp = &insp[index];
+    insp = &((ngx_http_waf_inspector_t *) wmcf->inspectors.elts)[index];
 
-    if (subject.len <= insp->subject.len
-        || ngx_memcmp(subject.data, insp->subject.data, insp->subject.len) != 0
-        || subject.data[insp->subject.len] != '.')
-    {
-        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
-                      "waf: inspector \"%V\" offered continuation on \"%V\", "
-                      "outside its own subject; ignored",
-                      &insp->name, &subject);
+    if (ctx->phase != NGX_HTTP_WAF_PHASE_REQUEST) {
+        ngx_log_error(NGX_LOG_INFO, ctx->request->connection->log, 0,
+                      "waf: inspector \"%V\" offered a continuation on the "
+                      "%V phase, which only the request phase hands over; "
+                      "ignored",
+                      &insp->name, ngx_http_waf_phase_name(ctx->phase));
 
         return NGX_OK;
     }
 
-    for (i = 0; i < subject.len; i++) {
-        if (subject.data[i] <= ' ' || subject.data[i] == '*'
-            || subject.data[i] == '>' || subject.data[i] == 0x7f)
+    for (i = 0; i < subject->len; i++) {
+        if (subject->data[i] <= ' ' || subject->data[i] == '*'
+            || subject->data[i] == '>' || subject->data[i] == 0x7f)
         {
             ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
                           "waf: inspector \"%V\" offered a continuation "
@@ -553,21 +587,30 @@ ngx_http_waf_reply_continue(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
         }
     }
 
-    if (ngx_http_waf_resume_keep(ctx, index, &subject,
-                                 (ngx_msec_t) ttl) != NGX_OK)
+    if (subject->len <= insp->subject.len
+        || ngx_memcmp(subject->data, insp->subject.data, insp->subject.len)
+           != 0
+        || subject->data[insp->subject.len] != '.')
     {
-        return NGX_ERROR;
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                      "waf: inspector \"%V\" offered continuation on \"%*s\", "
+                      "outside its own subject; ignored", &insp->name,
+                      ngx_http_waf_shown(shown, subject), shown);
+
+        return NGX_OK;
     }
 
-    return NGX_OK;
+    return ngx_http_waf_resume_keep(ctx, index, subject, (ngx_msec_t) ttl);
 }
 
 
 static ngx_int_t
-ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp, ngx_http_waf_reply_t *reply)
+ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
+    ngx_uint_t index, ngx_http_waf_reply_t *reply)
 {
-    ngx_str_t  key, value;
-    ngx_int_t  rc, n;
+    u_char     *save;
+    ngx_str_t   key, value;
+    ngx_int_t   rc, n;
 
     if (ngx_http_waf_jp_object(jp) != NGX_OK) {
         return NGX_ERROR;
@@ -589,7 +632,7 @@ ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp, ngx_http_waf_reply_t *reply)
                 return NGX_ERROR;
             }
 
-            if (!ngx_http_waf_value_clean(&value)) {
+            if (!ngx_http_waf_text_clean(&value, NGX_MAX_SIZE_T_VALUE)) {
                 return NGX_ERROR;
             }
 
@@ -609,9 +652,19 @@ ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp, ngx_http_waf_reply_t *reply)
             continue;
         }
 
+        save = jp->pos;
+
         if (key.len == 5 && ngx_strncmp(key.data, "scope", 5) == 0) {
             if (ngx_http_waf_jp_string(jp, &value) != NGX_OK) {
-                return NGX_ERROR;
+                jp->pos = save;
+
+                if (ngx_http_waf_reply_optional(jp, ctx, index, "scope")
+                    != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
+
+                continue;
             }
 
             reply->reason_scope = ngx_http_waf_deny_scope_parse(&value);
@@ -620,7 +673,15 @@ ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp, ngx_http_waf_reply_t *reply)
 
         if (key.len == 7 && ngx_strncmp(key.data, "subject", 7) == 0) {
             if (ngx_http_waf_jp_string(jp, &value) != NGX_OK) {
-                return NGX_ERROR;
+                jp->pos = save;
+
+                if (ngx_http_waf_reply_optional(jp, ctx, index, "subject")
+                    != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
+
+                continue;
             }
 
             if (ngx_http_waf_subject_clean(&value)) {
@@ -632,7 +693,15 @@ ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp, ngx_http_waf_reply_t *reply)
 
         if (key.len == 5 && ngx_strncmp(key.data, "retry", 5) == 0) {
             if (ngx_http_waf_jp_int(jp, &n) != NGX_OK) {
-                return NGX_ERROR;
+                jp->pos = save;
+
+                if (ngx_http_waf_reply_optional(jp, ctx, index, "retry")
+                    != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
+
+                continue;
             }
 
             if (n > 0 && n <= NGX_HTTP_WAF_DENY_RETRY_MAX) {
@@ -646,6 +715,30 @@ ngx_http_waf_reply_reason(ngx_http_waf_jp_t *jp, ngx_http_waf_reply_t *reply)
             return NGX_ERROR;
         }
     }
+}
+
+
+static ngx_int_t
+ngx_http_waf_reply_optional(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
+    ngx_uint_t index, const char *field)
+{
+    ngx_http_waf_inspector_t  *insp;
+    ngx_http_waf_main_conf_t  *wmcf;
+
+    jp->error = NULL;
+
+    if (ngx_http_waf_jp_skip(jp) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
+    insp = &((ngx_http_waf_inspector_t *) wmcf->inspectors.elts)[index];
+
+    ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+                  "waf: inspector \"%V\" sent reason.%s of a wrong type; "
+                  "dropped", &insp->name, field);
+
+    return NGX_OK;
 }
 
 
@@ -1028,9 +1121,14 @@ ngx_http_waf_reply_headers(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
                     return NGX_ERROR;
                 }
 
-                if (!ngx_http_waf_token_clean(&name)
-                    || ngx_http_waf_header_forbidden(&name))
-                {
+                if (!ngx_http_waf_token_clean(&name)) {
+                    ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log,
+                                  0, "waf: inspector \"%V\" sent a malformed "
+                                  "header name", &insp->name);
+                    continue;
+                }
+
+                if (ngx_http_waf_header_forbidden(&name)) {
                     ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log,
                                   0,
                                   "waf: inspector \"%V\" is not allowed to "
@@ -1069,14 +1167,19 @@ static ngx_int_t
 ngx_http_waf_reply_rewrite(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
     ngx_uint_t index, ngx_http_waf_reply_t *reply)
 {
+    u_char                     shown[NGX_HTTP_WAF_SHOWN_LEN];
     ngx_str_t                  key, value, *group;
     ngx_int_t                  rc, n;
-    ngx_uint_t                 i;
+    ngx_uint_t                 i, body, has_key, has_size;
     ngx_http_waf_inspector_t  *insp;
     ngx_http_waf_main_conf_t  *wmcf;
 
     wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
     insp = &((ngx_http_waf_inspector_t *) wmcf->inspectors.elts)[index];
+
+    body     = 0;
+    has_key  = 0;
+    has_size = 0;
 
     if (ngx_http_waf_jp_object(jp) != NGX_OK) {
         return NGX_ERROR;
@@ -1098,6 +1201,8 @@ ngx_http_waf_reply_rewrite(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
             if (ngx_http_waf_jp_object(jp) != NGX_OK) {
                 return NGX_ERROR;
             }
+
+            body = 1;
 
             for ( ;; ) {
                 rc = ngx_http_waf_jp_member(jp, &key);
@@ -1121,8 +1226,11 @@ ngx_http_waf_reply_rewrite(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
                         ngx_log_error(NGX_LOG_WARN,
                                       ctx->request->connection->log, 0,
                                       "waf: inspector \"%V\" sent rewrite "
-                                      "key \"%V\", expected %V:%*s:%V:<suffix>",
-                                      &insp->name, &value, &wmcf->node_id,
+                                      "key \"%*s\", expected "
+                                      "%V:%*s:%V:<suffix>",
+                                      &insp->name,
+                                      ngx_http_waf_shown(shown, &value), shown,
+                                      &wmcf->node_id,
                                       (size_t) NGX_HTTP_WAF_RID_HEX_LEN,
                                       ctx->rid_hex,
                                       ngx_http_waf_body_phase_tag_name(
@@ -1131,6 +1239,7 @@ ngx_http_waf_reply_rewrite(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
                     }
 
                     reply->rewrite_key = value;
+                    has_key = 1;
                     continue;
                 }
 
@@ -1141,6 +1250,7 @@ ngx_http_waf_reply_rewrite(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
 
                     reply->rewrite_size = (off_t) n;
                     reply->rewrite_body = 1;
+                    has_size = 1;
                     continue;
                 }
 
@@ -1174,7 +1284,8 @@ ngx_http_waf_reply_rewrite(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
 
         if (key.len == 12 && ngx_strncmp(key.data, "content_type", 12) == 0) {
             if (ngx_http_waf_jp_string(jp, &value) != NGX_OK
-                || !ngx_http_waf_content_type_clean(&value))
+                || value.len == 0
+                || !ngx_http_waf_text_clean(&value, 128))
             {
                 return NGX_ERROR;
             }
@@ -1237,41 +1348,13 @@ ngx_http_waf_reply_rewrite(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
         }
     }
 
-    if (reply->rewrite_body
-        && (reply->rewrite_key.len == 0 || reply->rewrite_size < 0))
-    {
-        return NGX_ERROR;
-    }
-
-    if (reply->rewrite_key.len != 0 && !reply->rewrite_body) {
+    if (body && !(has_key && has_size)) {
         return NGX_ERROR;
     }
 
     reply->rewrite_has = 1;
 
     return NGX_OK;
-}
-
-
-static ngx_uint_t
-ngx_http_waf_content_type_clean(ngx_str_t *s)
-{
-    u_char  c;
-    size_t  i;
-
-    if (s->len == 0 || s->len > 128) {
-        return 0;
-    }
-
-    for (i = 0; i < s->len; i++) {
-        c = s->data[i];
-
-        if (c < 0x20 || c == 0x7f) {
-            return 0;
-        }
-    }
-
-    return 1;
 }
 
 
@@ -1406,7 +1489,7 @@ static ngx_int_t
 ngx_http_waf_reply_actions(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
     ngx_uint_t index, ngx_http_waf_reply_t *reply, ngx_str_t *err)
 {
-    u_char                    *begin;
+    u_char                    *begin, shown[NGX_HTTP_WAF_SHOWN_LEN];
     ngx_str_t                  key, value, to;
     ngx_int_t                  rc, n;
     ngx_uint_t                 verb_set, apply_set, wave, obj;
@@ -1848,7 +1931,8 @@ ngx_http_waf_reply_actions(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
             if (dst == NULL) {
                 ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
                               "waf: action from inspector \"%V\" dropped: "
-                              "unknown addressee \"%V\"", &insp->name, &to);
+                              "unknown addressee \"%*s\"", &insp->name,
+                              ngx_http_waf_shown(shown, &to), shown);
                 continue;
             }
 
@@ -2138,7 +2222,7 @@ ngx_http_waf_reply_cookies(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
 
             if (key.len == 5 && ngx_strncmp(key.data, "value", 5) == 0) {
                 if (ngx_http_waf_jp_string(jp, &cookie.value) != NGX_OK
-                    || !ngx_http_waf_value_clean(&cookie.value))
+                    || !ngx_http_waf_cookie_value_clean(&cookie.value))
                 {
                     return NGX_ERROR;
                 }
@@ -2148,7 +2232,7 @@ ngx_http_waf_reply_cookies(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
 
             if (key.len == 4 && ngx_strncmp(key.data, "path", 4) == 0) {
                 if (ngx_http_waf_jp_string(jp, &cookie.path) != NGX_OK
-                    || !ngx_http_waf_value_clean(&cookie.path))
+                    || !ngx_http_waf_cookie_path_clean(&cookie.path))
                 {
                     return NGX_ERROR;
                 }
@@ -2377,7 +2461,9 @@ ngx_http_waf_reply_sessions(ngx_http_waf_jp_t *jp, ngx_http_waf_ctx_t *ctx,
                         || ngx_http_waf_jp_string(jp, &item) != NGX_OK
                         || !ngx_http_waf_text_clean(&item,
                                                 NGX_HTTP_WAF_SESSION_GROUPS_MAX)
-                        || item.len == 0)
+                        || item.len == 0
+                        || ngx_strlchr(item.data, item.data + item.len, ',')
+                           != NULL)
                     {
                         return NGX_ERROR;
                     }
@@ -2446,6 +2532,84 @@ ngx_http_waf_text_clean(ngx_str_t *s, size_t max)
     }
 
     return 1;
+}
+
+
+static ngx_uint_t
+ngx_http_waf_cookie_value_clean(ngx_str_t *s)
+{
+    u_char  c, *p, *last;
+
+    p    = s->data;
+    last = s->data + s->len;
+
+    if (s->len >= 2 && p[0] == '"' && last[-1] == '"') {
+        p++;
+        last--;
+    }
+
+    /* RFC 6265 cookie-octet */
+
+    for ( /* void */ ; p < last; p++) {
+        c = *p;
+
+        if (c <= 0x20 || c >= 0x7f || c == '"' || c == ',' || c == ';'
+            || c == '\\')
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static ngx_uint_t
+ngx_http_waf_cookie_path_clean(ngx_str_t *s)
+{
+    u_char  c;
+    size_t  i;
+
+    for (i = 0; i < s->len; i++) {
+        c = s->data[i];
+
+        if (c < 0x20 || c >= 0x7f || c == ';') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static size_t
+ngx_http_waf_shown(u_char *buf, ngx_str_t *s)
+{
+    u_char               c, *p;
+    size_t               i;
+    static const u_char  hex[] = "0123456789abcdef";
+
+    p = buf;
+
+    for (i = 0; i < s->len && i < NGX_HTTP_WAF_SHOWN_MAX; i++) {
+        c = s->data[i];
+
+        if (c >= 0x20 && c < 0x7f && c != '"' && c != '\\') {
+            *p++ = c;
+            continue;
+        }
+
+        *p++ = '\\';
+        *p++ = 'x';
+        *p++ = hex[c >> 4];
+        *p++ = hex[c & 0xf];
+    }
+
+    if (i < s->len) {
+        p = ngx_cpymem(p, "...", 3);
+    }
+
+    return (size_t) (p - buf);
 }
 
 
