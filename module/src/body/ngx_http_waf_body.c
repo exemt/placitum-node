@@ -2046,7 +2046,8 @@ ngx_http_waf_body_on_put(ngx_http_waf_body_op_t *op)
 
     if (ctx->ph == &ctx->phases[op->phase]
         && (ctx->state == NGX_HTTP_WAF_ST_NEED_BODY
-            || ctx->state == NGX_HTTP_WAF_ST_READING_BODY))
+            || ctx->state == NGX_HTTP_WAF_ST_READING_BODY
+            || ctx->state == NGX_HTTP_WAF_ST_PLACING_META))
     {
         ngx_http_waf_body_resumed(ctx, rc);
     }
