@@ -7,6 +7,7 @@
 
 static size_t ngx_http_waf_msg_prior_size(ngx_http_waf_main_conf_t *wmcf,
     ngx_http_waf_loc_conf_t *wlcf);
+static size_t ngx_http_waf_msg_actions_size(ngx_http_waf_ctx_t *ctx);
 static void ngx_http_waf_msg_conn(ngx_http_waf_jw_t *jw,
     ngx_http_request_t *r);
 static void ngx_http_waf_msg_http(ngx_http_waf_jw_t *jw,
@@ -64,6 +65,7 @@ ngx_http_waf_msg_request(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
            + ngx_http_waf_msg_room(wlcf->profiles[index].len)
            + ngx_http_waf_msg_room(insp->audit_subject.len)
            + ngx_http_waf_msg_prior_size(wmcf, wlcf)
+           + ngx_http_waf_msg_actions_size(ctx)
            + ngx_http_waf_msg_sessions_size(ctx, index)
            + ngx_http_waf_vars_size(ctx, insp->vars_mask)
            + ngx_http_waf_needs_size()
@@ -576,6 +578,41 @@ ngx_http_waf_msg_prior_size(ngx_http_waf_main_conf_t *wmcf,
                         "\"code\":,\"delta\":,\"value\":,\"counter\":,"
                         "\"group\":,\"set\":\"off\"}") - 1
                + 2 * NGX_INT_T_LEN);
+
+    return size;
+}
+
+
+/*
+ * Actions were limited by the location that accepted them; after an internal
+ * redirect the current location's budget may be smaller.
+ */
+
+static size_t
+ngx_http_waf_msg_actions_size(ngx_http_waf_ctx_t *ctx)
+{
+    size_t                  size;
+    ngx_uint_t              i;
+    ngx_http_waf_action_t  *a;
+
+    if (ctx->actions == NULL) {
+        return 0;
+    }
+
+    a    = ctx->actions->elts;
+    size = 0;
+
+    for (i = 0; i < ctx->actions->nelts; i++) {
+        size += sizeof(",\"actions\":[{\"do\":\"threshold\","
+                       "\"apply\":\"response\",\"phase\":\"response\","
+                       "\"code\":,\"delta\":,\"value\":,\"counter\":,"
+                       "\"group\":,\"set\":\"off\"}]") - 1
+                + 2 * NGX_INT_T_LEN
+                + ngx_http_waf_msg_room(a[i].code.len)
+                + ngx_http_waf_msg_room(a[i].counter.len)
+                + ngx_http_waf_msg_room(a[i].group.len)
+                + 512;
+    }
 
     return size;
 }
