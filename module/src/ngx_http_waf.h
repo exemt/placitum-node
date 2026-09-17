@@ -879,6 +879,7 @@ struct ngx_http_waf_ctx_s {
 
     unsigned                   rsp_streaming:1;
     unsigned                   rsp_body_capped:1;
+    unsigned                   rsp_monitor_held:1;
 
     unsigned                   rsp_journal:1;
     unsigned                   rsp_journal_done:1;

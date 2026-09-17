@@ -24,6 +24,8 @@ static ngx_uint_t ngx_http_waf_preview_allowed(ngx_str_t *name,
     ngx_array_t *allow, ngx_array_t *deny);
 static ngx_uint_t ngx_http_waf_preview_listed(ngx_array_t *list,
     ngx_str_t *name);
+static ngx_str_t ngx_http_waf_preview_arg_name(ngx_pool_t *pool,
+    ngx_str_t *raw);
 static void ngx_http_waf_preview_budgets(ngx_http_waf_ctx_t *ctx,
     ngx_http_waf_loc_conf_t *wlcf, size_t budget[NGX_HTTP_WAF_OBJ_COUNT]);
 static size_t ngx_http_waf_preview_overhead(void);
@@ -255,7 +257,7 @@ ngx_http_waf_preview_args(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
 {
     u_char                     *p, *last, *amp, *eq, *mark, hex[64];
     size_t                      left, item;
-    ngx_str_t                   name, value;
+    ngx_str_t                   name, value, match;
     ngx_uint_t                  first, dropped, rc;
     ngx_array_t                *allow, *deny, *mask, *cap_deny, *cap_mask;
     size_t                      budget[NGX_HTTP_WAF_OBJ_COUNT];
@@ -309,14 +311,21 @@ ngx_http_waf_preview_args(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
             continue;
         }
 
-        if (!ngx_http_waf_preview_allowed(&name, allow, deny)
-            || ngx_http_waf_preview_listed(cap_deny, &name))
+        /*
+         * The lists match the decoded name, so ?pass%77ord= cannot slip past a
+         * mask on "password". The value stays as it came -- its encoding is the
+         * evidence -- and the pair is shown under the raw name.
+         */
+        match = ngx_http_waf_preview_arg_name(r->pool, &name);
+
+        if (!ngx_http_waf_preview_allowed(&match, allow, deny)
+            || ngx_http_waf_preview_listed(cap_deny, &match))
         {
             continue;
         }
 
-        if (ngx_http_waf_preview_listed(mask, &name)
-            || ngx_http_waf_preview_listed(cap_mask, &name))
+        if (ngx_http_waf_preview_listed(mask, &match)
+            || ngx_http_waf_preview_listed(cap_mask, &match))
         {
             ngx_http_waf_preview_hash(&value, hex);
             value.data = hex;
@@ -694,6 +703,72 @@ ngx_http_waf_preview_allowed(ngx_str_t *name, ngx_array_t *allow,
     }
 
     return ngx_http_waf_preview_listed(allow, name);
+}
+
+
+/*
+ * Decodes an argument name for list matching: "+" becomes a space and "%XX" the
+ * byte it names, so an encoded name matches an allow/mask/deny entry the same
+ * as the plain one. Returns the raw name when it has nothing to decode.
+ */
+
+static ngx_str_t
+ngx_http_waf_preview_arg_name(ngx_pool_t *pool, ngx_str_t *raw)
+{
+    u_char     *p, *d, c, h, l;
+    size_t      i;
+    ngx_str_t   out;
+
+    for (i = 0; i < raw->len; i++) {
+        if (raw->data[i] == '%' || raw->data[i] == '+') {
+            break;
+        }
+    }
+
+    if (i == raw->len) {
+        return *raw;
+    }
+
+    d = ngx_pnalloc(pool, raw->len);
+    if (d == NULL) {
+        return *raw;
+    }
+
+    out.data = d;
+    p        = raw->data;
+
+    for (i = 0; i < raw->len; i++) {
+        c = p[i];
+
+        if (c == '+') {
+            *d++ = ' ';
+            continue;
+        }
+
+        if (c == '%' && i + 2 < raw->len) {
+            h = p[i + 1];
+            l = p[i + 2];
+
+            if (((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f')
+                 || (h >= 'A' && h <= 'F'))
+                && ((l >= '0' && l <= '9') || (l >= 'a' && l <= 'f')
+                    || (l >= 'A' && l <= 'F')))
+            {
+                h = (h <= '9') ? h - '0' : (h | 0x20) - 'a' + 10;
+                l = (l <= '9') ? l - '0' : (l | 0x20) - 'a' + 10;
+
+                *d++ = (u_char) ((h << 4) | l);
+                i += 2;
+                continue;
+            }
+        }
+
+        *d++ = c;
+    }
+
+    out.len = (size_t) (d - out.data);
+
+    return out;
 }
 
 

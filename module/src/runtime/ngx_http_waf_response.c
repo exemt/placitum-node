@@ -532,7 +532,14 @@ ngx_http_waf_response_resume(ngx_http_waf_ctx_t *ctx)
                           "connection, ray %*s", rc,
                           (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
 
+            ctx->rsp_monitor_held = 0;
             ngx_http_finalize_request(r, NGX_ERROR);
+
+        } else if (ctx->rsp_monitor_held) {
+
+            /* The wave that kept the streamed request alive is done; let it go. */
+            ctx->rsp_monitor_held = 0;
+            ngx_http_finalize_request(r, NGX_DONE);
         }
 
         return;
@@ -865,6 +872,18 @@ ngx_http_waf_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             && !ctx->rsp_settled
             && ngx_http_waf_response_body_ready(ctx))
         {
+            /*
+             * The response is already on the wire; placing the body and running
+             * the wave is async (store, then bus). Hold a reference first, or
+             * the request would finalize under us and the wave -- record and
+             * deny alike -- would be dropped on a freed request. The phase's
+             * settle in response_resume drops it.
+             */
+            if (!ctx->rsp_monitor_held) {
+                ctx->rsp_monitor_held = 1;
+                r->main->count++;
+            }
+
             (void) ngx_http_waf_response_body_place(ctx);
         }
 
