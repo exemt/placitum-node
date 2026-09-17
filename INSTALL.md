@@ -25,6 +25,10 @@ with `nginx -s reload`. The presence frame (`WAF_STATUS.node.<node>.agent`) says
 generation applied: `ok`, `apply_failed` or `undecryptable`. A fresh node fetches
 the current generation by itself; nothing has to be sent again.
 
+A generation that did not apply is tried again by the agent itself, after 2 seconds and then after a
+pause that doubles up to a minute: its blobs may not be in Redis yet, or an upstream name may not
+resolve yet. A newer generation replaces it at once.
+
 Before the first generation nginx serves a stub on `:8079`: `/healthz` answers `bootstrap`, everything
 else `503 waiting for controller generation`. Ports, servers and routes arrive with the generation.
 
@@ -111,8 +115,9 @@ docker exec <container> nginx -T | head -20
 ```
 
 A healthy agent logs the bus connection and then `desired applied` with the revision.
-`apply_failed` in the presence frame means the generation arrived but `nginx -t` rejected it; the
-reason is in the agent log.
+`apply_failed` in the presence frame means the generation arrived but did not apply: its blobs are
+missing or `nginx -t` rejected it. The reason is in the agent log next to `retry_in`, the pause before
+the next try.
 
 ## Pitfalls
 
