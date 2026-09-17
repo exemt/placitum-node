@@ -99,11 +99,12 @@ func filterArgs(data []byte, terms audit.Terms) ([]byte, error) {
 
 	for _, part := range strings.Split(src, "&") {
 		name, value, hadEq := splitArg(part)
-		if name == "" || !keepName(name, terms) {
+		key := argName(name)
+		if name == "" || !keepName(key, terms) {
 			continue
 		}
-		if listed(terms.Mask, name) {
-			value = maskValue(name, value, terms)
+		if listed(terms.Mask, key) {
+			value = maskValue(key, value, terms)
 			hadEq = true
 		}
 		if !first {
@@ -118,6 +119,51 @@ func filterArgs(data []byte, terms audit.Terms) ([]byte, error) {
 	}
 
 	return []byte(b.String()), nil
+}
+
+// argName decodes a query string name the way the module does before matching
+// lists: '+' is a space and a valid %XX is its byte.
+func argName(raw string) string {
+	if !strings.ContainsAny(raw, "%+") {
+		return raw
+	}
+
+	b := make([]byte, 0, len(raw))
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c == '+' {
+			b = append(b, ' ')
+			continue
+		}
+		if c == '%' && i+2 < len(raw) {
+			if v, ok := unhex(raw[i+1], raw[i+2]); ok {
+				b = append(b, v)
+				i += 2
+				continue
+			}
+		}
+		b = append(b, c)
+	}
+
+	return string(b)
+}
+
+func unhex(hi, lo byte) (byte, bool) {
+	h, ok1 := hexDigit(hi)
+	l, ok2 := hexDigit(lo)
+	return h<<4 | l, ok1 && ok2
+}
+
+func hexDigit(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 func splitArg(part string) (name, value string, hadEq bool) {
