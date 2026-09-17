@@ -1425,7 +1425,10 @@ ngx_http_waf_result_status(ngx_http_waf_ctx_t *ctx)
 
     case NGX_HTTP_WAF_V_DENY:
         dr = ngx_http_waf_deny_entry(ctx);
-        if (dr == NULL) {
+        if (dr == NULL
+            || (dr->type != NGX_HTTP_WAF_DENY_TYPE_HTTP
+                && !ngx_http_waf_phase_is_frame(ctx->phase)))
+        {
             return NGX_HTTP_FORBIDDEN;
         }
 
