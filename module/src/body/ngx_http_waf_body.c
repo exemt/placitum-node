@@ -451,8 +451,15 @@ ngx_http_waf_attachable(ngx_http_waf_ctx_t *ctx, ngx_uint_t obj)
     ngx_str_t   view;
     ngx_uint_t  truncated;
 
+    /*
+     * A frame has one object, its payload, held in the frame buffer until the
+     * record is written. A side without inspectors places nothing in the
+     * exchange, so the payload rides with the record like any journal object.
+     */
     if (ngx_http_waf_phase_is_frame(ctx->phase)) {
-        return 0;
+        return obj == NGX_HTTP_WAF_OBJ_BODY
+               && ngx_http_waf_body_attach_len(ctx, NGX_HTTP_WAF_AGENT_WHOLE,
+                                               &total) != 0;
     }
 
     switch (obj) {
@@ -3464,6 +3471,9 @@ ngx_http_waf_body_attach(ngx_http_waf_ctx_t *ctx, int fd, size_t limit,
     if (ctx->phase == NGX_HTTP_WAF_PHASE_RESPONSE) {
         ngx_http_waf_body_attach_response(ctx, loc, total);
         ngx_http_waf_body_encoding_out(r, loc);
+
+    } else if (ngx_http_waf_phase_is_frame(ctx->phase)) {
+        ngx_str_set(&loc->encoding, "identity");
 
     } else {
         ngx_http_waf_body_encoding(r, loc);
