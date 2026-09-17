@@ -11,7 +11,7 @@ is for installing a node separately, for example a second node for a running ins
 | Component | Required | Why |
 | --- | --- | --- |
 | NATS with JetStream | yes | inspector waves, audit, logs, configuration from KV, presence |
-| Exchange Redis | for `waf_capture` and `waf_archive` | body, headers and query string for the time of a wave |
+| Exchange Redis | for `waf_capture`, `waf_archive` and body previews | body, headers and query string for the time of a wave |
 | Internal Redis | recommended | generation blobs from the controller; without it they are read from the exchange |
 | Controller | yes | sends the configuration; until it does, the node answers with a stub |
 | S3-compatible storage | for `waf_archive` | archive of bodies, headers and query strings |
@@ -121,8 +121,8 @@ reason is in the agent log.
   under another.
 - **The agent is the main process of the container.** If the bus is unreachable at start, the agent
   exits and the container stops with it; the restart policy brings it back.
-- **nginx version.** The module is built against specific nginx sources; running it with another
-  version corrupts memory instead of failing to load. `NGINX_VERSION` of the build and the version of
-  the base image are one number and change together.
+- **nginx version.** The module is built against specific nginx sources, and nginx refuses to load
+  it into another version. `NGINX_VERSION` of the build and the version of the base image are one
+  number and change together; a new version also needs its `NGINX_SHA256`.
 - **The stub has its own port.** `:8079` does not collide with the ports that arrive with the
   generation.

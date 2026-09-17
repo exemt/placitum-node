@@ -32,10 +32,10 @@ client ──► nginx + ngx_http_waf_module ──► application
 1. `waf_inspect` on a route names the inspectors and their waves. The inspectors of one wave are
    asked in parallel; the next wave starts after the previous one and sees its answers.
 2. What the inspectors need (`waf_capture`: headers, query string, body) goes to the exchange
-   (Redis), and the message carries a locator. Bytes do not travel over the bus.
+   (Redis), and the message carries a locator instead of the bytes.
 3. An inspector answers `allow`, `score`, `redirect`, `deny` or `error`, and may add
-   requests to its neighbours. `deny`, or a score sum over `waf_score_deny`, ends the phase
-   with a deny response.
+   requests to its neighbours. `deny`, or a score sum that reaches `waf_score_deny`, ends the
+   phase with a deny response.
 4. When an inspector is late or silent, or the bus is down, `waf_deadline` and `waf_exception`
    decide: pass or deny, per phase and per cause.
 5. The result goes to the agent over a unix socket (`waf_agent_socket`); the agent publishes the
@@ -65,12 +65,12 @@ http {
     waf_inspector ip     subject=waf.req.ip;
     waf_inspector modsec subject=waf.req.modsec;
 
-    waf_deny_response blocked status=403 page=@waf_deny;
+    waf_deny_response blocked status=403;
     waf_deny_response_default blocked;
 
     waf_capture request headers=64k args=64k;
     waf_deadline request 50ms;
-    waf_exception request timeout deny;
+    waf_exception request timeout deny response=blocked;
     waf_exception request bus pass;
 
     server {
@@ -110,7 +110,8 @@ sending every request to `waf_exception … bus`.
 `captcha_required`, `auth_required`, `suspicious`, `malformed` and `error`, each as HTML and
 JSON. They are filled in with SSI from the module variables: `$waf_deny_status`,
 `$waf_deny_scope` and `$waf_deny_subject` (what is closed: an address, a network, a country, a
-system or a session), `$waf_deny_retry`, `$waf_deny_ray` (the event ID) and `$waf_deny_addr`.
+system, a session or the request), `$waf_deny_retry`, `$waf_deny_ray` (the event ID) and
+`$waf_deny_addr`.
 
 ## Build
 
@@ -119,10 +120,11 @@ docker build -f managed/Dockerfile -t placitum/node .
 docker build -f module/Dockerfile --target artifact --output type=local,dest=./out module
 ```
 
-`NGINX_VERSION` (1.28.0 by default) is shared by the module build and the base image. A module
-built against other nginx sources corrupts memory instead of failing to load, so to use the module
-with your own nginx, build it against the same version with the same `configure` flags
-(`--with-compat`).
+`NGINX_VERSION` (1.28.0 by default) is shared by the module build and the base image. The build
+checks the nginx sources against `NGINX_SHA256`, so a new version needs both values. nginx refuses
+to load a module built for another version. To use the module with your own nginx, build it
+against the same version with `--with-compat` and `--with-http_ssl_module`; without the SSL
+module the module cannot report HTTPS and TLS details.
 
 What the node needs, the agent settings and the checks are in [INSTALL.md](INSTALL.md).
 

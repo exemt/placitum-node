@@ -32,10 +32,10 @@
 1. `waf_inspect` на маршруте называет инспекторов и их волны. Инспекторов одной волны спрашивают
    параллельно; следующая волна начинается после предыдущей и видит её ответы.
 2. То, что нужно инспекторам (`waf_capture`: заголовки, строка запроса, тело), ложится в обменник
-   (Redis), а сообщение несёт локатор. Байты по шине не ездят.
+   (Redis), а сообщение несёт локатор вместо самих байтов.
 3. Инспектор отвечает `allow`, `score`, `redirect`, `deny` или `error` и может приложить
-   просьбы соседям. `deny` или сумма счёта выше `waf_score_deny` заканчивает фазу ответом
-   отказа.
+   просьбы соседям. `deny` или сумма счёта, дошедшая до `waf_score_deny`, заканчивает фазу
+   ответом отказа.
 4. Если инспектор опоздал или молчит либо шина лежит, решают `waf_deadline` и `waf_exception`:
    пропустить или отказать — по фазе и по причине.
 5. Итог уходит агенту по unix-сокету (`waf_agent_socket`); агент публикует запись аудита и
@@ -64,12 +64,12 @@ http {
     waf_inspector ip     subject=waf.req.ip;
     waf_inspector modsec subject=waf.req.modsec;
 
-    waf_deny_response blocked status=403 page=@waf_deny;
+    waf_deny_response blocked status=403;
     waf_deny_response_default blocked;
 
     waf_capture request headers=64k args=64k;
     waf_deadline request 50ms;
-    waf_exception request timeout deny;
+    waf_exception request timeout deny response=blocked;
     waf_exception request bus pass;
 
     server {
@@ -108,7 +108,7 @@ http {
 В `pages/` лежат страницы из образа: `blocked`, `too_many`, `ratelimited`, `captcha_required`,
 `auth_required`, `suspicious`, `malformed` и `error`, каждая в HTML и JSON. Их заполняет SSI
 из переменных модуля: `$waf_deny_status`, `$waf_deny_scope` и `$waf_deny_subject` (что закрыто:
-адрес, сеть, страна, система или сессия), `$waf_deny_retry`, `$waf_deny_ray` (Event ID) и
+адрес, сеть, страна, система, сессия или сам запрос), `$waf_deny_retry`, `$waf_deny_ray` (Event ID) и
 `$waf_deny_addr`.
 
 ## Сборка
@@ -118,9 +118,10 @@ docker build -f managed/Dockerfile -t placitum/node .
 docker build -f module/Dockerfile --target artifact --output type=local,dest=./out module
 ```
 
-`NGINX_VERSION` (по умолчанию 1.28.0) общая для сборки модуля и базового образа. Модуль, собранный
-против других исходников nginx, даёт порчу памяти, а не ошибку загрузки, поэтому для своего nginx
-модуль собирают против той же версии с теми же флагами `configure` (`--with-compat`).
+`NGINX_VERSION` (по умолчанию 1.28.0) общая для сборки модуля и базового образа. Сборка сверяет
+исходники nginx с `NGINX_SHA256`, поэтому для новой версии меняют оба значения. Модуль, собранный
+под другую версию, nginx не загрузит. Для своего nginx модуль собирают против той же версии с
+`--with-compat` и `--with-http_ssl_module`: без модуля SSL он не сообщит о HTTPS и TLS.
 
 Что нужно узлу, настройки агента и проверка — в [INSTALL.ru.md](INSTALL.ru.md).
 

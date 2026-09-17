@@ -1,6 +1,5 @@
-# NGINX_VERSION is shared by the module build and the base image: a module built against other nginx
-# sources corrupts memory instead of failing to load. NGINX_SHA256 is the checksum of that version's
-# tarball: change both together.
+# NGINX_VERSION is shared by the module build and the base image: nginx refuses to load a module built
+# for another version. NGINX_SHA256 is the checksum of that version's tarball: change both together.
 ARG NGINX_VERSION=1.28.0
 ARG NGINX_SHA256=c6b5c6b086c0df9d3ca3ff5e084c1d0ef909e6038279c71c1c3e985f576ff76a
 
