@@ -5,6 +5,8 @@
 #include "local/ngx_http_waf_local.h"
 #include "runtime/ngx_http_waf_preview.h"
 
+#include <sys/un.h>
+
 
 #define NGX_HTTP_WAF_DEFAULT_DEADLINE          50
 #define NGX_HTTP_WAF_DEFAULT_INFLIGHT        4096
@@ -36,12 +38,19 @@ ngx_http_waf_merge_lists(ngx_http_waf_shoot_conf_t *sh,
 }
 
 
+static void  ngx_http_waf_merge_body_limit(ngx_http_waf_loc_conf_t *conf,
+    ngx_http_waf_loc_conf_t *prev);
+static void  ngx_http_waf_merge_phase(ngx_http_waf_loc_conf_t *conf,
+    ngx_http_waf_loc_conf_t *prev, ngx_uint_t phase);
+static ngx_uint_t ngx_http_waf_merge_from(ngx_http_waf_loc_conf_t *conf,
+    ngx_http_waf_loc_conf_t *prev, ngx_uint_t phase, ngx_uint_t bit,
+    ngx_http_waf_loc_conf_t **from, ngx_uint_t *src);
 static char *ngx_http_waf_merge_waves(ngx_conf_t *cf,
     ngx_http_waf_main_conf_t *wmcf, ngx_http_waf_loc_conf_t *conf);
 static char *ngx_http_waf_check_exception(ngx_conf_t *cf,
     ngx_http_waf_main_conf_t *wmcf, ngx_http_waf_loc_conf_t *conf);
 static char *ngx_http_waf_check_send(ngx_conf_t *cf,
-    ngx_http_waf_main_conf_t *wmcf, ngx_http_waf_loc_conf_t *conf);
+    ngx_http_waf_loc_conf_t *conf);
 static char *ngx_http_waf_check_scoring(ngx_conf_t *cf,
     ngx_http_waf_main_conf_t *wmcf, ngx_http_waf_loc_conf_t *conf);
 static void  ngx_http_waf_merge_capture(ngx_http_waf_shoot_conf_t *sh,
@@ -49,10 +58,10 @@ static void  ngx_http_waf_merge_capture(ngx_http_waf_shoot_conf_t *sh,
 static void  ngx_http_waf_merge_archive(ngx_http_waf_shoot_conf_t *sh,
     ngx_http_waf_shoot_conf_t *psh);
 static char *ngx_http_waf_merge_preview(ngx_conf_t *cf,
-    ngx_http_waf_main_conf_t *wmcf, ngx_http_waf_loc_conf_t *conf,
-    ngx_http_waf_loc_conf_t *prev, ngx_uint_t phase);
+    ngx_http_waf_loc_conf_t *conf, ngx_http_waf_loc_conf_t *prev,
+    ngx_uint_t phase);
 static char *ngx_http_waf_check_body_limit(ngx_conf_t *cf,
-    ngx_http_waf_loc_conf_t *conf);
+    ngx_http_waf_loc_conf_t *conf, ngx_uint_t own);
 static char *ngx_http_waf_check_capture_limit(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase);
 static char *ngx_http_waf_check_archive_sizes(ngx_conf_t *cf,
@@ -64,14 +73,9 @@ static char *ngx_http_waf_check_held_size(ngx_conf_t *cf,
     ngx_uint_t obj, size_t limit);
 static char *ngx_http_waf_check_size_ceiling(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase, const char *dir,
-    ngx_uint_t obj, size_t limit);
+    ngx_uint_t obj, size_t limit, ngx_uint_t named);
 static size_t ngx_http_waf_read_ceiling(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase);
-static size_t ngx_http_waf_preview_ceiling(ngx_conf_t *cf,
-    ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase, ngx_uint_t obj);
-static char *ngx_http_waf_preview_budget(ngx_conf_t *cf,
-    ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase, ngx_uint_t obj,
-    ngx_uint_t named);
 
 
 void *
@@ -115,6 +119,10 @@ ngx_http_waf_init_main_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_waf_main_conf_t  *wmcf = conf;
 
+    size_t                     path_max;
+    ngx_uint_t                 i;
+    ngx_http_waf_inspector_t  *insp;
+
     ngx_conf_init_uint_value(wmcf->max_inflight, NGX_HTTP_WAF_DEFAULT_INFLIGHT);
     ngx_conf_init_size_value(wmcf->reply_max, NGX_HTTP_WAF_DEFAULT_REPLY_MAX);
     ngx_conf_init_size_value(wmcf->header_value_max,
@@ -134,7 +142,7 @@ ngx_http_waf_init_main_conf(ngx_conf_t *cf, void *conf)
         u_char  *p;
         size_t   len;
 
-        len = sizeof("waf-") - 1 + ngx_cycle->hostname.len;
+        len = sizeof("waf-") - 1 + cf->cycle->hostname.len;
 
         p = ngx_pnalloc(cf->pool, len);
         if (p == NULL) {
@@ -143,7 +151,13 @@ ngx_http_waf_init_main_conf(ngx_conf_t *cf, void *conf)
 
         wmcf->bus_name.data = p;
         wmcf->bus_name.len  = (size_t) (ngx_sprintf(p, "waf-%V",
-                                                    &ngx_cycle->hostname) - p);
+                                                    &cf->cycle->hostname) - p);
+    }
+
+    if (wmcf->max_inflight == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_max_inflight must be at least 1");
+        return NGX_CONF_ERROR;
     }
 
     if (wmcf->max_inflight > NGX_HTTP_WAF_SLOT_INDEX_MASK) {
@@ -153,8 +167,30 @@ ngx_http_waf_init_main_conf(ngx_conf_t *cf, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    if (wmcf->reply_max == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_reply_max must be above zero");
+        return NGX_CONF_ERROR;
+    }
+
+    if (wmcf->body_max_holds == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_body_max_holds must be at least 1");
+        return NGX_CONF_ERROR;
+    }
+
+    path_max = sizeof(((struct sockaddr_un *) 0)->sun_path) - 1;
+
+    if (wmcf->agent_socket.len > path_max) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf_agent_socket \"%V\" is too long for a unix "
+                           "socket path, at most %uz bytes",
+                           &wmcf->agent_socket, path_max);
+        return NGX_CONF_ERROR;
+    }
+
     if (wmcf->node_id.len == 0) {
-        wmcf->node_id = ngx_cycle->hostname;
+        wmcf->node_id = cf->cycle->hostname;
     }
 
     if (ngx_http_waf_shm_fit(cf) != NGX_OK) {
@@ -176,19 +212,26 @@ ngx_http_waf_init_main_conf(ngx_conf_t *cf, void *conf)
         }
     }
 
-    if (wmcf->inspectors.nelts > NGX_HTTP_WAF_MAX_INSPECTORS) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "waf: %ui inspectors declared, maximum is %d",
-                           wmcf->inspectors.nelts,
-                           NGX_HTTP_WAF_MAX_INSPECTORS);
-        return NGX_CONF_ERROR;
-    }
-
     if (wmcf->bus == NULL && wmcf->inspectors.nelts != 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "waf: inspectors are declared but waf_bus is not "
                            "configured");
         return NGX_CONF_ERROR;
+    }
+
+    insp = wmcf->inspectors.elts;
+
+    for (i = 0; i < wmcf->inspectors.nelts; i++) {
+
+        if (insp[i].breaker && insp[i].breaker_named
+            && wmcf->shm_zone == NULL)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "waf: inspector \"%V\" sets breaker options, "
+                               "and the circuit breaker needs waf_shm_zone",
+                               &insp[i].name);
+            return NGX_CONF_ERROR;
+        }
     }
 
     return ngx_http_waf_vars_init(cf, wmcf);
@@ -278,10 +321,13 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_waf_loc_conf_t  *conf = child;
 
     char                      *rv;
-    ngx_uint_t                 i;
+    ngx_uint_t                 i, obj, exc, own_body_limit;
     ngx_http_waf_main_conf_t  *wmcf;
 
     wmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_waf_module);
+
+    own_body_limit = conf->named[NGX_HTTP_WAF_PHASE_REQUEST]
+                     & NGX_HTTP_WAF_NAMED_BODY_LIMIT;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
 
@@ -391,15 +437,12 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         prev->exception[NGX_HTTP_WAF_PHASE_REQUEST][NGX_HTTP_WAF_EXC_OVERLOAD],
         NGX_HTTP_WAF_POLICY_BLOCK);
 
-    {
-        ngx_uint_t  exc;
-
-        for (exc = 0; exc < NGX_HTTP_WAF_EXC_COUNT; exc++) {
-            ngx_conf_merge_str_value(
-                conf->exception_response[NGX_HTTP_WAF_PHASE_REQUEST][exc],
-                prev->exception_response[NGX_HTTP_WAF_PHASE_REQUEST][exc], "");
-        }
+    for (exc = 0; exc < NGX_HTTP_WAF_EXC_COUNT; exc++) {
+        ngx_conf_merge_str_value(
+            conf->exception_response[NGX_HTTP_WAF_PHASE_REQUEST][exc],
+            prev->exception_response[NGX_HTTP_WAF_PHASE_REQUEST][exc], "");
     }
+
     ngx_conf_merge_uint_value(conf->deny_mode[NGX_HTTP_WAF_PHASE_REQUEST],
                               prev->deny_mode[NGX_HTTP_WAF_PHASE_REQUEST],
                               NGX_HTTP_WAF_DENY_FAST);
@@ -411,64 +454,17 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->hold[NGX_HTTP_WAF_PHASE_REQUEST],
                               prev->hold[NGX_HTTP_WAF_PHASE_REQUEST],
                               NGX_HTTP_WAF_HOLD_GATE);
-    ngx_conf_merge_size_value(conf->body_limit[NGX_HTTP_WAF_PHASE_REQUEST],
-                              prev->body_limit[NGX_HTTP_WAF_PHASE_REQUEST],
-                              NGX_HTTP_WAF_DEFAULT_BODY_LIMIT);
-    ngx_conf_merge_uint_value(
-        conf->body_limit_policy[NGX_HTTP_WAF_PHASE_REQUEST],
-        prev->body_limit_policy[NGX_HTTP_WAF_PHASE_REQUEST],
-        NGX_HTTP_WAF_POLICY_BLOCK);
+
+    ngx_http_waf_merge_body_limit(conf, prev);
 
     for (i = NGX_HTTP_WAF_PHASE_REQUEST + 1; i < NGX_HTTP_WAF_NPHASE; i++) {
+        ngx_http_waf_merge_phase(conf, prev, i);
+    }
 
-        ngx_conf_merge_msec_value(conf->deadline[i], prev->deadline[i],
-                                  conf->deadline[NGX_HTTP_WAF_PHASE_REQUEST]);
-        {
-            ngx_uint_t  exc;
-
-            for (exc = 0; exc < NGX_HTTP_WAF_EXC_COUNT; exc++) {
-                ngx_conf_merge_uint_value(
-                    conf->exception[i][exc], prev->exception[i][exc],
-                    conf->exception[NGX_HTTP_WAF_PHASE_REQUEST][exc]);
-                if (conf->exception_response[i][exc].data == NULL) {
-                    conf->exception_response[i][exc] =
-                        (prev->exception_response[i][exc].data != NULL)
-                            ? prev->exception_response[i][exc]
-                            : conf->exception_response
-                                  [NGX_HTTP_WAF_PHASE_REQUEST][exc];
-                }
-            }
-        }
-        {
-            ngx_uint_t  obj;
-
-            for (obj = 0; obj < NGX_HTTP_WAF_OBJ_COUNT; obj++) {
-                ngx_conf_merge_uint_value(conf->send[i][obj],
-                                          prev->send[i][obj],
-                                          NGX_CONF_UNSET_UINT);
-            }
-        }
-
-        ngx_conf_merge_uint_value(
-            conf->deny_mode[i], prev->deny_mode[i],
-            conf->deny_mode[NGX_HTTP_WAF_PHASE_REQUEST]);
-        ngx_conf_merge_value(conf->score_deny[i], prev->score_deny[i],
-                             conf->score_deny[NGX_HTTP_WAF_PHASE_REQUEST]);
-        ngx_conf_merge_uint_value(conf->hold[i], prev->hold[i],
-                                  conf->hold[NGX_HTTP_WAF_PHASE_REQUEST]);
-        ngx_conf_merge_size_value(
-            conf->body_limit[i], prev->body_limit[i],
-            conf->body_limit[NGX_HTTP_WAF_PHASE_REQUEST]);
-        ngx_conf_merge_uint_value(
-            conf->body_limit_policy[i], prev->body_limit_policy[i],
-            conf->body_limit_policy[NGX_HTTP_WAF_PHASE_REQUEST]);
-
-        ngx_conf_merge_str_value(conf->score_deny_response[i],
-                                 prev->score_deny_response[i], "");
-
-        if (conf->score_deny_response[i].len == 0) {
-            conf->score_deny_response[i] =
-                conf->score_deny_response[NGX_HTTP_WAF_PHASE_REQUEST];
+    for (i = 0; i < NGX_HTTP_WAF_NPHASE; i++) {
+        for (obj = 0; obj < NGX_HTTP_WAF_OBJ_COUNT; obj++) {
+            ngx_conf_merge_uint_value(conf->send[i][obj], prev->send[i][obj],
+                                      NGX_CONF_UNSET_UINT);
         }
     }
 
@@ -486,8 +482,6 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
             conf->inspects[i] = prev->inspects[i];
         }
     }
-
-    ngx_memcpy(conf->profiles, prev->profiles, sizeof(conf->profiles));
 
     if (conf->local_rates == NULL) {
         conf->local_rates = prev->local_rates;
@@ -520,7 +514,7 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                                   prev->frame_cache_ttl[i], 0);
     }
 
-    rv = ngx_http_waf_check_body_limit(cf, conf);
+    rv = ngx_http_waf_check_body_limit(cf, conf, own_body_limit);
     if (rv != NGX_CONF_OK) {
         return rv;
     }
@@ -534,7 +528,7 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
         ngx_http_waf_merge_archive(&conf->shoot[i], &prev->shoot[i]);
 
-        rv = ngx_http_waf_merge_preview(cf, wmcf, conf, prev, i);
+        rv = ngx_http_waf_merge_preview(cf, conf, prev, i);
         if (rv != NGX_CONF_OK) {
             return rv;
         }
@@ -569,7 +563,7 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         return rv;
     }
 
-    rv = ngx_http_waf_check_send(cf, wmcf, conf);
+    rv = ngx_http_waf_check_send(cf, conf);
     if (rv != NGX_CONF_OK) {
         return rv;
     }
@@ -580,6 +574,110 @@ ngx_http_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     return ngx_http_waf_msg_req_validate(cf, wmcf, conf);
+}
+
+
+static void
+ngx_http_waf_merge_body_limit(ngx_http_waf_loc_conf_t *conf,
+    ngx_http_waf_loc_conf_t *prev)
+{
+    ngx_uint_t  req = NGX_HTTP_WAF_PHASE_REQUEST;
+
+    if (conf->named[req] & NGX_HTTP_WAF_NAMED_BODY_LIMIT) {
+        return;
+    }
+
+    if (prev->named[req] & NGX_HTTP_WAF_NAMED_BODY_LIMIT) {
+        conf->body_limit[req]        = prev->body_limit[req];
+        conf->body_limit_policy[req] = prev->body_limit_policy[req];
+        conf->named[req]            |= NGX_HTTP_WAF_NAMED_BODY_LIMIT;
+        return;
+    }
+
+    conf->body_limit[req]        = NGX_HTTP_WAF_DEFAULT_BODY_LIMIT;
+    conf->body_limit_policy[req] = NGX_HTTP_WAF_POLICY_BLOCK;
+}
+
+
+/*
+ * A phase value named on any level is inherited; a phase nobody named takes
+ * the request value of the same level.
+ */
+
+static void
+ngx_http_waf_merge_phase(ngx_http_waf_loc_conf_t *conf,
+    ngx_http_waf_loc_conf_t *prev, ngx_uint_t phase)
+{
+    ngx_uint_t                exc, src;
+    ngx_http_waf_loc_conf_t  *from;
+
+    if (ngx_http_waf_merge_from(conf, prev, phase,
+                                NGX_HTTP_WAF_NAMED_DEADLINE, &from, &src))
+    {
+        conf->deadline[phase] = from->deadline[src];
+    }
+
+    if (ngx_http_waf_merge_from(conf, prev, phase,
+                                NGX_HTTP_WAF_NAMED_DENY_MODE, &from, &src))
+    {
+        conf->deny_mode[phase] = from->deny_mode[src];
+    }
+
+    if (ngx_http_waf_merge_from(conf, prev, phase, NGX_HTTP_WAF_NAMED_HOLD,
+                                &from, &src))
+    {
+        conf->hold[phase] = from->hold[src];
+    }
+
+    if (ngx_http_waf_merge_from(conf, prev, phase,
+                                NGX_HTTP_WAF_NAMED_SCORE_DENY, &from, &src))
+    {
+        conf->score_deny[phase]          = from->score_deny[src];
+        conf->score_deny_response[phase] = from->score_deny_response[src];
+    }
+
+    if (ngx_http_waf_merge_from(conf, prev, phase,
+                                NGX_HTTP_WAF_NAMED_BODY_LIMIT, &from, &src))
+    {
+        conf->body_limit[phase]        = from->body_limit[src];
+        conf->body_limit_policy[phase] = from->body_limit_policy[src];
+    }
+
+    for (exc = 0; exc < NGX_HTTP_WAF_EXC_COUNT; exc++) {
+
+        if (ngx_http_waf_merge_from(conf, prev, phase,
+                                    NGX_HTTP_WAF_NAMED_EXCEPTION(exc),
+                                    &from, &src))
+        {
+            conf->exception[phase][exc] = from->exception[src][exc];
+            conf->exception_response[phase][exc] =
+                                          from->exception_response[src][exc];
+        }
+    }
+}
+
+
+static ngx_uint_t
+ngx_http_waf_merge_from(ngx_http_waf_loc_conf_t *conf,
+    ngx_http_waf_loc_conf_t *prev, ngx_uint_t phase, ngx_uint_t bit,
+    ngx_http_waf_loc_conf_t **from, ngx_uint_t *src)
+{
+    if (conf->named[phase] & bit) {
+        return 0;
+    }
+
+    if (prev->named[phase] & bit) {
+        conf->named[phase] |= bit;
+
+        *from = prev;
+        *src  = phase;
+
+    } else {
+        *from = conf;
+        *src  = NGX_HTTP_WAF_PHASE_REQUEST;
+    }
+
+    return 1;
 }
 
 
@@ -616,8 +714,7 @@ ngx_http_waf_send_of(ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t phase,
 
 
 static char *
-ngx_http_waf_check_send(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
-    ngx_http_waf_loc_conf_t *conf)
+ngx_http_waf_check_send(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf)
 {
     ngx_uint_t                  ph, obj;
     ngx_http_waf_shoot_conf_t  *sh;
@@ -645,10 +742,7 @@ ngx_http_waf_check_send(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
                 return NGX_CONF_ERROR;
             }
         }
-
     }
-
-    (void) wmcf;
 
     return NGX_CONF_OK;
 }
@@ -705,6 +799,19 @@ ngx_http_waf_check_scoring(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
         }
     }
 
+    if (conf->require_upgrade_response.len != 0
+        && ngx_http_waf_deny_response_find(wmcf,
+                                           &conf->require_upgrade_response)
+           == NULL)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: waf_require_upgrade response=%V: "
+                           "waf_deny_response \"%V\" is not declared",
+                           &conf->require_upgrade_response,
+                           &conf->require_upgrade_response);
+        return NGX_CONF_ERROR;
+    }
+
     if (ngx_http_waf_deny_response_find(wmcf, &conf->deny_response_default)
         == NULL)
     {
@@ -734,26 +841,39 @@ ngx_http_waf_check_scoring(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
 }
 
 
+/*
+ * A limit named here must fit client_max_body_size; the default is cut to it
+ * silently, and a limit named above is left to the smaller of the two.
+ */
+
 static char *
-ngx_http_waf_check_body_limit(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf)
+ngx_http_waf_check_body_limit(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
+    ngx_uint_t own)
 {
+    size_t                    *limit;
     ngx_http_core_loc_conf_t  *clcf;
 
-    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf  = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    limit = &conf->body_limit[NGX_HTTP_WAF_PHASE_REQUEST];
 
-    if (clcf->client_max_body_size <= 0) {
+    if (clcf->client_max_body_size <= 0
+        || (off_t) *limit <= clcf->client_max_body_size)
+    {
         return NGX_CONF_OK;
     }
 
-    if ((off_t) conf->body_limit[NGX_HTTP_WAF_PHASE_REQUEST]
-        > clcf->client_max_body_size)
-    {
+    if (own) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "waf: waf_body_limit request %uz exceeds "
                            "client_max_body_size %O",
-                           conf->body_limit[NGX_HTTP_WAF_PHASE_REQUEST],
-                           clcf->client_max_body_size);
+                           *limit, clcf->client_max_body_size);
         return NGX_CONF_ERROR;
+    }
+
+    if (!(conf->named[NGX_HTTP_WAF_PHASE_REQUEST]
+          & NGX_HTTP_WAF_NAMED_BODY_LIMIT))
+    {
+        *limit = (size_t) clcf->client_max_body_size;
     }
 
     return NGX_CONF_OK;
@@ -789,30 +909,21 @@ static char *
 ngx_http_waf_check_capture_limit(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
     ngx_uint_t phase)
 {
-    size_t                      ceiling, limit;
-    ngx_uint_t                  i;
+    ngx_uint_t                  i, bit;
     ngx_http_waf_shoot_conf_t  *sh = &conf->shoot[phase];
 
-    ceiling = ngx_http_waf_read_ceiling(cf, conf, phase);
-
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
+        bit = NGX_HTTP_WAF_OBJ_BIT(i);
 
-        if (!(sh->capture & NGX_HTTP_WAF_OBJ_BIT(i))) {
+        if (!(sh->capture & bit)) {
             continue;
         }
 
-        limit = sh->capture_limit[i];
-
-        if (limit == NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE) {
-            continue;
-        }
-
-        if (limit > ceiling) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: waf_capture %V %uz exceeds the %uz bytes "
-                               "this object the WAF reads at all; lower it or "
-                               "raise waf_body_limit / client_max_body_size",
-                               ngx_http_waf_obj_name(i), limit, ceiling);
+        if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_capture", i,
+                                            sh->capture_limit[i],
+                                            sh->capture_set & bit)
+            != NGX_CONF_OK)
+        {
             return NGX_CONF_ERROR;
         }
     }
@@ -821,13 +932,19 @@ ngx_http_waf_check_capture_limit(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
 }
 
 
+/*
+ * Only a size named on this level is held to the read ceiling; nothing past
+ * the ceiling is read, whatever an inherited size says.
+ */
+
 static char *
 ngx_http_waf_check_size_ceiling(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
-    ngx_uint_t phase, const char *dir, ngx_uint_t obj, size_t limit)
+    ngx_uint_t phase, const char *dir, ngx_uint_t obj, size_t limit,
+    ngx_uint_t named)
 {
     size_t  ceiling;
 
-    if (limit == NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE) {
+    if (!named || limit == 0) {
         return NGX_CONF_OK;
     }
 
@@ -835,10 +952,11 @@ ngx_http_waf_check_size_ceiling(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
 
     if (limit > ceiling) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "waf: %s %V %uz exceeds the %uz bytes "
-                           "this object the WAF reads at all; lower it or "
-                           "raise waf_body_limit / client_max_body_size",
-                           dir, ngx_http_waf_obj_name(obj), limit, ceiling);
+                           "waf: %s %V %V=%uz is over the %uz bytes the WAF "
+                           "reads of this object; lower it or raise "
+                           "waf_body_limit or client_max_body_size",
+                           dir, ngx_http_waf_phase_name(phase),
+                           ngx_http_waf_obj_name(obj), limit, ceiling);
         return NGX_CONF_ERROR;
     }
 
@@ -921,7 +1039,8 @@ ngx_http_waf_check_archive_sizes(ngx_conf_t *cf,
         }
 
         if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_archive", i,
-                                            sh->archive_limit[i])
+                                            sh->archive_limit[i],
+                                            sh->archive_set & bit)
             != NGX_CONF_OK)
         {
             return NGX_CONF_ERROR;
@@ -962,24 +1081,20 @@ static char *
 ngx_http_waf_check_preview_sizes(ngx_conf_t *cf,
     ngx_http_waf_loc_conf_t *conf, ngx_uint_t phase)
 {
-    ngx_uint_t                  i, bit, named, inspected;
+    ngx_uint_t                  i, inspected;
     ngx_http_waf_shoot_conf_t  *sh = &conf->shoot[phase];
 
     inspected = ngx_http_waf_phase_inspected(conf, phase);
-    named     = 0;
 
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-        bit = NGX_HTTP_WAF_OBJ_BIT(i);
 
         if (sh->preview[i] == 0) {
             continue;
         }
 
-        named |= bit;
-
         if (ngx_http_waf_phase_is_frame(phase)) {
 
-            if (inspected && !(sh->capture & bit)) {
+            if (inspected && !(sh->capture & NGX_HTTP_WAF_OBJ_BIT(i))) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "waf: waf_preview %V %V needs "
                                    "\"waf_capture %V %V\" on a side with "
@@ -988,13 +1103,6 @@ ngx_http_waf_check_preview_sizes(ngx_conf_t *cf,
                                    ngx_http_waf_obj_name(i),
                                    ngx_http_waf_phase_name(phase),
                                    ngx_http_waf_obj_name(i));
-                return NGX_CONF_ERROR;
-            }
-
-            if (ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_preview",
-                                                i, sh->preview[i])
-                != NGX_CONF_OK)
-            {
                 return NGX_CONF_ERROR;
             }
 
@@ -1010,71 +1118,6 @@ ngx_http_waf_check_preview_sizes(ngx_conf_t *cf,
             return NGX_CONF_ERROR;
         }
     }
-
-    (void) named;
-
-    return NGX_CONF_OK;
-}
-
-
-static size_t
-ngx_http_waf_preview_ceiling(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
-    ngx_uint_t phase, ngx_uint_t obj)
-{
-    off_t                       client_max;
-    ngx_http_core_srv_conf_t   *cscf;
-    ngx_http_core_loc_conf_t   *clcf;
-
-    cscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_core_module);
-
-    switch (obj) {
-
-    case NGX_HTTP_WAF_OBJ_HEADERS:
-        return cscf->large_client_header_buffers.num
-               * cscf->large_client_header_buffers.size;
-
-    case NGX_HTTP_WAF_OBJ_ARGS:
-        return cscf->large_client_header_buffers.size;
-
-    default:
-        clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-
-        if (phase != NGX_HTTP_WAF_PHASE_REQUEST) {
-            return conf->body_limit[phase];
-        }
-
-        client_max = clcf->client_max_body_size;
-
-        if (client_max <= 0 || (off_t) conf->body_limit[phase] < client_max) {
-            return conf->body_limit[phase];
-        }
-
-        return (size_t) client_max;
-    }
-}
-
-
-static char *
-ngx_http_waf_preview_budget(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
-    ngx_uint_t phase, ngx_uint_t obj, ngx_uint_t named)
-{
-    size_t   ceiling = ngx_http_waf_preview_ceiling(cf, conf, phase, obj);
-    size_t  *budget  = &conf->shoot[phase].preview[obj];
-
-    if (*budget <= ceiling) {
-        return NGX_CONF_OK;
-    }
-
-    if (named) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "waf: waf_preview %V %uz is over the %uz bytes of "
-                           "this object the WAF reads at all; lower it or "
-                           "raise the read limit",
-                           ngx_http_waf_obj_name(obj), *budget, ceiling);
-        return NGX_CONF_ERROR;
-    }
-
-    *budget = ceiling;
 
     return NGX_CONF_OK;
 }
@@ -1242,11 +1285,10 @@ ngx_http_waf_merge_archive(ngx_http_waf_shoot_conf_t *sh,
 
 
 static char *
-ngx_http_waf_merge_preview(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
-    ngx_http_waf_loc_conf_t *conf, ngx_http_waf_loc_conf_t *prev,
-    ngx_uint_t phase)
+ngx_http_waf_merge_preview(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *conf,
+    ngx_http_waf_loc_conf_t *prev, ngx_uint_t phase)
 {
-    size_t                      room;
+    size_t                      room, ceiling;
     char                       *rv;
     ngx_uint_t                  i, named[NGX_HTTP_WAF_OBJ_COUNT];
     ngx_http_waf_shoot_conf_t  *sh  = &conf->shoot[phase];
@@ -1273,8 +1315,17 @@ ngx_http_waf_merge_preview(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
 
     ngx_http_waf_merge_lists(sh, psh, NGX_HTTP_WAF_LIST_PREVIEW);
 
+    ceiling = ngx_http_waf_read_ceiling(cf, conf, phase);
+
     for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-        rv = ngx_http_waf_preview_budget(cf, conf, phase, i, named[i]);
+
+        if (!named[i]) {
+            sh->preview[i] = ngx_min(sh->preview[i], ceiling);
+            continue;
+        }
+
+        rv = ngx_http_waf_check_size_ceiling(cf, conf, phase, "waf_preview", i,
+                                             sh->preview[i], 1);
         if (rv != NGX_CONF_OK) {
             return rv;
         }
@@ -1285,13 +1336,11 @@ ngx_http_waf_merge_preview(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
     if (room > NGX_HTTP_WAF_PREVIEW_MAX) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "waf: previews add up to %uz bytes, over the %d "
-                           "bytes a single agent datagram leaves them; name "
-                           "the sizes explicitly", room,
+                           "bytes a single agent datagram leaves them; lower "
+                           "the preview sizes", room,
                            NGX_HTTP_WAF_PREVIEW_MAX);
         return NGX_CONF_ERROR;
     }
-
-    (void) wmcf;
 
     return NGX_CONF_OK;
 }

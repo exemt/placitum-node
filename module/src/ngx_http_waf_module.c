@@ -90,7 +90,7 @@ static ngx_command_t  ngx_http_waf_commands[] = {
       NULL },
 
     { ngx_string("waf_deadline"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE23,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
       ngx_http_waf_deadline,
       NGX_HTTP_LOC_CONF_OFFSET,
       0,
@@ -126,7 +126,7 @@ static ngx_command_t  ngx_http_waf_commands[] = {
       NULL },
 
     { ngx_string("waf_deny_response"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+      NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
       ngx_http_waf_deny_response,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
@@ -370,10 +370,6 @@ ngx_http_waf_postconfiguration(ngx_conf_t *cf)
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
     wmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_waf_module);
 
-    if (ngx_http_waf_body_validate_main(cf, wmcf) != NGX_CONF_OK) {
-        return NGX_ERROR;
-    }
-
     if (ngx_http_waf_check_resume_pairs(cf, wmcf) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -405,6 +401,12 @@ static ngx_int_t
 ngx_http_waf_init_worker(ngx_cycle_t *cycle)
 {
     ngx_http_waf_main_conf_t  *wmcf;
+
+    if (ngx_process != NGX_PROCESS_WORKER
+        && ngx_process != NGX_PROCESS_SINGLE)
+    {
+        return NGX_OK;
+    }
 
     wmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_waf_module);
 
@@ -456,6 +458,12 @@ static void
 ngx_http_waf_exit_worker(ngx_cycle_t *cycle)
 {
     ngx_http_waf_main_conf_t  *wmcf;
+
+    if (ngx_process != NGX_PROCESS_WORKER
+        && ngx_process != NGX_PROCESS_SINGLE)
+    {
+        return;
+    }
 
     wmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_waf_module);
 

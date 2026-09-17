@@ -873,16 +873,6 @@ ngx_http_waf_body_validate_phase(ngx_conf_t *cf,
 }
 
 
-char *
-ngx_http_waf_body_validate_main(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf)
-{
-    (void) cf;
-    (void) wmcf;
-
-    return NGX_CONF_OK;
-}
-
-
 static ngx_uint_t
 ngx_http_waf_body_route_mask(ngx_http_waf_loc_conf_t *wlcf, ngx_uint_t phase,
     ngx_http_waf_mask_t *mask)

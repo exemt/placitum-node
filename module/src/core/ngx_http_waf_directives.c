@@ -17,10 +17,12 @@ static ngx_int_t ngx_http_waf_opt_flags(ngx_conf_t *cf, ngx_http_waf_kw_t *kw,
     ngx_str_t *value, ngx_uint_t *out);
 static ngx_int_t ngx_http_waf_opt_fraction(ngx_conf_t *cf, ngx_str_t *value,
     ngx_uint_t scale, ngx_uint_t max, ngx_uint_t *out);
+static ngx_int_t ngx_http_waf_opt_msec(ngx_conf_t *cf, const char *what,
+    ngx_str_t *value, ngx_msec_t *out);
 static char *ngx_http_waf_preview_names(ngx_conf_t *cf, ngx_str_t *directive,
     ngx_str_t *spec, ngx_array_t **list, u_char all);
 static char *ngx_http_waf_preview_set(ngx_conf_t *cf,
-    ngx_http_waf_shoot_conf_t *sh, ngx_uint_t phases);
+    ngx_http_waf_shoot_conf_t *sh, ngx_uint_t phases, ngx_uint_t phase);
 static char *ngx_http_waf_preview_spec(ngx_conf_t *cf,
     ngx_http_waf_shoot_conf_t *sh, ngx_uint_t obj, ngx_str_t *spec);
 static void ngx_http_waf_capture_none(ngx_http_waf_shoot_conf_t *sh);
@@ -30,12 +32,16 @@ static void ngx_http_waf_archive_reset(ngx_http_waf_shoot_conf_t *sh);
 static char *ngx_http_waf_archive_apply(ngx_conf_t *cf,
     ngx_http_waf_shoot_conf_t *sh, ngx_uint_t mask, ngx_uint_t off,
     ngx_uint_t when, time_t ttl, size_t *limits);
-static ngx_int_t ngx_http_waf_obj_bit(ngx_str_t *name, ngx_uint_t *bit);
-static ngx_uint_t ngx_http_waf_bit_obj(ngx_uint_t bit);
 static ngx_int_t ngx_http_waf_arg_phase(ngx_conf_t *cf, ngx_str_t *arg,
     ngx_uint_t *phases);
 static char *ngx_http_waf_obj_in_phase(ngx_conf_t *cf, ngx_str_t *dir,
     ngx_uint_t phases, ngx_uint_t obj);
+static ngx_uint_t ngx_http_waf_shoot_named(ngx_http_waf_shoot_conf_t *sh,
+    ngx_uint_t kind);
+static ngx_uint_t ngx_http_waf_shoot_cleared(ngx_http_waf_shoot_conf_t *sh,
+    ngx_uint_t kind);
+static char *ngx_http_waf_none_mix(ngx_conf_t *cf, ngx_str_t *dir,
+    ngx_uint_t phase);
 
 
 static ngx_http_waf_kw_t  ngx_http_waf_kw_phase[] = {
@@ -214,7 +220,8 @@ ngx_http_waf_obj_list(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *wlcf,
 
     if (cf->args->nelts != 4
         || ngx_http_waf_split(&args[2], &name, &value) == NGX_OK
-        || ngx_http_waf_obj_bit(&args[2], &bit) != NGX_OK
+        || ngx_http_waf_kw_lookup(ngx_http_waf_kw_obj, &args[2], &bit)
+           != NGX_OK
         || ngx_http_waf_split(&args[3], &name, &value) != NGX_OK)
     {
         return NGX_DECLINED;
@@ -244,11 +251,12 @@ ngx_http_waf_obj_list(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *wlcf,
         return NGX_ERROR;
     }
 
-    obj = ngx_http_waf_bit_obj(bit);
+    obj = ngx_http_waf_lowest_bit(bit);
 
     if (ngx_http_waf_obj_in_phase(cf, &args[0], phases, obj) != NGX_CONF_OK) {
         return NGX_ERROR;
     }
+
     who = (kind == NGX_HTTP_WAF_LIST_CAPTURE) ? "waf_capture"
         : (kind == NGX_HTTP_WAF_LIST_ARCHIVE) ? "waf_archive"
         : "waf_preview";
@@ -266,6 +274,11 @@ ngx_http_waf_obj_list(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *wlcf,
             continue;
         }
 
+        if (ngx_http_waf_shoot_cleared(&wlcf->shoot[ph], kind)) {
+            (void) ngx_http_waf_none_mix(cf, &args[0], ph);
+            return NGX_ERROR;
+        }
+
         list = &wlcf->shoot[ph].lists[kind][obj][axis];
 
         if (ngx_http_waf_preview_names(cf, &args[0], &value, list, all)
@@ -280,51 +293,10 @@ ngx_http_waf_obj_list(ngx_conf_t *cf, ngx_http_waf_loc_conf_t *wlcf,
 
 
 static ngx_int_t
-ngx_http_waf_obj_bit(ngx_str_t *name, ngx_uint_t *bit)
-{
-    ngx_http_waf_kw_t  *kw;
-
-    for (kw = ngx_http_waf_kw_obj; kw->name.len != 0; kw++) {
-        if (kw->name.len == name->len
-            && ngx_strncmp(kw->name.data, name->data, name->len) == 0)
-        {
-            *bit = kw->value;
-            return NGX_OK;
-        }
-    }
-
-    return NGX_ERROR;
-}
-
-
-static ngx_uint_t
-ngx_http_waf_bit_obj(ngx_uint_t bit)
-{
-    ngx_uint_t  i;
-
-    for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
-        if (NGX_HTTP_WAF_OBJ_BIT(i) == bit) {
-            return i;
-        }
-    }
-
-    return NGX_HTTP_WAF_OBJ_COUNT;
-}
-
-
-static ngx_int_t
 ngx_http_waf_arg_phase(ngx_conf_t *cf, ngx_str_t *arg, ngx_uint_t *phases)
 {
-    ngx_http_waf_kw_t  *kw;
-
-    for (kw = ngx_http_waf_kw_phase; kw->name.len != 0; kw++) {
-        if (kw->name.len == arg->len
-            && ngx_strncmp(kw->name.data, arg->data, arg->len) == 0)
-        {
-            *phases = kw->value;
-
-            return NGX_OK;
-        }
+    if (ngx_http_waf_kw_lookup(ngx_http_waf_kw_phase, arg, phases) == NGX_OK) {
+        return NGX_OK;
     }
 
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -380,6 +352,78 @@ ngx_http_waf_obj_in_phase(ngx_conf_t *cf, ngx_str_t *dir, ngx_uint_t phases,
 }
 
 
+static ngx_uint_t
+ngx_http_waf_shoot_named(ngx_http_waf_shoot_conf_t *sh, ngx_uint_t kind)
+{
+    ngx_uint_t  obj, axis;
+
+    switch (kind) {
+
+    case NGX_HTTP_WAF_LIST_CAPTURE:
+        if (sh->capture_set != 0) {
+            return 1;
+        }
+
+        break;
+
+    case NGX_HTTP_WAF_LIST_ARCHIVE:
+        if (sh->archive_set != 0) {
+            return 1;
+        }
+
+        break;
+
+    default:
+        for (obj = 0; obj < NGX_HTTP_WAF_OBJ_COUNT; obj++) {
+            if (sh->preview[obj] != NGX_CONF_UNSET_SIZE) {
+                return 1;
+            }
+        }
+
+        break;
+    }
+
+    for (obj = 0; obj < NGX_HTTP_WAF_META_COUNT; obj++) {
+        for (axis = 0; axis < NGX_HTTP_WAF_AXIS_COUNT; axis++) {
+            if (sh->lists[kind][obj][axis] != NULL) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+static ngx_uint_t
+ngx_http_waf_shoot_cleared(ngx_http_waf_shoot_conf_t *sh, ngx_uint_t kind)
+{
+    switch (kind) {
+
+    case NGX_HTTP_WAF_LIST_CAPTURE:
+        return sh->capture_cleared;
+
+    case NGX_HTTP_WAF_LIST_ARCHIVE:
+        return sh->archive_cleared;
+
+    default:
+        return sh->preview_cleared;
+    }
+}
+
+
+static char *
+ngx_http_waf_none_mix(ngx_conf_t *cf, ngx_str_t *dir, ngx_uint_t phase)
+{
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "%V %V none cannot be combined with other %V %V "
+                       "lines on the same level",
+                       dir, ngx_http_waf_phase_name(phase),
+                       dir, ngx_http_waf_phase_name(phase));
+    return NGX_CONF_ERROR;
+}
+
+
 ngx_http_waf_inspector_t *
 ngx_http_waf_inspector_find(ngx_http_waf_main_conf_t *wmcf, ngx_str_t *name)
 {
@@ -431,12 +475,11 @@ ngx_http_waf_inspector(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_http_waf_main_conf_t  *wmcf = conf;
 
     ngx_str_t                 *args, name, value;
-    ngx_uint_t                 i, audit_set, profile_set;
+    ngx_uint_t                 i, audit_set, flag;
     ngx_http_waf_inspector_t  *insp;
 
-    args        = cf->args->elts;
-    audit_set   = 0;
-    profile_set = 0;
+    args      = cf->args->elts;
+    audit_set = 0;
 
     if (wmcf->inspectors.nelts >= NGX_HTTP_WAF_MAX_INSPECTORS) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -498,7 +541,6 @@ ngx_http_waf_inspector(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             insp->profile = value;
-            profile_set   = 1;
             continue;
         }
 
@@ -516,12 +558,27 @@ ngx_http_waf_inspector(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         if (name.len == 7 && ngx_strncmp(name.data, "breaker", 7) == 0) {
-            insp->breaker = (value.len == 2
-                             && ngx_strncmp(value.data, "on", 2) == 0);
+            if (ngx_http_waf_opt_keyword(cf, ngx_http_waf_kw_flag, &value,
+                                         &flag)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
+            insp->breaker = flag ? 1 : 0;
+            insp->breaker_named |= insp->breaker;
             continue;
         }
 
         if (name.len == 4 && ngx_strncmp(name.data, "vars", 4) == 0) {
+            if (value.len == 0) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "waf: empty vars= on inspector \"%V\"; "
+                                   "drop the option to send no fields",
+                                   &insp->name);
+                return NGX_CONF_ERROR;
+            }
+
             insp->vars_spec = value;
             continue;
         }
@@ -534,16 +591,32 @@ ngx_http_waf_inspector(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             {
                 return NGX_CONF_ERROR;
             }
+
+            insp->breaker_named = 1;
             continue;
         }
 
         if (name.len == 14 && ngx_strncmp(name.data, "breaker_window", 14) == 0) {
-            insp->breaker_window = ngx_parse_time(&value, 0);
+            if (ngx_http_waf_opt_msec(cf, "breaker_window", &value,
+                                      &insp->breaker_window)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
+            insp->breaker_named = 1;
             continue;
         }
 
         if (name.len == 13 && ngx_strncmp(name.data, "breaker_probe", 13) == 0) {
-            insp->breaker_probe = ngx_parse_time(&value, 0);
+            if (ngx_http_waf_opt_msec(cf, "breaker_probe", &value,
+                                      &insp->breaker_probe)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
+            insp->breaker_named = 1;
             continue;
         }
 
@@ -558,10 +631,6 @@ ngx_http_waf_inspector(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            "waf: inspector \"%V\" has no subject=",
                            &insp->name);
         return NGX_CONF_ERROR;
-    }
-
-    if (!profile_set) {
-        insp->profile = ngx_http_waf_profile_default;
     }
 
     if (!audit_set) {
@@ -669,14 +738,6 @@ ngx_http_waf_inspect(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
-        if (name.len == 5 && ngx_strncmp(name.data, "phase", 5) == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: phase= is gone; write the phase as the "
-                               "first word (waf_inspect request %V wave=0)",
-                               &b.name);
-            return NGX_CONF_ERROR;
-        }
-
         if (name.len == 4 && ngx_strncmp(name.data, "wave", 4) == 0) {
             wave = ngx_atoi(value.data, value.len);
             if (wave == NGX_ERROR || wave < 0
@@ -728,20 +789,6 @@ ngx_http_waf_inspect(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
             continue;
-        }
-
-        if (name.len == 4 && ngx_strncmp(name.data, "when", 4) == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: when= is gone; a call that waits to be "
-                               "switched on is mode=off");
-            return NGX_CONF_ERROR;
-        }
-
-        if (name.len == 7 && ngx_strncmp(name.data, "control", 7) == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf: control= is gone; any inspector asked on "
-                               "the route may change this call's mode");
-            return NGX_CONF_ERROR;
         }
 
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -1002,9 +1049,14 @@ ngx_http_waf_deny_response(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (name.len == 4 && ngx_strncmp(name.data, "code", 4) == 0) {
             n = ngx_atoi(value.data, value.len);
-            if (n == NGX_ERROR || n < 0) {
+            if (n == NGX_ERROR
+                || !((n >= 1000 && n <= 1003) || (n >= 1007 && n <= 1014)
+                     || (n >= 3000 && n <= 4999)))
+            {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "waf: invalid close code \"%V\"", &value);
+                                   "waf: invalid close code \"%V\", expected "
+                                   "1000-1003, 1007-1014 or 3000-4999",
+                                   &value);
                 return NGX_CONF_ERROR;
             }
 
@@ -1218,7 +1270,7 @@ ngx_http_waf_score_deny(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    ngx_str_null(&page);
+    ngx_str_set(&page, "");
 
     for (i = 3; i < cf->args->nelts; i++) {
 
@@ -1240,11 +1292,9 @@ ngx_http_waf_score_deny(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-        wlcf->score_deny[phase] = n;
-
-        if (page.len != 0) {
-            wlcf->score_deny_response[phase] = page;
-        }
+        wlcf->score_deny[phase]          = n;
+        wlcf->score_deny_response[phase] = page;
+        wlcf->named[phase]              |= NGX_HTTP_WAF_NAMED_SCORE_DENY;
     }
 
     return NGX_CONF_OK;
@@ -1312,7 +1362,7 @@ ngx_http_waf_exception(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    ngx_str_null(&page);
+    ngx_str_set(&page, "");
 
     for (i = first + 1; i < cf->args->nelts; i++) {
 
@@ -1371,11 +1421,9 @@ ngx_http_waf_exception(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
 
-            wlcf->exception[ph][exc] = policy;
-
-            if (page.len != 0) {
-                wlcf->exception_response[ph][exc] = page;
-            }
+            wlcf->exception[ph][exc]          = policy;
+            wlcf->exception_response[ph][exc] = page;
+            wlcf->named[ph] |= NGX_HTTP_WAF_NAMED_EXCEPTION(exc);
         }
     }
 
@@ -1413,14 +1461,16 @@ ngx_http_waf_send(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
-        if (ngx_http_waf_obj_bit(&name, &bit) != NGX_OK) {
+        if (ngx_http_waf_kw_lookup(ngx_http_waf_kw_obj, &name, &bit)
+            != NGX_OK)
+        {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "waf: unknown option \"%V\" in waf_send",
                                &name);
             return NGX_CONF_ERROR;
         }
 
-        obj = ngx_http_waf_bit_obj(bit);
+        obj = ngx_http_waf_lowest_bit(bit);
 
         if (ngx_http_waf_obj_in_phase(cf, &args[0], phases, obj)
             != NGX_CONF_OK)
@@ -1442,13 +1492,6 @@ ngx_http_waf_send(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         seen     |= bit;
         send[obj] = how;
-    }
-
-    if (seen == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "waf_send: nothing to set; write "
-                           "<object>=original|store after the phase");
-        return NGX_CONF_ERROR;
     }
 
     for (ph = 0; ph < NGX_HTTP_WAF_NPHASE; ph++) {
@@ -1509,6 +1552,7 @@ ngx_http_waf_phase_deny_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     for (phase = 0; phase < NGX_HTTP_WAF_NPHASE; phase++) {
         if (phases & NGX_HTTP_WAF_PH_BIT(phase)) {
             wlcf->deny_mode[phase] = mode;
+            wlcf->named[phase]    |= NGX_HTTP_WAF_NAMED_DENY_MODE;
         }
     }
 
@@ -1626,9 +1670,21 @@ ngx_http_waf_capture(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 }
 
                 for (ph = 0; ph < NGX_HTTP_WAF_NPHASE; ph++) {
-                    if (phases & NGX_HTTP_WAF_PH_BIT(ph)) {
-                        ngx_http_waf_capture_none(&wlcf->shoot[ph]);
+
+                    if (!(phases & NGX_HTTP_WAF_PH_BIT(ph))) {
+                        continue;
                     }
+
+                    sh = &wlcf->shoot[ph];
+
+                    if (!sh->capture_cleared
+                        && ngx_http_waf_shoot_named(sh,
+                                                    NGX_HTTP_WAF_LIST_CAPTURE))
+                    {
+                        return ngx_http_waf_none_mix(cf, &args[0], ph);
+                    }
+
+                    ngx_http_waf_capture_none(sh);
                 }
 
                 return NGX_CONF_OK;
@@ -1641,7 +1697,7 @@ ngx_http_waf_capture(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             if (ngx_http_waf_obj_in_phase(cf, &args[0], phases,
-                                          ngx_http_waf_bit_obj(bit))
+                                          ngx_http_waf_lowest_bit(bit))
                 != NGX_CONF_OK)
             {
                 return NGX_CONF_ERROR;
@@ -1668,7 +1724,9 @@ ngx_http_waf_capture(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
-        if (ngx_http_waf_obj_bit(&name, &bit) != NGX_OK) {
+        if (ngx_http_waf_kw_lookup(ngx_http_waf_kw_obj, &name, &bit)
+            != NGX_OK)
+        {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "waf: unknown option \"%V\" in waf_capture",
                                &name);
@@ -1676,7 +1734,7 @@ ngx_http_waf_capture(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         if (ngx_http_waf_obj_in_phase(cf, &args[0], phases,
-                                      ngx_http_waf_bit_obj(bit))
+                                      ngx_http_waf_lowest_bit(bit))
             != NGX_CONF_OK)
         {
             return NGX_CONF_ERROR;
@@ -1705,7 +1763,7 @@ ngx_http_waf_capture(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
-        obj = ngx_http_waf_bit_obj(bit);
+        obj = ngx_http_waf_lowest_bit(bit);
         mask |= bit;
         limits[obj] = (size_t) size;
     }
@@ -1724,6 +1782,10 @@ ngx_http_waf_capture(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         sh = &wlcf->shoot[ph];
+
+        if (sh->capture_cleared) {
+            return ngx_http_waf_none_mix(cf, &args[0], ph);
+        }
 
         if (sh->capture == NGX_CONF_UNSET_UINT) {
             sh->capture = 0;
@@ -1829,6 +1891,13 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                         continue;
                     }
 
+                    if (!wlcf->shoot[ph].archive_cleared
+                        && ngx_http_waf_shoot_named(&wlcf->shoot[ph],
+                                                    NGX_HTTP_WAF_LIST_ARCHIVE))
+                    {
+                        return ngx_http_waf_none_mix(cf, &args[0], ph);
+                    }
+
                     ngx_http_waf_archive_reset(&wlcf->shoot[ph]);
                     wlcf->shoot[ph].archive = 0;
                 }
@@ -1849,13 +1918,15 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
 
-            obj = ngx_http_waf_bit_obj(bit);
+            obj = ngx_http_waf_lowest_bit(bit);
             mask |= bit;
             limits[obj] = NGX_HTTP_WAF_ARCHIVE_LIMIT_WHOLE;
             continue;
         }
 
-        if (ngx_http_waf_obj_bit(&name, &bit) == NGX_OK) {
+        if (ngx_http_waf_kw_lookup(ngx_http_waf_kw_obj, &name, &bit)
+            == NGX_OK)
+        {
 
             if ((mask | off) & bit) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -1880,7 +1951,7 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 return NGX_CONF_ERROR;
             }
 
-            obj = ngx_http_waf_bit_obj(bit);
+            obj = ngx_http_waf_lowest_bit(bit);
             mask |= bit;
             limits[obj] = (size_t) size;
             continue;
@@ -1902,37 +1973,6 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (name.len == 4 && ngx_strncmp(name.data, "when", 4) == 0) {
 
-            ngx_str_t   word;
-            u_char     *p, *last;
-
-            p    = value.data;
-            last = value.data + value.len;
-
-            while (p < last) {
-                word.data = p;
-
-                while (p < last && *p != ',') {
-                    p++;
-                }
-
-                word.len = (size_t) (p - word.data);
-
-                if (p < last) {
-                    p++;
-                }
-
-                if ((word.len == 6 && ngx_strncmp(word.data, "always", 6) == 0)
-                    || (word.len == 8
-                        && ngx_strncmp(word.data, "redirect", 8) == 0))
-                {
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                       "waf_archive: when= accepts only allow "
-                                       "and deny; omit when= to archive every "
-                                       "outcome");
-                    return NGX_CONF_ERROR;
-                }
-            }
-
             when = 0;
 
             if (ngx_http_waf_opt_flags(cf, ngx_http_waf_kw_archive_when,
@@ -1949,14 +1989,6 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             continue;
-        }
-
-        if (name.len == 5 && ngx_strncmp(name.data, "limit", 5) == 0) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "waf_archive: limit= is gone; write the size on "
-                               "the object (body=8k), or omit it to archive "
-                               "the whole object");
-            return NGX_CONF_ERROR;
         }
 
         if (name.len == 6 && ngx_strncmp(name.data, "source", 6) == 0) {
@@ -1996,6 +2028,10 @@ ngx_http_waf_archive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (!(phases & NGX_HTTP_WAF_PH_BIT(ph))) {
             continue;
+        }
+
+        if (wlcf->shoot[ph].archive_cleared) {
+            return ngx_http_waf_none_mix(cf, &args[0], ph);
         }
 
         if (ngx_http_waf_archive_apply(cf, &wlcf->shoot[ph], mask, off, when,
@@ -2080,6 +2116,8 @@ ngx_http_waf_preview_spec(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
                            "level", ngx_http_waf_obj_name(obj));
         return NGX_CONF_ERROR;
     }
+
+    sh->preview_item[obj] = NGX_HTTP_WAF_PREVIEW_ITEM_NONE;
 
     if (spec->len == 4 && ngx_strncmp(spec->data, "none", 4) == 0) {
         sh->preview[obj] = 0;
@@ -2173,8 +2211,9 @@ ngx_http_waf_preview_names(ngx_conf_t *cf, ngx_str_t *directive,
         || (spec->len == 4 && ngx_strncmp(spec->data, "none", 4) == 0))
     {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "%V: \"%V\" means an empty section here; say "
-                           "\"off\" instead", directive, spec);
+                           "%V: \"%V\" is not a list of names; allow= takes "
+                           "names or *, mask= and deny= take names or none",
+                           directive, spec);
         return NGX_CONF_ERROR;
     }
 
@@ -2272,7 +2311,7 @@ ngx_http_waf_preview(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-        if (ngx_http_waf_preview_set(cf, &wlcf->shoot[ph], phases)
+        if (ngx_http_waf_preview_set(cf, &wlcf->shoot[ph], phases, ph)
             != NGX_CONF_OK)
         {
             return NGX_CONF_ERROR;
@@ -2285,7 +2324,7 @@ ngx_http_waf_preview(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 static char *
 ngx_http_waf_preview_set(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
-    ngx_uint_t phases)
+    ngx_uint_t phases, ngx_uint_t phase)
 {
     ngx_str_t  *args, name, value;
     ngx_uint_t  i, bit, obj, named, source;
@@ -2298,13 +2337,25 @@ ngx_http_waf_preview_set(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
         && args[2].len == 4
         && ngx_strncmp(args[2].data, "none", 4) == 0)
     {
+        if (!sh->preview_cleared
+            && ngx_http_waf_shoot_named(sh, NGX_HTTP_WAF_LIST_PREVIEW))
+        {
+            return ngx_http_waf_none_mix(cf, &args[0], phase);
+        }
+
+        sh->preview_cleared = 1;
+
         for (i = 0; i < NGX_HTTP_WAF_OBJ_COUNT; i++) {
             sh->preview[i]        = 0;
-            sh->preview_item[i]   = NGX_CONF_UNSET_SIZE;
+            sh->preview_item[i]   = NGX_HTTP_WAF_PREVIEW_ITEM_NONE;
             sh->preview_source[i] = NGX_CONF_UNSET_UINT;
         }
 
         return NGX_CONF_OK;
+    }
+
+    if (sh->preview_cleared) {
+        return ngx_http_waf_none_mix(cf, &args[0], phase);
     }
 
     for (i = 2; i < cf->args->nelts; i++) {
@@ -2312,13 +2363,14 @@ ngx_http_waf_preview_set(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
         if (ngx_http_waf_split(&args[i], &name, &value) != NGX_OK) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "waf_preview: write the size on the object "
-                               "(headers=64k or headers=64k/2k); omitting it "
-                               "is no longer allowed");
+                               "(headers=64k or headers=64k/2k)");
             return NGX_CONF_ERROR;
         }
 
-        if (ngx_http_waf_obj_bit(&name, &bit) == NGX_OK) {
-            obj = ngx_http_waf_bit_obj(bit);
+        if (ngx_http_waf_kw_lookup(ngx_http_waf_kw_obj, &name, &bit)
+            == NGX_OK)
+        {
+            obj = ngx_http_waf_lowest_bit(bit);
 
             if (ngx_http_waf_obj_in_phase(cf, &args[0], phases, obj)
                 != NGX_CONF_OK)
@@ -2408,8 +2460,6 @@ ngx_http_waf_preview_set(ngx_conf_t *cf, ngx_http_waf_shoot_conf_t *sh,
 
     sh->preview_source[NGX_HTTP_WAF_OBJ_BODY] = source;
 
-    (void) phases;
-
     return NGX_CONF_OK;
 }
 
@@ -2461,7 +2511,8 @@ ngx_http_waf_hold(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     for (phase = 0; phase < NGX_HTTP_WAF_NPHASE; phase++) {
         if (phases & NGX_HTTP_WAF_PH_BIT(phase)) {
-            wlcf->hold[phase] = hold;
+            wlcf->hold[phase]   = hold;
+            wlcf->named[phase] |= NGX_HTTP_WAF_NAMED_HOLD;
         }
     }
 
@@ -2498,18 +2549,11 @@ ngx_http_waf_deadline(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    if (cf->args->nelts > 3) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "%V: \"%V\" is not a budget; the policy moved to "
-                           "\"waf_exception %V timeout pass|deny\"",
-                           &args[0], &args[3], &args[1]);
-        return NGX_CONF_ERROR;
-    }
-
     for (phase = 0; phase < NGX_HTTP_WAF_NPHASE; phase++) {
 
         if (phases & NGX_HTTP_WAF_PH_BIT(phase)) {
             wlcf->deadline[phase] = msec;
+            wlcf->named[phase]   |= NGX_HTTP_WAF_NAMED_DEADLINE;
         }
     }
 
@@ -2524,7 +2568,7 @@ ngx_http_waf_body_limit(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     ssize_t      size;
     ngx_str_t   *args = cf->args->elts;
-    ngx_uint_t   phase, phases, policy, policy_set;
+    ngx_uint_t   phase, phases, policy;
 
     if (ngx_http_waf_arg_phase(cf, &args[1], &phases) != NGX_OK) {
         return NGX_CONF_ERROR;
@@ -2546,18 +2590,14 @@ ngx_http_waf_body_limit(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    policy     = NGX_CONF_UNSET_UINT;
-    policy_set = 0;
+    policy = NGX_HTTP_WAF_POLICY_BLOCK;
 
-    if (cf->args->nelts > 3) {
-
-        if (ngx_http_waf_opt_keyword(cf, ngx_http_waf_kw_body_policy, &args[3],
-                                     &policy) != NGX_OK)
-        {
-            return NGX_CONF_ERROR;
-        }
-
-        policy_set = 1;
+    if (cf->args->nelts > 3
+        && ngx_http_waf_opt_keyword(cf, ngx_http_waf_kw_body_policy, &args[3],
+                                    &policy)
+           != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
     }
 
     for (phase = 0; phase < NGX_HTTP_WAF_NPHASE; phase++) {
@@ -2566,11 +2606,9 @@ ngx_http_waf_body_limit(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-        wlcf->body_limit[phase] = (size_t) size;
-
-        if (policy_set) {
-            wlcf->body_limit_policy[phase] = policy;
-        }
+        wlcf->body_limit[phase]        = (size_t) size;
+        wlcf->body_limit_policy[phase] = policy;
+        wlcf->named[phase]            |= NGX_HTTP_WAF_NAMED_BODY_LIMIT;
     }
 
     return NGX_CONF_OK;
@@ -2933,25 +2971,45 @@ ngx_http_waf_bus(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (name.len == 15
             && ngx_strncmp(name.data, "connect_timeout", 15) == 0)
         {
-            wmcf->bus_connect_timeout = ngx_parse_time(&value, 0);
+            if (ngx_http_waf_opt_msec(cf, "connect_timeout", &value,
+                                      &wmcf->bus_connect_timeout)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
             continue;
         }
 
         if (name.len == 14
             && ngx_strncmp(name.data, "reconnect_wait", 14) == 0)
         {
-            wmcf->bus_reconnect_wait = ngx_parse_time(&value, 0);
+            if (ngx_http_waf_opt_msec(cf, "reconnect_wait", &value,
+                                      &wmcf->bus_reconnect_wait)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
             continue;
         }
 
         if (name.len == 13 && ngx_strncmp(name.data, "ping_interval", 13) == 0) {
-            wmcf->bus_ping_interval = ngx_parse_time(&value, 0);
+            if (ngx_http_waf_opt_msec(cf, "ping_interval", &value,
+                                      &wmcf->bus_ping_interval)
+                != NGX_OK)
+            {
+                return NGX_CONF_ERROR;
+            }
+
             continue;
         }
 
         if (name.len == 11 && ngx_strncmp(name.data, "pending_max", 11) == 0) {
             wmcf->bus_pending_max = ngx_parse_size(&value);
-            if (wmcf->bus_pending_max == (size_t) NGX_ERROR) {
+            if (wmcf->bus_pending_max == (size_t) NGX_ERROR
+                || wmcf->bus_pending_max == 0)
+            {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "waf: invalid pending_max \"%V\"", &value);
                 return NGX_CONF_ERROR;
@@ -3116,11 +3174,12 @@ ngx_http_waf_opt_fraction(ngx_conf_t *cf, ngx_str_t *value, ngx_uint_t scale,
 {
     u_char      c;
     size_t      i;
-    ngx_uint_t  whole, frac, div;
+    ngx_uint_t  whole, frac, div, digits;
 
-    whole = 0;
-    frac  = 0;
-    div   = 1;
+    whole  = 0;
+    frac   = 0;
+    div    = 1;
+    digits = 0;
 
     for (i = 0; i < value->len; i++) {
         c = value->data[i];
@@ -3134,6 +3193,7 @@ ngx_http_waf_opt_fraction(ngx_conf_t *cf, ngx_str_t *value, ngx_uint_t scale,
             goto invalid;
         }
 
+        digits++;
         whole = whole * 10 + (ngx_uint_t) (c - '0');
 
         if (whole > max) {
@@ -3148,12 +3208,18 @@ ngx_http_waf_opt_fraction(ngx_conf_t *cf, ngx_str_t *value, ngx_uint_t scale,
             goto invalid;
         }
 
+        digits++;
+
         if (div * 10 > scale) {
             continue;
         }
 
         frac = frac * 10 + (ngx_uint_t) (c - '0');
         div *= 10;
+    }
+
+    if (digits == 0) {
+        goto invalid;
     }
 
     *out = whole * scale + frac * (scale / div);
@@ -3170,6 +3236,27 @@ invalid:
                        "waf: invalid fractional value \"%V\"", value);
 
     return NGX_ERROR;
+}
+
+
+static ngx_int_t
+ngx_http_waf_opt_msec(ngx_conf_t *cf, const char *what, ngx_str_t *value,
+    ngx_msec_t *out)
+{
+    ngx_int_t  n;
+
+    n = ngx_parse_time(value, 0);
+
+    if (n == NGX_ERROR || n == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: invalid %s \"%V\", expected a time above "
+                           "zero", what, value);
+        return NGX_ERROR;
+    }
+
+    *out = (ngx_msec_t) n;
+
+    return NGX_OK;
 }
 
 
@@ -3201,6 +3288,8 @@ ngx_http_waf_require_upgrade(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            &args[1]);
         return NGX_CONF_ERROR;
     }
+
+    ngx_str_set(&wlcf->require_upgrade_response, "");
 
     for (i = 2; i < cf->args->nelts; i++) {
 
@@ -3303,6 +3392,8 @@ ngx_http_waf_audit_frames(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    wlcf->audit_frames_sample = 1;
+
     for (i = 2; i < cf->args->nelts; i++) {
 
         if (ngx_http_waf_split(&args[i], &name, &value) != NGX_OK
@@ -3404,10 +3495,9 @@ ngx_http_waf_frame_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_waf_loc_conf_t  *wlcf = conf;
 
-    ngx_str_t                 *args, name, value;
-    ngx_int_t                  ttl;
-    ngx_uint_t                 i, ph, phases;
-    ngx_http_waf_main_conf_t  *wmcf;
+    ngx_str_t   *args, name, value;
+    ngx_int_t    ttl;
+    ngx_uint_t   i, ph, phases;
 
     args = cf->args->elts;
 
@@ -3497,9 +3587,6 @@ ngx_http_waf_frame_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         wlcf->frame_cache_ttl[ph] = (ngx_msec_t) ttl;
     }
-
-    wmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_waf_module);
-    wmcf->frame_cache_used = 1;
 
     ngx_http_waf_fcache_want(1);
 

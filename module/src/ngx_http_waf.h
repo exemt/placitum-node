@@ -265,6 +265,7 @@ typedef struct {
     ngx_uint_t                 index;
 
     unsigned                   breaker:1;
+    unsigned                   breaker_named:1;
 
     ngx_uint_t                 breaker_threshold;
     ngx_msec_t                 breaker_window;
@@ -972,8 +973,6 @@ typedef struct {
     ngx_shm_zone_t            *shm_zone;
     ngx_str_t                  shm_name;
 
-    unsigned                   frame_cache_used:1;
-
     ngx_array_t               *datasets;
 
     ngx_http_waf_body_store_t *body_store;
@@ -1026,12 +1025,20 @@ typedef struct {
     ngx_uint_t                 preview_source[NGX_HTTP_WAF_OBJ_COUNT];
 
     size_t                     preview_item[NGX_HTTP_WAF_OBJ_COUNT];
+    ngx_uint_t                 preview_cleared;
 
     ngx_array_t               *lists[NGX_HTTP_WAF_LIST_COUNT]
                                     [NGX_HTTP_WAF_META_COUNT]
                                     [NGX_HTTP_WAF_AXIS_COUNT];
 } ngx_http_waf_shoot_conf_t;
 
+
+#define NGX_HTTP_WAF_NAMED_DEADLINE        0x0001
+#define NGX_HTTP_WAF_NAMED_DENY_MODE       0x0002
+#define NGX_HTTP_WAF_NAMED_HOLD            0x0004
+#define NGX_HTTP_WAF_NAMED_SCORE_DENY      0x0008
+#define NGX_HTTP_WAF_NAMED_BODY_LIMIT      0x0010
+#define NGX_HTTP_WAF_NAMED_EXCEPTION(exc)  (0x0100u << (exc))
 
 typedef struct {
     ngx_flag_t                 enable;
@@ -1044,6 +1051,8 @@ typedef struct {
     ngx_array_t               *waves[NGX_HTTP_WAF_NPHASE];
 
     ngx_str_t                  profiles[NGX_HTTP_WAF_MAX_INSPECTORS];
+
+    ngx_uint_t                 named[NGX_HTTP_WAF_NPHASE];
 
     ngx_msec_t                 deadline[NGX_HTTP_WAF_NPHASE];
 

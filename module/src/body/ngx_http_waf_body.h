@@ -119,9 +119,6 @@ ngx_int_t  ngx_http_waf_sets_get(ngx_str_t *key, off_t max, ngx_pool_t *pool,
 char *ngx_http_waf_body_validate(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
     ngx_http_waf_loc_conf_t *wlcf);
 
-char *ngx_http_waf_body_validate_main(ngx_conf_t *cf,
-    ngx_http_waf_main_conf_t *wmcf);
-
 
 ngx_int_t  ngx_http_waf_body_init_worker(ngx_cycle_t *cycle);
 void       ngx_http_waf_body_exit_worker(ngx_cycle_t *cycle);
