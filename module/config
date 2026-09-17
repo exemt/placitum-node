@@ -46,19 +46,11 @@ WAF_DEPS=" \
     $ngx_addon_dir/src/runtime/ngx_http_waf_preview.h \
 "
 
-if test -n "$ngx_module_link"; then
-    ngx_module_type=HTTP
-    ngx_module_name=$ngx_addon_name
-    ngx_module_srcs="$WAF_SRCS"
-    ngx_module_deps="$WAF_DEPS"
-    ngx_module_incs="$ngx_addon_dir/src"
-    ngx_module_libs=
+ngx_module_type=HTTP
+ngx_module_name=$ngx_addon_name
+ngx_module_srcs="$WAF_SRCS"
+ngx_module_deps="$WAF_DEPS"
+ngx_module_incs="$ngx_addon_dir/src"
+ngx_module_libs=
 
-    . auto/module
-else
-    # nginx older than 1.9.11 has no dynamic module support; static link only.
-    HTTP_MODULES="$HTTP_MODULES $ngx_addon_name"
-    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $WAF_SRCS"
-    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $WAF_DEPS"
-    CFLAGS="$CFLAGS -I$ngx_addon_dir/src"
-fi
+. auto/module
