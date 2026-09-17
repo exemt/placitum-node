@@ -754,6 +754,7 @@ typedef struct {
     ngx_http_waf_reply_t      *replies;
     ngx_http_waf_mask_t        got;
     ngx_http_waf_mask_t        published;
+    ngx_http_waf_mask_t        personal;
     ngx_http_waf_mask_t        skipped;
 
     ngx_http_waf_mask_t        controlled;
@@ -1305,10 +1306,6 @@ ngx_http_waf_control_t  *ngx_http_waf_frame_control(ngx_http_waf_ctx_t *ctx);
 
 ngx_int_t  ngx_http_waf_audit_ovr_apply(ngx_http_waf_ctx_t *ctx,
                ngx_http_waf_action_t *a);
-
-ngx_http_waf_audit_ovr_t  *ngx_http_waf_frame_audit_ovr(
-               ngx_http_waf_ctx_t *ctx);
-
 
 void       ngx_http_waf_resolve_verdict(ngx_http_waf_ctx_t *ctx);
 ngx_str_t *ngx_http_waf_verdict_name(ngx_uint_t verdict);

@@ -12,6 +12,7 @@
 #define NGX_HTTP_WAF_NATS_MAX_PING     2
 #define NGX_HTTP_WAF_NATS_IN_SLACK     4096
 #define NGX_HTTP_WAF_NATS_OUT_INITIAL  (32 * 1024)
+#define NGX_HTTP_WAF_NATS_LINE_MAX     4096
 
 
 typedef enum {
@@ -62,8 +63,6 @@ static void      ngx_http_waf_nats_exit_worker(ngx_http_waf_bus_t *bus,
     ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_waf_nats_publish(ngx_http_waf_bus_t *bus,
     ngx_http_waf_bus_msg_t *msg, ngx_uint_t *status);
-static void      ngx_http_waf_nats_cancel(ngx_http_waf_bus_t *bus,
-    uint64_t rid);
 static ngx_int_t ngx_http_waf_nats_publish_audit(ngx_http_waf_bus_t *bus,
     ngx_str_t *subject, ngx_str_t *payload);
 static ngx_int_t ngx_http_waf_nats_request(ngx_http_waf_bus_t *bus,
@@ -90,6 +89,8 @@ static void      ngx_http_waf_nats_deliver(ngx_http_waf_nats_t *nats,
 static ngx_int_t ngx_http_waf_nats_handshake(ngx_http_waf_nats_t *nats);
 static ngx_int_t ngx_http_waf_nats_hello_build(ngx_http_waf_nats_t *nats,
     ngx_cycle_t *cycle);
+static ngx_int_t ngx_http_waf_nats_pub(ngx_http_waf_nats_t *nats,
+    ngx_str_t *subject, ngx_str_t *reply, ngx_str_t *payload);
 
 static u_char   *ngx_http_waf_nats_token(u_char **pos, u_char *last,
     size_t *len);
@@ -110,7 +111,6 @@ ngx_http_waf_bus_nats_create(ngx_conf_t *cf)
     bus->init_worker   = ngx_http_waf_nats_init_worker;
     bus->exit_worker   = ngx_http_waf_nats_exit_worker;
     bus->publish       = ngx_http_waf_nats_publish;
-    bus->cancel        = ngx_http_waf_nats_cancel;
     bus->publish_audit = ngx_http_waf_nats_publish_audit;
     bus->request       = ngx_http_waf_nats_request;
     bus->connected     = ngx_http_waf_nats_connected;
@@ -358,6 +358,7 @@ ngx_http_waf_nats_line(ngx_http_waf_nats_t *nats, u_char *line, size_t len)
 
     if (len >= 4 && ngx_strncmp(line, "PONG", 4) == 0) {
         nats->pings = 0;
+        ngx_http_waf_link_up(&nats->link);
         return NGX_OK;
     }
 
@@ -600,8 +601,8 @@ ngx_http_waf_nats_deliver(ngx_http_waf_nats_t *nats, u_char *msg, size_t len)
             && nats->msg_hdr >= 12
             && ngx_strncmp(msg, "NATS/1.0 503", 12) == 0)
         {
-            ngx_http_waf_bus_absent(nats->msg_rid, nats->msg_index,
-                                    NGX_HTTP_WAF_BUS_NO_RESPONDER);
+            ngx_http_waf_bus_absent(nats->bus, nats->msg_rid,
+                                    nats->msg_index);
             return;
         }
 
@@ -733,9 +734,11 @@ static ngx_int_t
 ngx_http_waf_nats_publish(ngx_http_waf_bus_t *bus, ngx_http_waf_bus_msg_t *msg,
     ngx_uint_t *status)
 {
-    u_char                head[NGX_INT64_LEN * 2 + 128];
     u_char                hex[NGX_HTTP_WAF_RID_HEX_LEN];
-    u_char               *p;
+    u_char                buf[sizeof(NGX_HTTP_WAF_BUS_TOKEN_V ".") - 1
+                              + NGX_HTTP_WAF_RID_HEX_LEN + 1 + NGX_INT_T_LEN];
+    ngx_int_t             rc;
+    ngx_str_t             reply;
     ngx_http_waf_nats_t  *nats = bus->data;
 
     *status = NGX_HTTP_WAF_BUS_OK;
@@ -752,33 +755,21 @@ ngx_http_waf_nats_publish(ngx_http_waf_bus_t *bus, ngx_http_waf_bus_msg_t *msg,
 
     ngx_http_waf_rid_hex(msg->rid, hex);
 
-    p = ngx_slprintf(head, head + sizeof(head),
-                     "PUB %V %V." NGX_HTTP_WAF_BUS_TOKEN_V ".%*s.%02xi %uz\r\n",
-                     &msg->subject, &nats->bus->inbox,
-                     (size_t) NGX_HTTP_WAF_RID_HEX_LEN, hex,
-                     msg->inspector, msg->payload.len);
+    reply.data = buf;
+    reply.len  = (size_t) (ngx_sprintf(buf, NGX_HTTP_WAF_BUS_TOKEN_V ".%*s.%02xi",
+                                       (size_t) NGX_HTTP_WAF_RID_HEX_LEN, hex,
+                                       msg->inspector)
+                           - buf);
 
-    if (ngx_http_waf_link_reserve(&nats->link,
-                                  (size_t) (p - head) + msg->payload.len + 2)
-        != NGX_OK)
-    {
-        *status = NGX_HTTP_WAF_BUS_OVERFLOW;
+    rc = ngx_http_waf_nats_pub(nats, &msg->subject, &reply, &msg->payload);
+
+    if (rc != NGX_OK) {
+        *status = (rc == NGX_DECLINED) ? NGX_HTTP_WAF_BUS_TOO_LARGE
+                                       : NGX_HTTP_WAF_BUS_OVERFLOW;
         return NGX_ERROR;
     }
 
-    (void) ngx_http_waf_link_out(&nats->link, head, (size_t) (p - head));
-    (void) ngx_http_waf_link_out(&nats->link, msg->payload.data, msg->payload.len);
-    (void) ngx_http_waf_link_out(&nats->link, (u_char *) "\r\n", 2);
-
-    ngx_http_waf_link_flush(&nats->link);
-
     return NGX_OK;
-}
-
-
-static void
-ngx_http_waf_nats_cancel(ngx_http_waf_bus_t *bus, uint64_t rid)
-{
 }
 
 
@@ -786,29 +777,15 @@ static ngx_int_t
 ngx_http_waf_nats_publish_audit(ngx_http_waf_bus_t *bus, ngx_str_t *subject,
     ngx_str_t *payload)
 {
-    u_char                head[256];
-    u_char               *p;
     ngx_http_waf_nats_t  *nats = bus->data;
 
     if (nats == NULL || !nats->link.ready) {
         return NGX_ERROR;
     }
 
-    p = ngx_slprintf(head, head + sizeof(head), "PUB %V %uz\r\n",
-                     subject, payload->len);
-
-    if (ngx_http_waf_link_reserve(&nats->link,
-                                  (size_t) (p - head) + payload->len + 2)
-        != NGX_OK)
-    {
+    if (ngx_http_waf_nats_pub(nats, subject, NULL, payload) != NGX_OK) {
         return NGX_ERROR;
     }
-
-    (void) ngx_http_waf_link_out(&nats->link, head, (size_t) (p - head));
-    (void) ngx_http_waf_link_out(&nats->link, payload->data, payload->len);
-    (void) ngx_http_waf_link_out(&nats->link, (u_char *) "\r\n", 2);
-
-    ngx_http_waf_link_flush(&nats->link);
 
     return NGX_OK;
 }
@@ -818,44 +795,68 @@ static ngx_int_t
 ngx_http_waf_nats_request(ngx_http_waf_bus_t *bus, ngx_str_t *subject,
     ngx_str_t *reply_suffix, ngx_str_t *payload)
 {
-    u_char                head[1024];
-    u_char               *p, *last;
     ngx_http_waf_nats_t  *nats = bus->data;
 
     if (nats == NULL || !nats->link.ready) {
         return NGX_ERROR;
     }
 
-    last = head + sizeof(head);
-
-    if (reply_suffix == NULL) {
-        p = ngx_slprintf(head, last, "PUB %V %uz\r\n", subject, payload->len);
-
-    } else {
-        p = ngx_slprintf(head, last, "PUB %V %V.%V %uz\r\n", subject,
-                         &nats->bus->inbox, reply_suffix, payload->len);
-    }
-
-    if (p == last) {
-        return NGX_ERROR;
-    }
-
-    if (ngx_http_waf_link_reserve(&nats->link,
-                                  (size_t) (p - head) + payload->len + 2)
+    if (ngx_http_waf_nats_pub(nats, subject, reply_suffix, payload)
         != NGX_OK)
     {
         return NGX_ERROR;
     }
 
-    (void) ngx_http_waf_link_out(&nats->link, head, (size_t) (p - head));
+    return NGX_OK;
+}
 
-    if (payload->len != 0) {
-        (void) ngx_http_waf_link_out(&nats->link, payload->data, payload->len);
+
+static ngx_int_t
+ngx_http_waf_nats_pub(ngx_http_waf_nats_t *nats, ngx_str_t *subject,
+    ngx_str_t *reply, ngx_str_t *payload)
+{
+    u_char               *p, *last;
+    size_t                len;
+    ngx_http_waf_link_t  *link = &nats->link;
+
+    len = sizeof("PUB  \r\n") - 1 + subject->len + NGX_SIZE_T_LEN;
+
+    if (reply != NULL) {
+        len += sizeof(" .") - 1 + nats->bus->inbox.len + reply->len;
     }
 
-    (void) ngx_http_waf_link_out(&nats->link, (u_char *) "\r\n", 2);
+    if (len > NGX_HTTP_WAF_NATS_LINE_MAX) {
+        ngx_log_error(NGX_LOG_ERR, nats->log, 0,
+                      "waf: bus subject \"%*s\" is too long to publish",
+                      ngx_min(subject->len, 128), subject->data);
+        return NGX_DECLINED;
+    }
 
-    ngx_http_waf_link_flush(&nats->link);
+    if (ngx_http_waf_link_reserve(link, len + payload->len + 2) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    p    = link->out + link->out_last;
+    last = p + len;
+
+    if (reply != NULL) {
+        p = ngx_slprintf(p, last, "PUB %V %V.%V %uz\r\n", subject,
+                         &nats->bus->inbox, reply, payload->len);
+
+    } else {
+        p = ngx_slprintf(p, last, "PUB %V %uz\r\n", subject, payload->len);
+    }
+
+    if (payload->len != 0) {
+        p = ngx_cpymem(p, payload->data, payload->len);
+    }
+
+    *p++ = CR;
+    *p++ = LF;
+
+    link->out_last = (size_t) (p - link->out);
+
+    ngx_http_waf_link_flush(link);
 
     return NGX_OK;
 }

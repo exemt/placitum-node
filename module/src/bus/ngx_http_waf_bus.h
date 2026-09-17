@@ -10,7 +10,6 @@ typedef struct ngx_http_waf_bus_s  ngx_http_waf_bus_t;
 
 typedef enum {
     NGX_HTTP_WAF_BUS_OK           = 0,
-    NGX_HTTP_WAF_BUS_NO_RESPONDER = 1,
     NGX_HTTP_WAF_BUS_UNAVAILABLE  = 2,
     NGX_HTTP_WAF_BUS_OVERFLOW     = 3,
     NGX_HTTP_WAF_BUS_TOO_LARGE    = 4
@@ -23,7 +22,6 @@ typedef struct {
 
     uint64_t                    rid;
     ngx_uint_t                  inspector;
-    ngx_msec_t                  timeout;
 } ngx_http_waf_bus_msg_t;
 
 
@@ -49,8 +47,6 @@ struct ngx_http_waf_bus_s {
                                     ngx_http_waf_bus_msg_t *msg,
                                     ngx_uint_t *status);
 
-    void                      (*cancel)(ngx_http_waf_bus_t *bus, uint64_t rid);
-
     ngx_int_t                 (*publish_audit)(ngx_http_waf_bus_t *bus,
                                     ngx_str_t *subject, ngx_str_t *payload);
 
@@ -72,8 +68,8 @@ ngx_int_t  ngx_http_waf_bus_publish_wave(ngx_http_waf_ctx_t *ctx,
 void       ngx_http_waf_bus_dispatch(ngx_http_waf_bus_t *bus, uint64_t rid,
                ngx_uint_t inspector, ngx_str_t *payload);
 
-void       ngx_http_waf_bus_absent(uint64_t rid, ngx_uint_t inspector,
-               ngx_uint_t status);
+void       ngx_http_waf_bus_absent(ngx_http_waf_bus_t *bus, uint64_t rid,
+               ngx_uint_t inspector);
 
 ngx_int_t  ngx_http_waf_bus_inbox_build(ngx_http_waf_bus_t *bus,
                ngx_cycle_t *cycle, ngx_str_t *node_id);

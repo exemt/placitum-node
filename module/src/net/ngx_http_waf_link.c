@@ -16,6 +16,9 @@ ngx_http_waf_link_init(ngx_http_waf_link_t *link,
     link->data = data;
     link->log  = cycle->log;
 
+    link->quiet = *cycle->log;
+    link->quiet.log_level = NGX_LOG_CRIT;
+
     link->in_size = conf->in_size;
 
     link->in = ngx_palloc(cycle->pool, link->in_size);
@@ -72,25 +75,30 @@ ngx_http_waf_link_connect(ngx_http_waf_link_t *link)
     link->peer.socklen   = addrs[link->next_server].socklen;
     link->peer.name      = &addrs[link->next_server].name;
     link->peer.get       = ngx_event_get_peer;
-    link->peer.log       = link->log;
-    link->peer.log_error = NGX_ERROR_ERR;
+    link->peer.log       = link->failures ? &link->quiet : link->log;
+    link->peer.log_error = link->failures ? NGX_ERROR_INFO : NGX_ERROR_ERR;
 
     link->next_server++;
 
     rc = ngx_event_connect_peer(&link->peer);
 
+    link->peer.log = link->log;
+
     if (rc == NGX_ERROR || rc == NGX_DECLINED) {
-        ngx_log_error(NGX_LOG_ERR, link->log, 0,
+        ngx_log_error(ngx_http_waf_link_level(link, NGX_LOG_ERR), link->log, 0,
                       "waf: %s connect to \"%V\" failed",
                       conf->name, link->peer.name);
 
         link->peer.connection = NULL;
-        ngx_http_waf_link_reschedule(link);
+        ngx_http_waf_link_drop(link);
         return;
     }
 
     c = link->peer.connection;
 
+    c->log            = link->log;
+    c->read->log      = link->log;
+    c->write->log     = link->log;
     c->data           = link;
     c->read->handler  = ngx_http_waf_link_read_handler;
     c->write->handler = ngx_http_waf_link_write_handler;
@@ -100,6 +108,7 @@ ngx_http_waf_link_connect(ngx_http_waf_link_t *link)
     link->out_pos    = 0;
     link->out_last   = 0;
     link->ready      = 0;
+    link->up         = 0;
     link->connecting = 1;
 
     ngx_add_timer(c->write, conf->connect_timeout);
@@ -129,6 +138,7 @@ ngx_http_waf_link_close(ngx_http_waf_link_t *link)
     }
 
     link->connecting = 0;
+    link->up         = 0;
 }
 
 
@@ -146,8 +156,44 @@ ngx_http_waf_link_reschedule(ngx_http_waf_link_t *link)
 void
 ngx_http_waf_link_drop(ngx_http_waf_link_t *link)
 {
+    ngx_uint_t  up;
+
+    up = link->up;
+
     ngx_http_waf_link_close(link);
+
+    if (!up && link->failures++ == 0) {
+        ngx_log_error(NGX_LOG_WARN, link->log, 0,
+                      "waf: %s at \"%V\" is down, retrying every %M ms; "
+                      "repeated failures are logged at info level",
+                      link->conf->name, link->peer.name,
+                      link->conf->reconnect_wait);
+    }
+
     ngx_http_waf_link_reschedule(link);
+}
+
+
+void
+ngx_http_waf_link_up(ngx_http_waf_link_t *link)
+{
+    if (link->up) {
+        return;
+    }
+
+    link->up = 1;
+
+    if (link->peer.connection != NULL) {
+        link->peer.connection->log_error = NGX_ERROR_ERR;
+    }
+
+    if (link->failures != 0) {
+        ngx_log_error(NGX_LOG_NOTICE, link->log, 0,
+                      "waf: %s at \"%V\" is up after %ui failed attempts",
+                      link->conf->name, link->peer.name, link->failures);
+
+        link->failures = 0;
+    }
 }
 
 
@@ -177,7 +223,7 @@ ngx_http_waf_link_write_handler(ngx_event_t *wev)
     ngx_http_waf_link_conf_t  *conf = link->conf;
 
     if (wev->timedout) {
-        ngx_log_error(NGX_LOG_ERR, link->log, 0,
+        ngx_log_error(ngx_http_waf_link_level(link, NGX_LOG_ERR), link->log, 0,
                       "waf: %s connect to \"%V\" timed out",
                       conf->name, link->peer.name);
 
@@ -200,9 +246,9 @@ ngx_http_waf_link_write_handler(ngx_event_t *wev)
             ngx_del_timer(wev);
         }
 
-        ngx_log_error(NGX_LOG_NOTICE, link->log, 0,
-                      "waf: %s connected to \"%V\"", conf->name,
-                      link->peer.name);
+        ngx_log_error(ngx_http_waf_link_level(link, NGX_LOG_NOTICE),
+                      link->log, 0, "waf: %s connected to \"%V\"",
+                      conf->name, link->peer.name);
 
         if (conf->on_connected && conf->on_connected(link) != NGX_OK) {
             ngx_http_waf_link_drop(link);
@@ -223,6 +269,7 @@ static void
 ngx_http_waf_link_read_handler(ngx_event_t *rev)
 {
     ssize_t                    n;
+    ngx_int_t                  rc;
     ngx_connection_t          *c = rev->data;
     ngx_http_waf_link_t       *link = c->data;
     ngx_http_waf_link_conf_t  *conf = link->conf;
@@ -232,7 +279,8 @@ ngx_http_waf_link_read_handler(ngx_event_t *rev)
         if (link->in_last == link->in_size) {
 
             if (link->in_pos == 0) {
-                ngx_log_error(NGX_LOG_ERR, link->log, 0,
+                ngx_log_error(ngx_http_waf_link_level(link, NGX_LOG_ERR),
+                              link->log, 0,
                               "waf: %s message exceeds the %uz byte input "
                               "buffer", conf->name, link->in_size);
 
@@ -254,8 +302,9 @@ ngx_http_waf_link_read_handler(ngx_event_t *rev)
         }
 
         if (n == 0) {
-            ngx_log_error(NGX_LOG_ERR, link->log, 0,
-                          "waf: %s closed the connection", conf->name);
+            ngx_log_error(ngx_http_waf_link_level(link, NGX_LOG_ERR),
+                          link->log, 0, "waf: %s closed the connection",
+                          conf->name);
 
             ngx_http_waf_link_drop(link);
             return;
@@ -268,7 +317,13 @@ ngx_http_waf_link_read_handler(ngx_event_t *rev)
 
         link->in_last += (size_t) n;
 
-        if (conf->on_read(link) != NGX_OK) {
+        rc = conf->on_read(link);
+
+        if (link->peer.connection != c) {
+            return;
+        }
+
+        if (rc != NGX_OK) {
             ngx_http_waf_link_drop(link);
             return;
         }

@@ -51,9 +51,17 @@ struct ngx_http_waf_link_s {
 
     ngx_event_t                reconnect;
 
+    ngx_log_t                  quiet;
+    ngx_uint_t                 failures;
+
     unsigned                   ready:1;
     unsigned                   connecting:1;
+    unsigned                   up:1;
 };
+
+
+#define ngx_http_waf_link_level(link, level)                                  \
+    ((link)->failures != 0 ? NGX_LOG_INFO : (level))
 
 
 ngx_int_t  ngx_http_waf_link_init(ngx_http_waf_link_t *link,
@@ -62,6 +70,8 @@ ngx_int_t  ngx_http_waf_link_init(ngx_http_waf_link_t *link,
 void       ngx_http_waf_link_connect(ngx_http_waf_link_t *link);
 
 void       ngx_http_waf_link_drop(ngx_http_waf_link_t *link);
+
+void       ngx_http_waf_link_up(ngx_http_waf_link_t *link);
 
 void       ngx_http_waf_link_stop(ngx_http_waf_link_t *link);
 

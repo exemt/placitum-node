@@ -24,7 +24,6 @@ ngx_http_waf_bus_publish_wave(ngx_http_waf_ctx_t *ctx,
     ngx_http_waf_bus_t        *bus;
     ngx_http_waf_bus_msg_t     msg;
     ngx_http_waf_wave_t       *w;
-    ngx_http_waf_binding_t    *bind;
     ngx_http_waf_inspector_t  *inspectors;
     ngx_http_waf_loc_conf_t   *wlcf;
     ngx_http_waf_main_conf_t  *wmcf;
@@ -86,8 +85,6 @@ ngx_http_waf_bus_publish_wave(ngx_http_waf_ctx_t *ctx,
         msg.subject   = inspectors[index].subject;
 
         wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
-        bind = ngx_http_waf_binding_find(wlcf, index, ctx->phase);
-        msg.timeout = (bind != NULL) ? bind->timeout : 0;
 
         personal = ngx_http_waf_resume_subject(ctx, index);
 
@@ -112,42 +109,16 @@ ngx_http_waf_bus_publish_wave(ngx_http_waf_ctx_t *ctx,
         }
 
         if (bus->publish(bus, &msg, &status) != NGX_OK) {
-            if (status == NGX_HTTP_WAF_BUS_NO_RESPONDER && personal != NULL
-                && bind != NULL && bind->resume == NGX_HTTP_WAF_RESUME_PREFER)
-            {
-                ngx_log_error(NGX_LOG_INFO, ctx->request->connection->log, 0,
-                              "waf: continuation on \"%V\" is gone, asking "
-                              "the group, rid %*s", &msg.subject,
-                              (size_t) NGX_HTTP_WAF_RID_HEX_LEN, ctx->rid_hex);
-
-                ngx_http_waf_resume_forget(ctx, index);
-
-                msg.subject = inspectors[index].subject;
-
-                if (ngx_http_waf_msg_request(ctx, index, &msg.payload)
-                    != NGX_OK)
-                {
-                    return NGX_ERROR;
-                }
-
-                if (bus->publish(bus, &msg, &status) == NGX_OK) {
-                    published++;
-                    continue;
-                }
-            }
-
             ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
                           "waf: publish to \"%V\" failed, status %ui, rid %*s",
                           &msg.subject, status,
                           (size_t) NGX_HTTP_WAF_RID_HEX_LEN, ctx->rid_hex);
 
-            if (status == NGX_HTTP_WAF_BUS_NO_RESPONDER) {
-                ngx_http_waf_skip(slot, index,
-                                  NGX_HTTP_WAF_CODE_FAIL_ABSENT);
-                continue;
-            }
-
             return NGX_ERROR;
+        }
+
+        if (personal != NULL) {
+            ctx->ph->personal |= bit;
         }
 
         published++;
@@ -164,9 +135,18 @@ ngx_http_waf_bus_publish_wave(ngx_http_waf_ctx_t *ctx,
 
 
 void
-ngx_http_waf_bus_absent(uint64_t rid, ngx_uint_t inspector, ngx_uint_t status)
+ngx_http_waf_bus_absent(ngx_http_waf_bus_t *bus, uint64_t rid,
+    ngx_uint_t inspector)
 {
-    ngx_http_waf_slot_t  *slot;
+    uint64_t                   bit;
+    ngx_uint_t                 status;
+    ngx_http_waf_ctx_t        *ctx;
+    ngx_http_waf_slot_t       *slot;
+    ngx_http_waf_bus_msg_t     msg;
+    ngx_http_waf_binding_t    *bind;
+    ngx_http_waf_inspector_t  *insp;
+    ngx_http_waf_loc_conf_t   *wlcf;
+    ngx_http_waf_main_conf_t  *wmcf;
 
     slot = ngx_http_waf_slot_lookup(rid);
 
@@ -174,10 +154,60 @@ ngx_http_waf_bus_absent(uint64_t rid, ngx_uint_t inspector, ngx_uint_t status)
         return;
     }
 
-    ngx_http_waf_skip(slot, inspector,
-                      (status == NGX_HTTP_WAF_BUS_NO_RESPONDER)
-                          ? NGX_HTTP_WAF_CODE_FAIL_ABSENT
-                          : NGX_HTTP_WAF_CODE_FAIL_BUS);
+    ctx  = slot->ctx;
+    wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
+
+    if (inspector >= wmcf->inspectors.nelts) {
+        return;
+    }
+
+    bit = 1ULL << inspector;
+
+    /* personal accumulates across waves of the phase; got tells whether this
+     * inspector has already been resolved (in any wave), so a late or repeated
+     * 503 does not re-ask the group. */
+    if (!(ctx->ph->personal & bit) || (ctx->ph->got & bit)) {
+        ngx_http_waf_skip(slot, inspector, NGX_HTTP_WAF_CODE_FAIL_ABSENT);
+        return;
+    }
+
+    ctx->ph->personal &= ~bit;
+
+    wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
+    bind = ngx_http_waf_binding_find(wlcf, inspector, ctx->phase);
+
+    if (bind == NULL || bind->resume != NGX_HTTP_WAF_RESUME_PREFER) {
+        ngx_http_waf_skip(slot, inspector, NGX_HTTP_WAF_CODE_FAIL_ABSENT);
+        return;
+    }
+
+    insp = wmcf->inspectors.elts;
+    insp = &insp[inspector];
+
+    ngx_log_error(NGX_LOG_INFO, ctx->request->connection->log, 0,
+                  "waf: continuation of \"%V\" has no responders, asking "
+                  "\"%V\", rid %*s", &insp->name, &insp->subject,
+                  (size_t) NGX_HTTP_WAF_RID_HEX_LEN, ctx->rid_hex);
+
+    ngx_memzero(&msg, sizeof(ngx_http_waf_bus_msg_t));
+
+    msg.rid       = ctx->rid;
+    msg.inspector = inspector;
+    msg.subject   = insp->subject;
+
+    if (ngx_http_waf_msg_request(ctx, inspector, &msg.payload) != NGX_OK) {
+        ngx_http_waf_skip(slot, inspector, NGX_HTTP_WAF_CODE_FAIL_BUS);
+        return;
+    }
+
+    if (bus->publish(bus, &msg, &status) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
+                      "waf: publish to \"%V\" failed, status %ui, rid %*s",
+                      &msg.subject, status,
+                      (size_t) NGX_HTTP_WAF_RID_HEX_LEN, ctx->rid_hex);
+
+        ngx_http_waf_skip(slot, inspector, NGX_HTTP_WAF_CODE_FAIL_BUS);
+    }
 }
 
 
@@ -185,10 +215,11 @@ void
 ngx_http_waf_bus_dispatch(ngx_http_waf_bus_t *bus, uint64_t rid,
     ngx_uint_t inspector, ngx_str_t *payload)
 {
-    ngx_str_t              err;
-    ngx_http_waf_ctx_t    *ctx;
-    ngx_http_waf_slot_t   *slot;
-    ngx_http_waf_reply_t   reply;
+    ngx_str_t                  err;
+    ngx_http_waf_ctx_t        *ctx;
+    ngx_http_waf_slot_t       *slot;
+    ngx_http_waf_reply_t       reply;
+    ngx_http_waf_main_conf_t  *wmcf;
 
     slot = ngx_http_waf_slot_lookup(rid);
 
@@ -198,7 +229,15 @@ ngx_http_waf_bus_dispatch(ngx_http_waf_bus_t *bus, uint64_t rid,
         return;
     }
 
-    ctx = slot->ctx;
+    ctx  = slot->ctx;
+    wmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_waf_module);
+
+    if (inspector >= wmcf->inspectors.nelts) {
+        ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
+                      "waf: reply for unknown inspector %ui dropped",
+                      inspector);
+        return;
+    }
 
     ngx_memzero(&reply, sizeof(ngx_http_waf_reply_t));
     ngx_str_null(&err);

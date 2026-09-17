@@ -59,7 +59,6 @@ typedef struct {
     unsigned                   fin:1;
     unsigned                   masked:1;
     unsigned                   rsv_warned:1;
-    unsigned                   peer_close:1;
 
     uint64_t                   held_seq;
     ngx_uint_t                 fragments;
@@ -835,10 +834,9 @@ ngx_http_waf_frame_parse(ngx_http_waf_frame_t *fc, ngx_http_waf_frame_dir_t *d)
 
             d->seq++;
 
-            if (opcode == NGX_HTTP_WAF_WS_OP_CLOSE) {
-                d->peer_close = 1;
-
-            } else if (!ngx_http_waf_frame_ctrl_allowed(fc, d)) {
+            if (opcode != NGX_HTTP_WAF_WS_OP_CLOSE
+                && !ngx_http_waf_frame_ctrl_allowed(fc, d))
+            {
                 ngx_http_waf_frame_cut(d, p, hlen + (size_t) plen);
                 continue;
             }
@@ -1306,19 +1304,6 @@ ngx_http_waf_frame_control(ngx_http_waf_ctx_t *ctx)
     }
 
     return fc->conn_ctl;
-}
-
-
-ngx_http_waf_audit_ovr_t *
-ngx_http_waf_frame_audit_ovr(ngx_http_waf_ctx_t *ctx)
-{
-    ngx_http_waf_frame_t  *fc = ctx->frame;
-
-    if (fc == NULL || fc->cur == NULL) {
-        return NULL;
-    }
-
-    return &fc->conn_audit;
 }
 
 
