@@ -43,6 +43,9 @@ ngx_http_waf_operand_compile(ngx_conf_t *cf, ngx_str_t *token,
 
     op->text   = *token;
     op->object = NGX_HTTP_WAF_SEL_VAR;
+    op->binary = (token->len == sizeof("$binary_remote_addr") - 1
+                  && ngx_strncmp(token->data, "$binary_remote_addr",
+                                 token->len) == 0);
 
     if (token->len > 5 && ngx_strncmp(token->data, "$waf_", 5) == 0
         && ngx_strlchr(token->data, token->data + token->len, '.') != NULL
@@ -582,7 +585,7 @@ ngx_http_waf_operand_hit(ngx_http_waf_ctx_t *ctx, ngx_http_waf_operand_t *op,
             return NGX_DECLINED;
         }
 
-        if (ngx_http_waf_dataset_hit(ds, &value)) {
+        if (ngx_http_waf_dataset_hit(ds, &value, op->binary)) {
             *matched = value;
             return NGX_OK;
         }
@@ -607,7 +610,7 @@ ngx_http_waf_operand_hit(ngx_http_waf_ctx_t *ctx, ngx_http_waf_operand_t *op,
             continue;
         }
 
-        if (ngx_http_waf_dataset_hit(ds, &pair[i].value)) {
+        if (ngx_http_waf_dataset_hit(ds, &pair[i].value, 0)) {
             *matched = pair[i].value;
             return NGX_OK;
         }

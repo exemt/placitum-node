@@ -4,6 +4,8 @@
 
 #define NGX_HTTP_WAF_RATE_KEY_MAX   255
 
+#define NGX_HTTP_WAF_RATE_EVICT     16
+
 
 typedef struct {
     u_char             color;
@@ -11,6 +13,7 @@ typedef struct {
     ngx_queue_t        queue;
     ngx_msec_t         last;
     ngx_uint_t         excess;
+    ngx_uint_t         rate;
     uint32_t           sig;
     u_char             data[1];
 } ngx_http_waf_rate_node_t;
@@ -23,16 +26,21 @@ typedef enum {
 } ngx_http_waf_rate_mode_e;
 
 
-static ngx_int_t ngx_http_waf_rate_account(ngx_http_waf_shm_t *shm,
+static ngx_int_t ngx_http_waf_rate_account(ngx_http_waf_shm_conf_t *scf,
     ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, ngx_uint_t mode,
     ngx_uint_t *excess);
 static ngx_http_waf_rate_node_t *ngx_http_waf_rate_lookup(
     ngx_http_waf_shm_t *shm, ngx_http_waf_rate_rule_t *rule, ngx_str_t *key,
     uint32_t hash);
-static ngx_int_t ngx_http_waf_rate_insert(ngx_http_waf_shm_t *shm,
+static ngx_int_t ngx_http_waf_rate_insert(ngx_http_waf_shm_conf_t *scf,
     ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, uint32_t hash,
     ngx_uint_t excess);
 static void ngx_http_waf_rate_expire(ngx_http_waf_shm_t *shm, ngx_uint_t force);
+static void ngx_http_waf_rate_free(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_rate_node_t *rn);
+static size_t ngx_http_waf_rate_charge(size_t len);
+static ngx_msec_int_t ngx_http_waf_rate_elapsed(ngx_msec_t now,
+    ngx_msec_t last);
 static ngx_int_t ngx_http_waf_rate_key(ngx_http_waf_ctx_t *ctx,
     ngx_http_waf_rate_rule_t *rule, ngx_str_t *raw, ngx_str_t *key,
     u_char *hex);
@@ -46,6 +54,7 @@ ngx_http_waf_local_rate(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_waf_loc_conf_t  *wlcf = conf;
 
+    uint32_t                            sig;
     ngx_str_t                          *args, name, value, list_name;
     ngx_uint_t                          i;
     ngx_http_waf_rate_rule_t           *rule;
@@ -336,13 +345,15 @@ ngx_http_waf_local_rate(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    rule->sig = ngx_crc32_long(rule->key.text.data, rule->key.text.len);
-    rule->sig = ngx_murmur_hash2((u_char *) &rule->rate, sizeof(ngx_uint_t))
-                    ^ rule->sig
-                    ^ ngx_murmur_hash2((u_char *) &rule->burst,
-                                       sizeof(ngx_uint_t))
-                    ^ (uint32_t) rule->count
-                    ^ ((uint32_t) rule->hash << 8);
+    ngx_crc32_init(sig);
+    ngx_crc32_update(&sig, (u_char *) &rule->rate, sizeof(rule->rate));
+    ngx_crc32_update(&sig, (u_char *) &rule->burst, sizeof(rule->burst));
+    ngx_crc32_update(&sig, (u_char *) &rule->count, sizeof(rule->count));
+    ngx_crc32_update(&sig, (u_char *) &rule->hash, sizeof(rule->hash));
+    ngx_crc32_update(&sig, rule->key.text.data, rule->key.text.len);
+    ngx_crc32_final(sig);
+
+    rule->sig = sig;
 
     return NGX_CONF_OK;
 }
@@ -355,8 +366,8 @@ ngx_http_waf_rate_check(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule_name,
     u_char                    hex[NGX_HTTP_WAF_MD5_HEX_LEN];
     ngx_str_t                 raw, key;
     ngx_uint_t                i, excess, frame;
-    ngx_http_waf_shm_t       *shm;
     ngx_http_waf_loc_conf_t  *wlcf;
+    ngx_http_waf_shm_conf_t  *scf;
     ngx_http_waf_rate_rule_t *rules;
 
     wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
@@ -365,9 +376,9 @@ ngx_http_waf_rate_check(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule_name,
         return NGX_OK;
     }
 
-    shm = ngx_http_waf_shm();
+    scf = ngx_http_waf_shm_conf();
 
-    if (shm == NULL) {
+    if (scf == NULL || scf->shm == NULL) {
         return NGX_OK;
     }
 
@@ -389,7 +400,7 @@ ngx_http_waf_rate_check(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule_name,
             continue;
         }
 
-        if (ngx_http_waf_rate_account(shm, &rules[i], &key,
+        if (ngx_http_waf_rate_account(scf, &rules[i], &key,
                                       rules[i].count
                                           == NGX_HTTP_WAF_RATE_WAVES
                                               ? NGX_HTTP_WAF_RATE_PEEK
@@ -414,6 +425,7 @@ ngx_http_waf_rate_check(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule_name,
 
             if (rules[i].list != NULL) {
                 (void) ngx_http_waf_dataset_put(ctx, rules[i].list, &raw,
+                                                rules[i].key.binary,
                                                 rules[i].list_ttl,
                                                 &ngx_http_waf_rate_rule_name);
 
@@ -434,8 +446,8 @@ ngx_http_waf_rate_charge_wave(ngx_http_waf_ctx_t *ctx)
     u_char                     hex[NGX_HTTP_WAF_MD5_HEX_LEN];
     ngx_str_t                  raw, key;
     ngx_uint_t                 i, excess;
-    ngx_http_waf_shm_t        *shm;
     ngx_http_waf_loc_conf_t   *wlcf;
+    ngx_http_waf_shm_conf_t   *scf;
     ngx_http_waf_rate_rule_t  *rules;
 
     wlcf = ngx_http_get_module_loc_conf(ctx->request, ngx_http_waf_module);
@@ -444,9 +456,9 @@ ngx_http_waf_rate_charge_wave(ngx_http_waf_ctx_t *ctx)
         return;
     }
 
-    shm = ngx_http_waf_shm();
+    scf = ngx_http_waf_shm_conf();
 
-    if (shm == NULL) {
+    if (scf == NULL || scf->shm == NULL) {
         return;
     }
 
@@ -466,7 +478,7 @@ ngx_http_waf_rate_charge_wave(ngx_http_waf_ctx_t *ctx)
             continue;
         }
 
-        (void) ngx_http_waf_rate_account(shm, &rules[i], &key,
+        (void) ngx_http_waf_rate_account(scf, &rules[i], &key,
                                          NGX_HTTP_WAF_RATE_DEBT, &excess);
     }
 }
@@ -505,16 +517,39 @@ ngx_http_waf_rate_key(ngx_http_waf_ctx_t *ctx, ngx_http_waf_rate_rule_t *rule,
 }
 
 
+static ngx_msec_int_t
+ngx_http_waf_rate_elapsed(ngx_msec_t now, ngx_msec_t last)
+{
+    ngx_msec_int_t  ms;
+
+    /* another worker may have stored a fresher cached time */
+
+    ms = (ngx_msec_int_t) (now - last);
+
+    if (ms < -60000) {
+        ms = 1;
+
+    } else if (ms < 0) {
+        ms = 0;
+    }
+
+    return ms;
+}
+
+
 static ngx_int_t
-ngx_http_waf_rate_account(ngx_http_waf_shm_t *shm,
+ngx_http_waf_rate_account(ngx_http_waf_shm_conf_t *scf,
     ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, ngx_uint_t mode,
     ngx_uint_t *excess)
 {
     uint32_t                   hash;
-    ngx_int_t                  ms, value, decayed, limit;
+    ngx_int_t                  value, limit;
     ngx_msec_t                 now;
+    ngx_msec_int_t             ms;
+    ngx_http_waf_shm_t        *shm;
     ngx_http_waf_rate_node_t  *rn;
 
+    shm  = scf->shm;
     hash = ngx_crc32_short(key->data, key->len) ^ rule->sig;
     now  = ngx_current_msec;
 
@@ -526,7 +561,7 @@ ngx_http_waf_rate_account(ngx_http_waf_shm_t *shm,
         *excess = 0;
 
         if (mode != NGX_HTTP_WAF_RATE_PEEK) {
-            (void) ngx_http_waf_rate_insert(shm, rule, key, hash,
+            (void) ngx_http_waf_rate_insert(scf, rule, key, hash,
                                             mode == NGX_HTTP_WAF_RATE_DEBT
                                                 ? 1000 : 0);
         }
@@ -536,24 +571,33 @@ ngx_http_waf_rate_account(ngx_http_waf_shm_t *shm,
         return NGX_OK;
     }
 
-    ms      = (ngx_int_t) (now - rn->last);
-    decayed = (ngx_int_t) rn->excess - (ngx_int_t) rule->rate * ms / 1000;
-
-    if (decayed < 0) {
-        decayed = 0;
-    }
-
-    value   = decayed
-              + (ngx_int_t) (mode == NGX_HTTP_WAF_RATE_PEEK ? 0 : 1000);
-    *excess = (ngx_uint_t) value;
-
-    rn->last = now;
-
     ngx_queue_remove(&rn->queue);
     ngx_queue_insert_head(&shm->rate_lru, &rn->queue);
 
+    ms = ngx_http_waf_rate_elapsed(now, rn->last);
+
+    value = (ngx_int_t) rn->excess
+            - (ngx_int_t) (rule->rate * (ngx_uint_t) ms / 1000)
+            + (mode == NGX_HTTP_WAF_RATE_PEEK ? 0 : 1000);
+
+    if (value < 0) {
+        value = 0;
+    }
+
+    *excess = (ngx_uint_t) value;
+
+    if (mode == NGX_HTTP_WAF_RATE_PEEK) {
+        ngx_shmtx_unlock(&shm->shpool->mutex);
+
+        return (value <= (ngx_int_t) rule->burst) ? NGX_OK : NGX_DECLINED;
+    }
+
     if (value <= (ngx_int_t) rule->burst) {
         rn->excess = (ngx_uint_t) value;
+
+        if (ms) {
+            rn->last = now;
+        }
 
         ngx_shmtx_unlock(&shm->shpool->mutex);
 
@@ -565,8 +609,9 @@ ngx_http_waf_rate_account(ngx_http_waf_shm_t *shm,
 
         rn->excess = (ngx_uint_t) (value > limit ? limit : value);
 
-    } else {
-        rn->excess = (ngx_uint_t) decayed;
+        if (ms) {
+            rn->last = now;
+        }
     }
 
     ngx_shmtx_unlock(&shm->shpool->mutex);
@@ -608,7 +653,7 @@ ngx_http_waf_rate_lookup(ngx_http_waf_shm_t *shm,
             }
 
         } else {
-            rc = (rn->sig < rule->sig) ? -1 : 1;
+            rc = (rule->sig < rn->sig) ? -1 : 1;
         }
 
         node = (rc < 0) ? node->left : node->right;
@@ -618,35 +663,76 @@ ngx_http_waf_rate_lookup(ngx_http_waf_shm_t *shm,
 }
 
 
-static ngx_int_t
-ngx_http_waf_rate_insert(ngx_http_waf_shm_t *shm,
-    ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, uint32_t hash,
-    ngx_uint_t excess)
+static size_t
+ngx_http_waf_rate_charge(size_t len)
 {
-    size_t                     size;
-    ngx_rbtree_node_t         *node;
-    ngx_http_waf_rate_node_t  *rn;
+    size_t  size, charge;
 
     size = offsetof(ngx_rbtree_node_t, color)
            + offsetof(ngx_http_waf_rate_node_t, data)
-           + key->len;
+           + len;
+
+    for (charge = 8; charge < size; charge <<= 1) { /* void */ }
+
+    return charge;
+}
+
+
+static ngx_int_t
+ngx_http_waf_rate_insert(ngx_http_waf_shm_conf_t *scf,
+    ngx_http_waf_rate_rule_t *rule, ngx_str_t *key, uint32_t hash,
+    ngx_uint_t excess)
+{
+    size_t                     charge;
+    ngx_uint_t                 n;
+    ngx_rbtree_node_t         *node;
+    ngx_http_waf_shm_t        *shm;
+    ngx_http_waf_rate_node_t  *rn;
+
+    static ngx_msec_t          warned;
+
+    shm    = scf->shm;
+    charge = ngx_http_waf_rate_charge(key->len);
 
     ngx_http_waf_rate_expire(shm, 0);
 
-    node = ngx_slab_alloc_locked(shm->shpool, size);
-
-    if (node == NULL) {
+    for (n = 0;
+         shm->rate_bytes + charge > scf->rate_max
+         && n < NGX_HTTP_WAF_RATE_EVICT
+         && !ngx_queue_empty(&shm->rate_lru);
+         n++)
+    {
         ngx_http_waf_rate_expire(shm, 1);
+    }
 
-        node = ngx_slab_alloc_locked(shm->shpool, size);
+    node = NULL;
+
+    if (shm->rate_bytes + charge <= scf->rate_max) {
+        node = ngx_slab_alloc_locked(shm->shpool, charge);
 
         if (node == NULL) {
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "waf: local rate zone is exhausted, "
-                          "key \"%V\" is not counted", key);
-            return NGX_ERROR;
+            ngx_http_waf_rate_expire(shm, 1);
+
+            node = ngx_slab_alloc_locked(shm->shpool, charge);
         }
     }
+
+    if (node == NULL) {
+
+        if (ngx_current_msec - warned >= 1000) {
+            warned = ngx_current_msec;
+
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                          "waf: local rate counters are out of room in zone "
+                          "\"%V\" (%uz of %uz bytes), rule \"%V\" does not "
+                          "count a new key", &scf->wmcf->shm_name,
+                          shm->rate_bytes, scf->rate_max, &rule->key.text);
+        }
+
+        return NGX_ERROR;
+    }
+
+    shm->rate_bytes += charge;
 
     node->key = hash;
 
@@ -654,6 +740,7 @@ ngx_http_waf_rate_insert(ngx_http_waf_shm_t *shm,
 
     rn->len    = (u_char) key->len;
     rn->sig    = rule->sig;
+    rn->rate   = rule->rate;
     rn->excess = excess;
     rn->last   = ngx_current_msec;
 
@@ -667,13 +754,33 @@ ngx_http_waf_rate_insert(ngx_http_waf_shm_t *shm,
 
 
 static void
+ngx_http_waf_rate_free(ngx_http_waf_shm_t *shm, ngx_http_waf_rate_node_t *rn)
+{
+    size_t              charge;
+    ngx_rbtree_node_t  *node;
+
+    charge = ngx_http_waf_rate_charge(rn->len);
+
+    node = (ngx_rbtree_node_t *)
+               ((u_char *) rn - offsetof(ngx_rbtree_node_t, color));
+
+    ngx_queue_remove(&rn->queue);
+    ngx_rbtree_delete(&shm->rate, node);
+    ngx_slab_free_locked(shm->shpool, node);
+
+    shm->rate_bytes = (shm->rate_bytes > charge) ? shm->rate_bytes - charge
+                                                 : 0;
+}
+
+
+static void
 ngx_http_waf_rate_expire(ngx_http_waf_shm_t *shm, ngx_uint_t force)
 {
-    ngx_int_t                  ms, excess;
+    ngx_int_t                  excess;
     ngx_uint_t                 n;
     ngx_queue_t               *q;
     ngx_msec_t                 now;
-    ngx_rbtree_node_t         *node;
+    ngx_msec_int_t             ms;
     ngx_http_waf_rate_node_t  *rn;
 
     now = ngx_current_msec;
@@ -688,20 +795,16 @@ ngx_http_waf_rate_expire(ngx_http_waf_shm_t *shm, ngx_uint_t force)
         rn = ngx_queue_data(q, ngx_http_waf_rate_node_t, queue);
 
         if (!force) {
-            ms     = (ngx_int_t) (now - rn->last);
-            excess = (ngx_int_t) rn->excess - 1000 * ms / 1000;
+            ms     = ngx_http_waf_rate_elapsed(now, rn->last);
+            excess = (ngx_int_t) rn->excess
+                     - (ngx_int_t) (rn->rate * (ngx_uint_t) ms / 1000);
 
             if (excess > 0) {
                 return;
             }
         }
 
-        node = (ngx_rbtree_node_t *)
-                   ((u_char *) rn - offsetof(ngx_rbtree_node_t, color));
-
-        ngx_queue_remove(q);
-        ngx_rbtree_delete(&shm->rate, node);
-        ngx_slab_free_locked(shm->shpool, node);
+        ngx_http_waf_rate_free(shm, rn);
 
         force = 0;
     }

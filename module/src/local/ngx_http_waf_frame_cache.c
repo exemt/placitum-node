@@ -87,14 +87,10 @@ ngx_http_waf_fcache_lookup(uint32_t route, ngx_uint_t phase, ngx_uint_t opcode,
             continue;
         }
 
-        (void) ngx_atomic_fetch_add(&fc->hits, 1);
-
         ngx_shmtx_unlock(&shm->shpool->mutex);
 
         return NGX_OK;
     }
-
-    (void) ngx_atomic_fetch_add(&fc->misses, 1);
 
     ngx_shmtx_unlock(&shm->shpool->mutex);
 
@@ -162,8 +158,6 @@ ngx_http_waf_fcache_insert(uint32_t route, ngx_uint_t phase, ngx_uint_t opcode,
     victim->opcode  = (uint8_t) opcode;
     victim->pad     = 0;
     victim->expires = now + ttl;
-
-    (void) ngx_atomic_fetch_add(&fc->inserts, 1);
 
     ngx_shmtx_unlock(&shm->shpool->mutex);
 }

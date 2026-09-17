@@ -24,14 +24,13 @@ typedef struct {
     ngx_atomic_t               attempts;
     ngx_atomic_t               failures;
     ngx_atomic_t               probe_at;
+    ngx_atomic_t               tag;
 } ngx_http_waf_breaker_t;
 
 
 typedef struct {
-    ngx_atomic_t               readers;
+    ngx_uint_t                 type;
     ngx_uint_t                 entries;
-    size_t                     size;
-    uint64_t                   hash;
 } ngx_http_waf_set_t;
 
 
@@ -40,16 +39,11 @@ typedef struct {
 
     ngx_uint_t                 n4;
     uint32_t                  *v4_start;
-    uint32_t                  *v4_end;
     uint32_t                  *v4_cover;
 
     ngx_uint_t                 n6;
     u_char                    *v6_start;
-    u_char                    *v6_end;
     u_char                    *v6_cover;
-
-    uint64_t                  *v4_h;
-    uint64_t                  *v6_h;
 } ngx_http_waf_cidr_set_t;
 
 
@@ -59,7 +53,6 @@ typedef struct {
     ngx_uint_t                 mask;
     uint32_t                  *table;
     u_char                    *blob;
-    size_t                     blob_len;
 } ngx_http_waf_str_set_t;
 
 
@@ -77,31 +70,32 @@ typedef struct {
     u_char                     name[NGX_HTTP_WAF_DS_NAME_MAX];
     size_t                     name_len;
     ngx_uint_t                 type;
+    ngx_uint_t                 mode;
 
     void                      *set;
+    ngx_atomic_t               readers;
+    void                      *retired[NGX_HTTP_WAF_DS_RETIRED];
+
     ngx_http_waf_ds_live_t    *live;
     ngx_uint_t                 live_max;
 
     ngx_atomic_t               lock;
 
     uint64_t                   seq;
-    time_t                     updated;
-
     uint64_t                   epoch;
     u_char                     key[16];
     uint64_t                   live_hash;
 
     ngx_msec_t                 seen;
-    unsigned                   silent:1;
-
-    unsigned                   syncing:1;
-    unsigned                   snap_bad:1;
-
     ngx_msec_t                 snapshot_at;
 
-    void                      *retired[NGX_HTTP_WAF_DS_RETIRED];
+    ngx_uint_t                 gen;
+    ngx_uint_t                 released;
 
-    unsigned                   bound:1;
+    u_char                     silent;
+    u_char                     syncing;
+    u_char                     snap_bad;
+    u_char                     bound;
 } ngx_http_waf_ds_slot_t;
 
 
@@ -118,9 +112,6 @@ typedef struct {
 } ngx_http_waf_fcache_entry_t;
 
 typedef struct {
-    ngx_atomic_t               hits;
-    ngx_atomic_t               misses;
-    ngx_atomic_t               inserts;
     ngx_http_waf_fcache_entry_t  entries[NGX_HTTP_WAF_FCACHE_ENTRIES];
 } ngx_http_waf_fcache_t;
 
@@ -133,11 +124,23 @@ typedef struct {
     ngx_rbtree_t               rate;
     ngx_rbtree_node_t          rate_sentinel;
     ngx_queue_t                rate_lru;
+    size_t                     rate_bytes;
+    size_t                     base_used;
 
+    ngx_uint_t                 ds_gen;
+    ngx_uint_t                 ds_committed;
     ngx_http_waf_ds_slot_t     datasets[NGX_HTTP_WAF_MAX_DATASETS];
 
     ngx_http_waf_fcache_t     *fcache;
 } ngx_http_waf_shm_t;
+
+
+typedef struct {
+    ngx_http_waf_shm_t        *shm;
+    ngx_http_waf_main_conf_t  *wmcf;
+    ngx_uint_t                 gen;
+    size_t                     rate_max;
+} ngx_http_waf_shm_conf_t;
 
 
 char      *ngx_http_waf_shm_zone(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -147,7 +150,8 @@ ngx_int_t  ngx_http_waf_shm_required(ngx_conf_t *cf, const char *directive);
 
 ngx_int_t  ngx_http_waf_shm_fit(ngx_conf_t *cf);
 
-ngx_http_waf_shm_t  *ngx_http_waf_shm(void);
+ngx_http_waf_shm_conf_t  *ngx_http_waf_shm_conf(void);
+ngx_http_waf_shm_t       *ngx_http_waf_shm(void);
 
 
 ngx_int_t  ngx_http_waf_breaker_allow(ngx_uint_t index,
@@ -177,6 +181,9 @@ char      *ngx_http_waf_local_check(ngx_conf_t *cf, ngx_command_t *cmd,
 ngx_http_waf_dataset_t  *ngx_http_waf_dataset_find(
                              ngx_http_waf_main_conf_t *wmcf, ngx_str_t *name);
 
+ngx_int_t  ngx_http_waf_dataset_init_zone(ngx_http_waf_shm_conf_t *scf,
+               ngx_log_t *log);
+
 ngx_int_t  ngx_http_waf_dataset_bind(ngx_cycle_t *cycle);
 
 typedef enum {
@@ -192,7 +199,6 @@ typedef struct {
     uint64_t                   seq;
     uint64_t                   hash;
     ngx_uint_t                 has_hash;
-    ngx_str_t                  package;
     ngx_str_t                  object;
     ngx_str_t                  reply;
     ngx_uint_t                 count;
@@ -225,40 +231,47 @@ void       ngx_http_waf_dataset_state(ngx_uint_t index, uint64_t *epoch,
 ngx_uint_t ngx_http_waf_dataset_snap_bad(ngx_uint_t index);
 
 ngx_msec_int_t ngx_http_waf_dataset_seen(ngx_uint_t index, ngx_uint_t touch,
-               ngx_uint_t *first_silence);
+               ngx_msec_t silence, ngx_uint_t *first_silence);
 
 ngx_int_t  ngx_http_waf_dataset_check(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule,
                ngx_str_t *response);
 
 ngx_uint_t ngx_http_waf_dataset_hit(ngx_http_waf_dataset_t *ds,
-               ngx_str_t *value);
+               ngx_str_t *value, ngx_uint_t binary);
 
 void       ngx_http_waf_md5_hex(ngx_str_t *in, u_char *out);
 
 ngx_int_t  ngx_http_waf_dataset_snapshot_claim(ngx_uint_t index,
                ngx_msec_t wait);
 
-ngx_int_t  ngx_http_waf_ds_live_put(ngx_http_waf_ds_slot_t *slot,
-               ngx_str_t *key, ngx_msec_t expires, uint64_t h, uint32_t gen);
-ngx_int_t  ngx_http_waf_ds_live_drop(ngx_http_waf_ds_slot_t *slot,
-               ngx_str_t *key);
-ngx_uint_t ngx_http_waf_ds_live_hit(ngx_http_waf_dataset_t *ds,
-               ngx_http_waf_ds_slot_t *slot, ngx_str_t *value);
-void       ngx_http_waf_ds_live_reset(ngx_http_waf_ds_slot_t *slot);
+ngx_int_t  ngx_http_waf_ds_addr(ngx_str_t *value, ngx_uint_t binary,
+               ngx_uint_t *fam, u_char *addr);
 
-uint32_t   ngx_http_waf_ds_live_begin(ngx_http_waf_ds_slot_t *slot);
+ngx_int_t  ngx_http_waf_ds_live_put(ngx_http_waf_shm_t *shm,
+               ngx_http_waf_ds_slot_t *slot, ngx_str_t *key,
+               ngx_msec_t expires, uint64_t h, uint32_t gen);
+ngx_int_t  ngx_http_waf_ds_live_drop(ngx_http_waf_shm_t *shm,
+               ngx_http_waf_ds_slot_t *slot, ngx_str_t *key);
+void       ngx_http_waf_ds_live_mark(ngx_http_waf_ds_slot_t *slot,
+               ngx_str_t *key, uint32_t gen);
+ngx_uint_t ngx_http_waf_ds_live_hit(ngx_http_waf_ds_slot_t *slot,
+               ngx_str_t *value);
+ngx_uint_t ngx_http_waf_ds_live_probe(ngx_http_waf_ds_slot_t *slot,
+               ngx_uint_t fam, u_char *addr);
+void       ngx_http_waf_ds_live_reset(ngx_http_waf_shm_t *shm,
+               ngx_http_waf_ds_slot_t *slot);
+
+uint32_t   ngx_http_waf_ds_live_begin(ngx_http_waf_shm_t *shm,
+               ngx_http_waf_ds_slot_t *slot);
 uint32_t   ngx_http_waf_ds_live_gen(ngx_http_waf_ds_slot_t *slot);
 
-ngx_int_t  ngx_http_waf_ds_live_sweep(ngx_http_waf_ds_slot_t *slot,
-               uint32_t gen, ngx_uint_t batch, ngx_rbtree_node_t **cursor,
-               ngx_uint_t *swept);
-
-ngx_int_t  ngx_http_waf_ds_material(ngx_http_waf_dataset_t *ds,
-               ngx_str_t *value, u_char *buf, ngx_str_t *key);
+ngx_int_t  ngx_http_waf_ds_live_sweep(ngx_http_waf_shm_t *shm,
+               ngx_http_waf_ds_slot_t *slot, uint32_t gen, ngx_uint_t batch,
+               ngx_rbtree_node_t **cursor, ngx_uint_t *swept);
 
 ngx_int_t  ngx_http_waf_dataset_put(ngx_http_waf_ctx_t *ctx,
-               ngx_http_waf_dataset_t *ds, ngx_str_t *value, ngx_uint_t ttl,
-               ngx_str_t *reason);
+               ngx_http_waf_dataset_t *ds, ngx_str_t *value, ngx_uint_t binary,
+               ngx_uint_t ttl, ngx_str_t *reason);
 
 
 ngx_int_t  ngx_http_waf_fcache_init(ngx_http_waf_shm_t *shm,

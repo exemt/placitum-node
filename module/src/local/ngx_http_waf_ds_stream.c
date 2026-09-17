@@ -33,8 +33,10 @@ typedef struct {
     ngx_pool_t                *pool;
     ngx_http_waf_body_op_t    *op;
     ngx_uint_t                 kind;
+    ngx_uint_t                 fetch_seq;
     uint64_t                   fetching;
 
+    uint64_t                   want_epoch;
     uint64_t                   want;
     uint64_t                   want_hash;
     ngx_uint_t                 want_has_hash;
@@ -191,10 +193,6 @@ ngx_http_waf_ds_stream_snapshot(ngx_http_waf_ds_stream_t *st, ngx_uint_t claim)
     ngx_str_t                  body;
     ngx_http_waf_main_conf_t  *wmcf;
 
-    if (ngx_http_waf_dataset_snap_bad(ngx_http_waf_ds_stream_pos(st))) {
-        return NGX_DECLINED;
-    }
-
     if (claim
         && ngx_http_waf_dataset_snapshot_claim(st->ds->index,
                                                NGX_HTTP_WAF_DS_SNAPSHOT_WAIT)
@@ -292,7 +290,7 @@ ngx_http_waf_ds_stream_timer(ngx_event_t *ev)
 
     case NGX_HTTP_WAF_DS_ST_READY:
         age = ngx_http_waf_dataset_seen(ngx_http_waf_ds_stream_pos(st), 0,
-                                        &first);
+                                        NGX_HTTP_WAF_DS_SILENCE, &first);
 
         if (age > NGX_HTTP_WAF_DS_SILENCE && first) {
             ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
@@ -349,7 +347,7 @@ ngx_http_waf_ds_stream_message(ngx_uint_t index, ngx_str_t *payload)
 
     ngx_destroy_pool(pool);
 
-    (void) ngx_http_waf_dataset_seen(index, 1, NULL);
+    (void) ngx_http_waf_dataset_seen(index, 1, 0, NULL);
 
     if (n.op != NGX_HTTP_WAF_DS_OP_DIFF && n.op != NGX_HTTP_WAF_DS_OP_TICK) {
         return;
@@ -357,7 +355,8 @@ ngx_http_waf_ds_stream_message(ngx_uint_t index, ngx_str_t *payload)
 
     ngx_http_waf_dataset_state(index, &epoch, &seq);
 
-    if (n.epoch == epoch && n.seq > st->want) {
+    if (n.epoch != st->want_epoch || n.seq > st->want) {
+        st->want_epoch    = n.epoch;
         st->want          = n.seq;
         st->want_hash     = n.hash;
         st->want_has_hash = n.has_hash;
@@ -397,7 +396,10 @@ ngx_http_waf_ds_stream_message(ngx_uint_t index, ngx_str_t *payload)
     if (n.op == NGX_HTTP_WAF_DS_OP_TICK && n.seq == seq && n.has_hash) {
         rc = ngx_http_waf_dataset_verify(index, n.epoch, n.seq, n.hash);
 
-        if (rc == NGX_HTTP_WAF_DS_DIVERGED || rc == NGX_HTTP_WAF_DS_FOREIGN) {
+        if (rc == NGX_HTTP_WAF_DS_FOREIGN
+            || (rc == NGX_HTTP_WAF_DS_DIVERGED
+                && !ngx_http_waf_dataset_snap_bad(index)))
+        {
             (void) ngx_http_waf_ds_stream_snapshot(st, 1);
         }
     }
@@ -430,7 +432,7 @@ ngx_http_waf_ds_stream_reply(ngx_uint_t index, ngx_str_t *payload)
         return;
     }
 
-    (void) ngx_http_waf_dataset_seen(index, 1, NULL);
+    (void) ngx_http_waf_dataset_seen(index, 1, 0, NULL);
 
     pool = ngx_create_pool(1024, ngx_cycle->log);
     if (pool == NULL) {
@@ -477,8 +479,8 @@ ngx_http_waf_ds_stream_fetch(ngx_http_waf_ds_stream_t *st, ngx_str_t *key,
     off_t                    max;
     ngx_int_t                rc;
     ngx_str_t                k;
+    ngx_uint_t               seq_no;
     ngx_pool_t              *pool;
-    ngx_http_waf_body_op_t  *op;
 
     if (key->len == 0 || key->len > NGX_HTTP_WAF_DS_KEY_MAX) {
         return NGX_ERROR;
@@ -505,6 +507,8 @@ ngx_http_waf_ds_stream_fetch(ngx_http_waf_ds_stream_t *st, ngx_str_t *key,
     st->fetching = seq;
     st->state    = NGX_HTTP_WAF_DS_ST_FETCH;
 
+    seq_no = ++st->fetch_seq;
+
     if (st->timer.timer_set) {
         ngx_del_timer(&st->timer);
     }
@@ -512,8 +516,14 @@ ngx_http_waf_ds_stream_fetch(ngx_http_waf_ds_stream_t *st, ngx_str_t *key,
     max = (kind == NGX_HTTP_WAF_DS_FETCH_SNAPSHOT) ? NGX_HTTP_WAF_DS_OBJECT_MAX
                                                    : NGX_HTTP_WAF_DS_PACKAGE_MAX;
 
+    /* st->op is set before the driver runs: it may complete right away */
+
     rc = ngx_http_waf_sets_get(&k, max, pool, ngx_cycle->log,
-                               ngx_http_waf_ds_stream_fetched, st, &op);
+                               ngx_http_waf_ds_stream_fetched, st, &st->op);
+
+    if (st->fetch_seq != seq_no || st->state != NGX_HTTP_WAF_DS_ST_FETCH) {
+        return NGX_OK;
+    }
 
     if (rc == NGX_ERROR) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
@@ -523,10 +533,8 @@ ngx_http_waf_ds_stream_fetch(ngx_http_waf_ds_stream_t *st, ngx_str_t *key,
         return NGX_ERROR;
     }
 
-    st->op = op;
-
     if (rc == NGX_OK) {
-        ngx_http_waf_ds_stream_fetched(op);
+        ngx_http_waf_ds_stream_fetched(st->op);
     }
 
     return NGX_OK;
@@ -548,8 +556,8 @@ ngx_http_waf_ds_stream_catch_up(ngx_http_waf_ds_stream_t *st)
         return;
     }
 
-    if (seq >= st->want) {
-        if (st->want_has_hash && seq == st->want) {
+    if (st->want_epoch != epoch || seq >= st->want) {
+        if (st->want_epoch == epoch && st->want_has_hash && seq == st->want) {
             (void) ngx_http_waf_dataset_verify(ngx_http_waf_ds_stream_pos(st),
                                                epoch, seq, st->want_hash);
         }
@@ -641,6 +649,7 @@ ngx_http_waf_ds_stream_fetched(ngx_http_waf_body_op_t *op)
 
         case NGX_HTTP_WAF_DS_APPLIED:
         case NGX_HTTP_WAF_DS_DIVERGED:
+        case NGX_HTTP_WAF_DS_STALE:
         case NGX_HTTP_WAF_DS_BUSY:
             ngx_http_waf_ds_stream_settle(st);
 
@@ -678,6 +687,15 @@ ngx_http_waf_ds_stream_fetched(ngx_http_waf_body_op_t *op)
     case NGX_HTTP_WAF_DS_BUSY:
         ngx_http_waf_ds_stream_settle(st);
         return;
+
+    case NGX_HTTP_WAF_DS_DIVERGED:
+
+        if (ngx_http_waf_dataset_snap_bad(index)) {
+            ngx_http_waf_ds_stream_catch_up(st);
+            return;
+        }
+
+        /* fall through */
 
     default:
         if (ngx_http_waf_ds_stream_snapshot(st, 1) != NGX_OK) {

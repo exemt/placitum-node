@@ -5,71 +5,54 @@
 #include "local/ngx_http_waf_local.h"
 
 
-#define NGX_HTTP_WAF_DS_ACQUIRE_TRIES 4
-
-
-#define NGX_HTTP_WAF_DS_MERGE_ADD     1
-#define NGX_HTTP_WAF_DS_MERGE_REMOVE  2
+#define NGX_HTTP_WAF_DS_SYNC_WAIT     5000
+#define NGX_HTTP_WAF_DS_READERS_SPIN  4096
 
 
 typedef struct {
     uint32_t                  start;
     uint32_t                  end;
-    uint64_t                  h;
 } ngx_http_waf_ds_r4_t;
 
 
 typedef struct {
     u_char                    start[16];
     u_char                    end[16];
-    uint64_t                  h;
 } ngx_http_waf_ds_r6_t;
-
-
-typedef struct {
-    ngx_uint_t                op;
-    u_char                    key[16];
-
-    ngx_array_t              *r4;
-    ngx_array_t              *r6;
-    ngx_array_t              *str;
-} ngx_http_waf_ds_update_t;
 
 
 static ngx_uint_t ngx_http_waf_ds_arg_option(ngx_str_t *arg);
 static ngx_int_t ngx_http_waf_ds_add_entry(ngx_conf_t *cf,
     ngx_http_waf_dataset_t *ds, ngx_str_t *text);
-static ngx_int_t ngx_http_waf_ds_load_internal(ngx_cycle_t *cycle,
-    ngx_http_waf_dataset_t *ds);
 
-static ngx_int_t ngx_http_waf_ds_entry_cidr(ngx_str_t *text,
-    ngx_http_waf_ds_update_t *up, uint64_t h);
-static uint64_t ngx_http_waf_ds_siphash(const u_char *key, const u_char *data,
-    size_t len);
-static ngx_int_t ngx_http_waf_ds_hex(ngx_str_t *text, u_char *out, size_t n);
-static ngx_int_t ngx_http_waf_ds_hex64(ngx_str_t *text, uint64_t *out);
-
+static void ngx_http_waf_ds_slot_reset(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_ds_slot_t *slot);
+static ngx_int_t ngx_http_waf_ds_build(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_dataset_t *ds, ngx_log_t *log, void **out);
+static ngx_int_t ngx_http_waf_ds_entry_cidr(ngx_str_t *text, ngx_array_t *r4,
+    ngx_array_t *r6);
 static void ngx_http_waf_ds_sort_uniq(ngx_array_t *a,
     int (ngx_libc_cdecl *cmp)(const void *, const void *));
-
 static void *ngx_http_waf_ds_build_cidr(ngx_http_waf_shm_t *shm,
-    ngx_http_waf_ds_update_t *up);
+    ngx_array_t *r4, ngx_array_t *r6);
 static void *ngx_http_waf_ds_build_str(ngx_http_waf_shm_t *shm,
-    ngx_http_waf_ds_update_t *up);
+    ngx_array_t *str);
 
-static void *ngx_http_waf_ds_acquire(ngx_http_waf_ds_slot_t *slot);
-static void  ngx_http_waf_ds_release(void *set);
-static void  ngx_http_waf_ds_retire(ngx_http_waf_shm_t *shm,
+static void ngx_http_waf_ds_publish(ngx_http_waf_shm_t *shm,
     ngx_http_waf_ds_slot_t *slot, void *set);
-static void  ngx_http_waf_ds_reclaim(ngx_http_waf_shm_t *shm,
-    ngx_http_waf_ds_slot_t *slot);
+static void *ngx_http_waf_ds_acquire(ngx_http_waf_ds_slot_t *slot);
+static void ngx_http_waf_ds_release(ngx_http_waf_ds_slot_t *slot);
 
-static ngx_int_t ngx_http_waf_ds_lookup_cidr(ngx_http_waf_cidr_set_t *set,
-    ngx_str_t *value);
-static ngx_int_t ngx_http_waf_ds_lookup_str(ngx_http_waf_str_set_t *set,
-    ngx_str_t *value);
+static ngx_uint_t ngx_http_waf_ds_lookup_cidr(ngx_http_waf_cidr_set_t *set,
+    ngx_uint_t fam, u_char *addr);
 static ngx_uint_t ngx_http_waf_ds_str_probe(ngx_http_waf_str_set_t *set,
     u_char *data, size_t len, ngx_uint_t *slot);
+
+static uint64_t ngx_http_waf_ds_siphash(const u_char *key, const u_char *data,
+    size_t len);
+static uint64_t ngx_http_waf_ds_le64(const u_char *p);
+static ngx_int_t ngx_http_waf_ds_hex(ngx_str_t *text, u_char *out, size_t n);
+static ngx_int_t ngx_http_waf_ds_hex64(ngx_str_t *text, uint64_t *out);
 
 static int ngx_libc_cdecl ngx_http_waf_ds_cmp_r4(const void *a, const void *b);
 static int ngx_libc_cdecl ngx_http_waf_ds_cmp_r6(const void *a, const void *b);
@@ -632,259 +615,457 @@ ngx_http_waf_local_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+
 ngx_int_t
-ngx_http_waf_dataset_bind(ngx_cycle_t *cycle)
+ngx_http_waf_dataset_init_zone(ngx_http_waf_shm_conf_t *scf, ngx_log_t *log)
 {
-    ngx_uint_t                 i, j, free_slot;
+    void                      *sets[NGX_HTTP_WAF_MAX_DATASETS];
+    u_char                     taken[NGX_HTTP_WAF_MAX_DATASETS];
+    u_char                     reset[NGX_HTTP_WAF_MAX_DATASETS];
+    u_char                     freed[NGX_HTTP_WAF_MAX_DATASETS];
+    ngx_int_t                  rc;
+    ngx_uint_t                 i, j, n, gen, best;
+    ngx_uint_t                 slots[NGX_HTTP_WAF_MAX_DATASETS];
     ngx_http_waf_shm_t        *shm;
     ngx_http_waf_dataset_t    *ds;
     ngx_http_waf_ds_slot_t    *slot;
     ngx_http_waf_main_conf_t  *wmcf;
 
-    wmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_waf_module);
+    shm  = scf->shm;
+    wmcf = scf->wmcf;
 
-    if (wmcf == NULL || wmcf->datasets == NULL) {
-        return NGX_OK;
-    }
+    ds = (wmcf->datasets != NULL) ? wmcf->datasets->elts : NULL;
+    n  = (wmcf->datasets != NULL) ? wmcf->datasets->nelts : 0;
 
-    shm = ngx_http_waf_shm();
+    ngx_memzero(sets, sizeof(sets));
+    ngx_memzero(taken, sizeof(taken));
+    ngx_memzero(reset, sizeof(reset));
+    ngx_memzero(freed, sizeof(freed));
 
-    if (shm == NULL) {
-        return NGX_ERROR;
-    }
-
-    ds = wmcf->datasets->elts;
+    rc = NGX_OK;
 
     ngx_shmtx_lock(&shm->shpool->mutex);
 
-    for (i = 0; i < wmcf->datasets->nelts; i++) {
+    gen = ++shm->ds_gen;
+    scf->gen = gen;
 
-        free_slot = NGX_HTTP_WAF_MAX_DATASETS;
-        slot      = NULL;
+    for (i = 0; i < n; i++) {
+        slots[i] = NGX_HTTP_WAF_MAX_DATASETS;
 
         for (j = 0; j < NGX_HTTP_WAF_MAX_DATASETS; j++) {
+            slot = &shm->datasets[j];
 
-            if (!shm->datasets[j].bound) {
-                if (free_slot == NGX_HTTP_WAF_MAX_DATASETS) {
-                    free_slot = j;
-                }
+            if (!slot->bound
+                || slot->name_len != ds[i].name.len
+                || ngx_memcmp(slot->name, ds[i].name.data, ds[i].name.len)
+                   != 0)
+            {
                 continue;
             }
 
-            if (shm->datasets[j].name_len == ds[i].name.len
-                && ngx_memcmp(shm->datasets[j].name, ds[i].name.data,
-                              ds[i].name.len) == 0)
+            slots[i] = j;
+            taken[j] = 1;
+
+            if (slot->type != ds[i].type
+                || (slot->mode == NGX_HTTP_WAF_DS_MODE_ACTIVE
+                    && ds[i].mode == NGX_HTTP_WAF_DS_MODE_INTERNAL))
             {
-                slot = &shm->datasets[j];
-                break;
+                ngx_log_error(NGX_LOG_WARN, log, 0,
+                              "waf: dataset \"%V\" changed type or mode, its "
+                              "data is dropped", &ds[i].name);
+                reset[j] = 1;
+            }
+
+            break;
+        }
+    }
+
+    /*
+     * a slot is released only when the running workers do not name it:
+     * they committed a generation newer than its last declaration
+     */
+
+    for (j = 0; j < NGX_HTTP_WAF_MAX_DATASETS; j++) {
+        slot = &shm->datasets[j];
+
+        if (slot->bound && !taken[j] && slot->gen < shm->ds_committed) {
+            slot->bound    = 0;
+            slot->released = gen;
+            reset[j] = 1;
+            freed[j] = 1;
+        }
+    }
+
+    for (i = 0; i < n; i++) {
+
+        if (slots[i] != NGX_HTTP_WAF_MAX_DATASETS) {
+            continue;
+        }
+
+        best = NGX_HTTP_WAF_MAX_DATASETS;
+
+        for (j = 0; j < NGX_HTTP_WAF_MAX_DATASETS; j++) {
+            slot = &shm->datasets[j];
+
+            if (slot->bound || taken[j]) {
+                continue;
+            }
+
+            if (best == NGX_HTTP_WAF_MAX_DATASETS
+                || slot->released < shm->datasets[best].released)
+            {
+                best = j;
             }
         }
 
-        if (slot == NULL) {
-
-            if (free_slot == NGX_HTTP_WAF_MAX_DATASETS) {
-                ngx_shmtx_unlock(&shm->shpool->mutex);
-
-                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                              "waf: no free dataset slot in the zone for "
-                              "\"%V\"; a full restart is required after "
-                              "renaming datasets", &ds[i].name);
-                return NGX_ERROR;
-            }
-
-            slot = &shm->datasets[free_slot];
-
-            ngx_memcpy(slot->name, ds[i].name.data, ds[i].name.len);
-            slot->name_len = ds[i].name.len;
-
-            slot->type     = ds[i].type;
-            slot->live_max = ds[i].live_max;
-            slot->bound    = 1;
-
-        } else if (slot->type != ds[i].type) {
-            ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
-                          "waf: dataset \"%V\" changed type, its data is "
-                          "dropped", &ds[i].name);
-
-            if (slot->set != NULL) {
-                ngx_http_waf_ds_retire(shm, slot, slot->set);
-                slot->set = NULL;
-            }
-
-            slot->type  = ds[i].type;
-            slot->seq   = 0;
-            slot->epoch = 0;
-            slot->snap_bad = 0;
-            slot->syncing  = 0;
-
-            ngx_shmtx_unlock(&shm->shpool->mutex);
-            ngx_http_waf_ds_live_reset(slot);
-            ngx_shmtx_lock(&shm->shpool->mutex);
+        if (best == NGX_HTTP_WAF_MAX_DATASETS) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0,
+                          "waf: no free dataset slot for \"%V\": the running "
+                          "configuration holds the others, restart nginx to "
+                          "switch to this set of datasets", &ds[i].name);
+            rc = NGX_ERROR;
+            break;
         }
 
-        if (ds[i].mode == NGX_HTTP_WAF_DS_MODE_ACTIVE && slot->set != NULL) {
-            ngx_http_waf_ds_retire(shm, slot, slot->set);
-            slot->set = NULL;
-        }
-
-        if (ds[i].name.len != slot->name_len
-            || ngx_memcmp(slot->name, ds[i].name.data, ds[i].name.len) != 0)
-        {
-            ngx_memcpy(slot->name, ds[i].name.data, ds[i].name.len);
-            slot->name_len = ds[i].name.len;
-        }
-
-        slot->live_max = ds[i].live_max;
-        ds[i].index = (ngx_uint_t) (slot - shm->datasets);
+        slots[i] = best;
+        taken[best] = 1;
+        reset[best] = 1;
     }
 
     ngx_shmtx_unlock(&shm->shpool->mutex);
 
-    for (i = 0; i < wmcf->datasets->nelts; i++) {
+    for (j = 0; j < NGX_HTTP_WAF_MAX_DATASETS; j++) {
+
+        if (!reset[j]) {
+            continue;
+        }
+
+        slot = &shm->datasets[j];
+
+        if (freed[j]) {
+            ngx_log_error(NGX_LOG_NOTICE, log, 0,
+                          "waf: dataset \"%*s\" is no longer declared, its "
+                          "slot and data are released",
+                          (size_t) slot->name_len, slot->name);
+        }
+
+        ngx_http_waf_ds_slot_reset(shm, slot);
+    }
+
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    for (i = 0; i < n; i++) {
+
         if (ds[i].mode != NGX_HTTP_WAF_DS_MODE_INTERNAL) {
             continue;
         }
 
-        if (ngx_http_waf_ds_load_internal(cycle, &ds[i]) != NGX_OK) {
-            return NGX_ERROR;
+        if (ngx_http_waf_ds_build(shm, &ds[i], log, &sets[i]) != NGX_OK) {
+            rc = NGX_ERROR;
+            break;
         }
     }
+
+    ngx_shmtx_lock(&shm->shpool->mutex);
+
+    if (rc != NGX_OK) {
+
+        for (i = 0; i < n; i++) {
+            if (sets[i] != NULL) {
+                ngx_slab_free_locked(shm->shpool, sets[i]);
+            }
+        }
+
+        ngx_shmtx_unlock(&shm->shpool->mutex);
+
+        return rc;
+    }
+
+    for (i = 0; i < n; i++) {
+        slot = &shm->datasets[slots[i]];
+
+        if (!slot->bound) {
+            ngx_memcpy(slot->name, ds[i].name.data, ds[i].name.len);
+            slot->name_len = ds[i].name.len;
+            slot->bound    = 1;
+        }
+
+        if (slot->mode != ds[i].mode) {
+            slot->seq   = 0;
+            slot->epoch = 0;
+        }
+
+        slot->type     = ds[i].type;
+        slot->mode     = ds[i].mode;
+        slot->live_max = ds[i].live_max;
+        slot->gen      = gen;
+
+        if (ds[i].mode == NGX_HTTP_WAF_DS_MODE_INTERNAL) {
+            ngx_http_waf_ds_publish(shm, slot, sets[i]);
+            slot->seq = (sets[i] != NULL) ? 1 : 0;
+
+        } else if (slot->set != NULL) {
+            ngx_http_waf_ds_publish(shm, slot, NULL);
+        }
+
+        ds[i].index = slots[i];
+    }
+
+    ngx_shmtx_unlock(&shm->shpool->mutex);
 
     return NGX_OK;
 }
 
 
-static ngx_int_t
-ngx_http_waf_ds_load_internal(ngx_cycle_t *cycle, ngx_http_waf_dataset_t *ds)
+ngx_int_t
+ngx_http_waf_dataset_bind(ngx_cycle_t *cycle)
 {
-    void                      *set;
-    ngx_uint_t                 i, entries;
-    ngx_pool_t                *pool;
-    ngx_str_t                 *items;
     ngx_http_waf_shm_t        *shm;
-    ngx_http_waf_ds_slot_t    *slot;
-    ngx_http_waf_ds_update_t   up;
+    ngx_http_waf_shm_conf_t   *scf;
+    ngx_http_waf_main_conf_t  *wmcf;
 
-    shm = ngx_http_waf_shm();
+    wmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_waf_module);
 
-    if (shm == NULL) {
-        return NGX_ERROR;
-    }
-
-    slot = &shm->datasets[ds->index];
-
-    if (ds->entries == NULL || ds->entries->nelts == 0) {
-
-        ngx_shmtx_lock(&shm->shpool->mutex);
-
-        if (slot->set != NULL) {
-            ngx_http_waf_ds_retire(shm, slot, slot->set);
-            slot->set = NULL;
-        }
-
-        slot->seq = 0;
-
-        ngx_shmtx_unlock(&shm->shpool->mutex);
-
+    if (wmcf == NULL || wmcf->shm_zone == NULL) {
         return NGX_OK;
     }
 
-    pool = ngx_create_pool(4096, cycle->log);
-    if (pool == NULL) {
-        return NGX_ERROR;
-    }
+    scf = wmcf->shm_zone->data;
+    shm = scf->shm;
 
-    ngx_memzero(&up, sizeof(ngx_http_waf_ds_update_t));
-    up.op = NGX_HTTP_WAF_DS_MERGE_ADD;
-
-    if (ds->type == NGX_HTTP_WAF_DS_CIDR) {
-        up.r4 = ngx_array_create(pool, ds->entries->nelts,
-                                 sizeof(ngx_http_waf_ds_r4_t));
-        up.r6 = ngx_array_create(pool, 4, sizeof(ngx_http_waf_ds_r6_t));
-
-        if (up.r4 == NULL || up.r6 == NULL) {
-            ngx_destroy_pool(pool);
-            return NGX_ERROR;
-        }
-
-    } else {
-        up.str = ngx_array_create(pool, ds->entries->nelts, sizeof(ngx_str_t));
-        if (up.str == NULL) {
-            ngx_destroy_pool(pool);
-            return NGX_ERROR;
-        }
-    }
-
-    items = ds->entries->elts;
-
-    for (i = 0; i < ds->entries->nelts; i++) {
-
-        if (ds->type == NGX_HTTP_WAF_DS_CIDR) {
-
-            if (ngx_http_waf_ds_entry_cidr(&items[i], &up, 0) != NGX_OK) {
-                ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                              "waf: dataset \"%V\" has an invalid network "
-                              "\"%V\"", &ds->name, &items[i]);
-                ngx_destroy_pool(pool);
-                return NGX_ERROR;
-            }
-
-        } else {
-            ngx_str_t  *item;
-
-            item = ngx_array_push(up.str);
-            if (item == NULL) {
-                ngx_destroy_pool(pool);
-                return NGX_ERROR;
-            }
-
-            *item = items[i];
-        }
-    }
-
-    if (ds->type == NGX_HTTP_WAF_DS_CIDR) {
-        ngx_http_waf_ds_sort_uniq(up.r4, ngx_http_waf_ds_cmp_r4);
-        ngx_http_waf_ds_sort_uniq(up.r6, ngx_http_waf_ds_cmp_r6);
-        entries = up.r4->nelts + up.r6->nelts;
-
-    } else {
-        ngx_http_waf_ds_sort_uniq(up.str, ngx_http_waf_ds_cmp_str);
-        entries = up.str->nelts;
+    if (shm == NULL) {
+        return NGX_OK;
     }
 
     ngx_shmtx_lock(&shm->shpool->mutex);
 
-    set = (ds->type == NGX_HTTP_WAF_DS_CIDR)
-              ? ngx_http_waf_ds_build_cidr(shm, &up)
-              : ngx_http_waf_ds_build_str(shm, &up);
-
-    if (set == NULL) {
-        ngx_shmtx_unlock(&shm->shpool->mutex);
-
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                      "waf: no room in the zone for dataset \"%V\"",
-                      &ds->name);
-        ngx_destroy_pool(pool);
-        return NGX_ERROR;
+    if (scf->gen > shm->ds_committed) {
+        shm->ds_committed = scf->gen;
     }
-
-    if (slot->set != NULL) {
-        ngx_http_waf_ds_retire(shm, slot, slot->set);
-    }
-
-    slot->set     = set;
-    slot->seq     = 1;
-    slot->updated = ngx_time();
 
     ngx_shmtx_unlock(&shm->shpool->mutex);
 
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_waf_ds_slot_reset(ngx_http_waf_shm_t *shm,
+    ngx_http_waf_ds_slot_t *slot)
+{
+    ngx_uint_t  n;
+
+    for (n = 0; slot->syncing && n < NGX_HTTP_WAF_DS_SYNC_WAIT; n++) {
+        ngx_msleep(1);
+    }
+
+    ngx_http_waf_ds_live_reset(shm, slot);
+
+    ngx_rwlock_wlock(&slot->lock);
+
+    slot->seq         = 0;
+    slot->epoch       = 0;
+    slot->live_hash   = 0;
+    slot->seen        = 0;
+    slot->snapshot_at = 0;
+    slot->silent      = 0;
+    slot->syncing     = 0;
+    slot->snap_bad    = 0;
+
+    ngx_memzero(slot->key, sizeof(slot->key));
+
+    ngx_rwlock_unlock(&slot->lock);
+
+    ngx_shmtx_lock(&shm->shpool->mutex);
+    ngx_http_waf_ds_publish(shm, slot, NULL);
+    ngx_shmtx_unlock(&shm->shpool->mutex);
+}
+
+
+static ngx_int_t
+ngx_http_waf_ds_build(ngx_http_waf_shm_t *shm, ngx_http_waf_dataset_t *ds,
+    ngx_log_t *log, void **out)
+{
+    void         *set;
+    ngx_uint_t    i, entries;
+    ngx_pool_t   *pool;
+    ngx_str_t    *items, *item;
+    ngx_array_t  *r4, *r6, *str;
+
+    *out = NULL;
+
+    if (ds->entries == NULL || ds->entries->nelts == 0) {
+        return NGX_OK;
+    }
+
+    pool = ngx_create_pool(4096, log);
+    if (pool == NULL) {
+        return NGX_ERROR;
+    }
+
+    items = ds->entries->elts;
+
+    r4  = NULL;
+    r6  = NULL;
+    str = NULL;
+
+    if (ds->type == NGX_HTTP_WAF_DS_CIDR) {
+        r4 = ngx_array_create(pool, ds->entries->nelts,
+                              sizeof(ngx_http_waf_ds_r4_t));
+        r6 = ngx_array_create(pool, 4, sizeof(ngx_http_waf_ds_r6_t));
+
+        if (r4 == NULL || r6 == NULL) {
+            goto failed;
+        }
+
+        for (i = 0; i < ds->entries->nelts; i++) {
+            if (ngx_http_waf_ds_entry_cidr(&items[i], r4, r6) != NGX_OK) {
+                ngx_log_error(NGX_LOG_EMERG, log, 0,
+                              "waf: dataset \"%V\" has an invalid network "
+                              "\"%V\"", &ds->name, &items[i]);
+                goto failed;
+            }
+        }
+
+        ngx_http_waf_ds_sort_uniq(r4, ngx_http_waf_ds_cmp_r4);
+        ngx_http_waf_ds_sort_uniq(r6, ngx_http_waf_ds_cmp_r6);
+
+        entries = r4->nelts + r6->nelts;
+        set = ngx_http_waf_ds_build_cidr(shm, r4, r6);
+
+    } else {
+        str = ngx_array_create(pool, ds->entries->nelts, sizeof(ngx_str_t));
+        if (str == NULL) {
+            goto failed;
+        }
+
+        for (i = 0; i < ds->entries->nelts; i++) {
+            item = ngx_array_push(str);
+            if (item == NULL) {
+                goto failed;
+            }
+
+            *item = items[i];
+        }
+
+        ngx_http_waf_ds_sort_uniq(str, ngx_http_waf_ds_cmp_str);
+
+        entries = str->nelts;
+        set = ngx_http_waf_ds_build_str(shm, str);
+    }
+
+    if (set == NULL) {
+        ngx_log_error(NGX_LOG_EMERG, log, 0,
+                      "waf: no room in the zone for dataset \"%V\"",
+                      &ds->name);
+        goto failed;
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, log, 0,
                   "waf: dataset \"%V\" loaded %ui internal entries",
                   &ds->name, entries);
 
     ngx_destroy_pool(pool);
 
+    *out = set;
+
     return NGX_OK;
+
+failed:
+
+    ngx_destroy_pool(pool);
+
+    return NGX_ERROR;
+}
+
+
+static void
+ngx_http_waf_ds_publish(ngx_http_waf_shm_t *shm, ngx_http_waf_ds_slot_t *slot,
+    void *set)
+{
+    void        *old;
+    ngx_uint_t   i, n;
+
+    old = slot->set;
+
+    if (old == set) {
+        return;
+    }
+
+    slot->set = set;
+
+    ngx_memory_barrier();
+
+    if (old != NULL) {
+
+        for (i = 0; i < NGX_HTTP_WAF_DS_RETIRED; i++) {
+            if (slot->retired[i] == NULL) {
+                slot->retired[i] = old;
+                old = NULL;
+                break;
+            }
+        }
+    }
+
+    /*
+     * readers count themselves before they load slot->set: once the count is
+     * seen at zero after the swap, nobody holds an unpublished set
+     */
+
+    for (n = 0; slot->readers != 0 && n < NGX_HTTP_WAF_DS_READERS_SPIN; n++) {
+        ngx_cpu_pause();
+    }
+
+    if (slot->readers != 0) {
+
+        if (old != NULL) {
+            ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
+                          "waf: dataset \"%*s\" leaked a retired set: all %d "
+                          "retire slots are busy", (size_t) slot->name_len,
+                          slot->name, NGX_HTTP_WAF_DS_RETIRED);
+        }
+
+        return;
+    }
+
+    if (old != NULL) {
+        ngx_slab_free_locked(shm->shpool, old);
+    }
+
+    for (i = 0; i < NGX_HTTP_WAF_DS_RETIRED; i++) {
+        if (slot->retired[i] != NULL) {
+            ngx_slab_free_locked(shm->shpool, slot->retired[i]);
+            slot->retired[i] = NULL;
+        }
+    }
+}
+
+
+static void *
+ngx_http_waf_ds_acquire(ngx_http_waf_ds_slot_t *slot)
+{
+    void  *set;
+
+    (void) ngx_atomic_fetch_add(&slot->readers, 1);
+
+    ngx_memory_barrier();
+
+    set = slot->set;
+
+    if (set == NULL) {
+        (void) ngx_atomic_fetch_add(&slot->readers, -1);
+    }
+
+    return set;
+}
+
+
+static void
+ngx_http_waf_ds_release(ngx_http_waf_ds_slot_t *slot)
+{
+    (void) ngx_atomic_fetch_add(&slot->readers, -1);
 }
 
 
@@ -922,40 +1103,54 @@ ngx_http_waf_dataset_snapshot_claim(ngx_uint_t index, ngx_msec_t wait)
 
 
 ngx_uint_t
-ngx_http_waf_dataset_hit(ngx_http_waf_dataset_t *ds, ngx_str_t *value)
+ngx_http_waf_dataset_hit(ngx_http_waf_dataset_t *ds, ngx_str_t *value,
+    ngx_uint_t binary)
 {
     void                    *set;
-    ngx_int_t                hit;
+    u_char                   addr[16];
     u_char                   hex[NGX_HTTP_WAF_MD5_HEX_LEN];
     ngx_str_t                hashed;
+    ngx_uint_t               hit, fam, pos;
     ngx_http_waf_shm_t      *shm;
+    ngx_http_waf_set_t      *h;
     ngx_http_waf_ds_slot_t  *slot;
 
     if (value->len == 0) {
         return 0;
     }
 
-    if (ds->hash == NGX_HTTP_WAF_DS_HASH_MD5) {
-        ngx_http_waf_md5_hex(value, hex);
-        hashed.data = hex;
-        hashed.len = NGX_HTTP_WAF_MD5_HEX_LEN;
-        value = &hashed;
-    }
+    fam = 0;
 
     shm = ngx_http_waf_shm();
 
-    if (shm == NULL) {
+    if (shm == NULL || ds->index >= NGX_HTTP_WAF_MAX_DATASETS) {
         return 0;
     }
 
     slot = &shm->datasets[ds->index];
 
-    if (ngx_http_waf_ds_live_hit(ds, slot, value)) {
-        return 1;
-    }
+    if (ds->type == NGX_HTTP_WAF_DS_CIDR) {
 
-    if (ds->mode != NGX_HTTP_WAF_DS_MODE_INTERNAL) {
-        return 0;
+        if (ngx_http_waf_ds_addr(value, binary, &fam, addr) != NGX_OK) {
+            return 0;
+        }
+
+        if (ds->mode != NGX_HTTP_WAF_DS_MODE_INTERNAL) {
+            return ngx_http_waf_ds_live_probe(slot, fam, addr);
+        }
+
+    } else {
+
+        if (ds->hash == NGX_HTTP_WAF_DS_HASH_MD5) {
+            ngx_http_waf_md5_hex(value, hex);
+            hashed.data = hex;
+            hashed.len = NGX_HTTP_WAF_MD5_HEX_LEN;
+            value = &hashed;
+        }
+
+        if (ds->mode != NGX_HTTP_WAF_DS_MODE_INTERNAL) {
+            return ngx_http_waf_ds_live_hit(slot, value);
+        }
     }
 
     set = ngx_http_waf_ds_acquire(slot);
@@ -964,16 +1159,24 @@ ngx_http_waf_dataset_hit(ngx_http_waf_dataset_t *ds, ngx_str_t *value)
         return 0;
     }
 
-    hit = (slot->type == NGX_HTTP_WAF_DS_CIDR)
-              ? ngx_http_waf_ds_lookup_cidr(set, value)
-              : ngx_http_waf_ds_lookup_str(set, value);
+    h = set;
 
-    ngx_http_waf_ds_release(set);
+    if (h->type != ds->type) {
+        hit = 0;
 
-    return hit ? 1 : 0;
+    } else if (ds->type == NGX_HTTP_WAF_DS_CIDR) {
+        hit = ngx_http_waf_ds_lookup_cidr(set, fam, addr);
+
+    } else {
+        hit = (h->entries != 0
+               && ngx_http_waf_ds_str_probe(set, value->data, value->len,
+                                            &pos));
+    }
+
+    ngx_http_waf_ds_release(slot);
+
+    return hit;
 }
-
-
 
 
 void
@@ -1062,40 +1265,23 @@ ngx_http_waf_dataset_check(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule_name,
 }
 
 
-static ngx_int_t
-ngx_http_waf_ds_lookup_cidr(ngx_http_waf_cidr_set_t *set, ngx_str_t *value)
+static ngx_uint_t
+ngx_http_waf_ds_lookup_cidr(ngx_http_waf_cidr_set_t *set, ngx_uint_t fam,
+    u_char *addr)
 {
-    u_char      addr6[16];
-    uint32_t    addr;
+    uint32_t    a;
     ngx_uint_t  lo, hi, mid;
 
-    if (value->len == 4) {
-        addr = ((uint32_t) value->data[0] << 24)
-               + ((uint32_t) value->data[1] << 16)
-               + ((uint32_t) value->data[2] << 8)
-               + (uint32_t) value->data[3];
-
-    } else if (value->len == 16) {
-        ngx_memcpy(addr6, value->data, 16);
+    if (fam == 1) {
         goto v6;
-
-    } else {
-        in_addr_t  in = ngx_inet_addr(value->data, value->len);
-
-        if (in != INADDR_NONE) {
-            addr = ntohl(in);
-
-        } else if (ngx_inet6_addr(value->data, value->len, addr6) == NGX_OK) {
-            goto v6;
-
-        } else {
-            return 0;
-        }
     }
 
     if (set->n4 == 0) {
         return 0;
     }
+
+    a = ((uint32_t) addr[0] << 24) | ((uint32_t) addr[1] << 16)
+        | ((uint32_t) addr[2] << 8) | (uint32_t) addr[3];
 
     lo = 0;
     hi = set->n4;
@@ -1103,7 +1289,7 @@ ngx_http_waf_ds_lookup_cidr(ngx_http_waf_cidr_set_t *set, ngx_str_t *value)
     while (lo < hi) {
         mid = lo + (hi - lo) / 2;
 
-        if (set->v4_start[mid] <= addr) {
+        if (set->v4_start[mid] <= a) {
             lo = mid + 1;
 
         } else {
@@ -1115,7 +1301,7 @@ ngx_http_waf_ds_lookup_cidr(ngx_http_waf_cidr_set_t *set, ngx_str_t *value)
         return 0;
     }
 
-    return set->v4_cover[lo - 1] >= addr;
+    return set->v4_cover[lo - 1] >= a;
 
 v6:
 
@@ -1129,7 +1315,7 @@ v6:
     while (lo < hi) {
         mid = lo + (hi - lo) / 2;
 
-        if (ngx_memcmp(set->v6_start + mid * 16, addr6, 16) <= 0) {
+        if (ngx_memcmp(set->v6_start + mid * 16, addr, 16) <= 0) {
             lo = mid + 1;
 
         } else {
@@ -1141,20 +1327,7 @@ v6:
         return 0;
     }
 
-    return ngx_memcmp(set->v6_cover + (lo - 1) * 16, addr6, 16) >= 0;
-}
-
-
-static ngx_int_t
-ngx_http_waf_ds_lookup_str(ngx_http_waf_str_set_t *set, ngx_str_t *value)
-{
-    ngx_uint_t  slot;
-
-    if (set->h.entries == 0) {
-        return 0;
-    }
-
-    return ngx_http_waf_ds_str_probe(set, value->data, value->len, &slot);
+    return ngx_memcmp(set->v6_cover + (lo - 1) * 16, addr, 16) >= 0;
 }
 
 
@@ -1190,84 +1363,6 @@ ngx_http_waf_ds_str_probe(ngx_http_waf_str_set_t *set, u_char *data,
 }
 
 
-static void *
-ngx_http_waf_ds_acquire(ngx_http_waf_ds_slot_t *slot)
-{
-    ngx_uint_t           n;
-    ngx_http_waf_set_t  *set;
-
-    for (n = 0; n < NGX_HTTP_WAF_DS_ACQUIRE_TRIES; n++) {
-
-        set = slot->set;
-
-        if (set == NULL) {
-            return NULL;
-        }
-
-        (void) ngx_atomic_fetch_add(&set->readers, 1);
-
-        ngx_memory_barrier();
-
-        if (slot->set == set) {
-            return set;
-        }
-
-        (void) ngx_atomic_fetch_add(&set->readers, -1);
-    }
-
-    return NULL;
-}
-
-
-static void
-ngx_http_waf_ds_release(void *set)
-{
-    (void) ngx_atomic_fetch_add(&((ngx_http_waf_set_t *) set)->readers, -1);
-}
-
-
-static void
-ngx_http_waf_ds_retire(ngx_http_waf_shm_t *shm, ngx_http_waf_ds_slot_t *slot,
-    void *set)
-{
-    ngx_uint_t  i;
-
-    ngx_http_waf_ds_reclaim(shm, slot);
-
-    for (i = 0; i < NGX_HTTP_WAF_DS_RETIRED; i++) {
-        if (slot->retired[i] == NULL) {
-            slot->retired[i] = set;
-            return;
-        }
-    }
-
-    ngx_log_error(NGX_LOG_ALERT, ngx_cycle->log, 0,
-                  "waf: dataset \"%*s\" leaked a retired set: all %d retire "
-                  "slots are busy", (size_t) slot->name_len, slot->name,
-                  NGX_HTTP_WAF_DS_RETIRED);
-}
-
-
-static void
-ngx_http_waf_ds_reclaim(ngx_http_waf_shm_t *shm, ngx_http_waf_ds_slot_t *slot)
-{
-    ngx_uint_t           i;
-    ngx_http_waf_set_t  *set;
-
-    for (i = 0; i < NGX_HTTP_WAF_DS_RETIRED; i++) {
-
-        set = slot->retired[i];
-
-        if (set == NULL || set->readers != 0) {
-            continue;
-        }
-
-        ngx_slab_free_locked(shm->shpool, set);
-        slot->retired[i] = NULL;
-    }
-}
-
-
 #define NGX_HTTP_WAF_PACK_HEADER    52
 #define NGX_HTTP_WAF_PACK_SNAPSHOT  1
 #define NGX_HTTP_WAF_PACK_PACKAGE   2
@@ -1298,10 +1393,6 @@ typedef struct {
     ngx_uint_t                type;
     ngx_uint_t                flags;
 } ngx_http_waf_ds_cursor_t;
-
-
-static uint64_t
-ngx_http_waf_ds_le64(const u_char *p);
 
 
 static ngx_int_t
@@ -1368,7 +1459,7 @@ ngx_http_waf_ds_pack_next(ngx_http_waf_ds_cursor_t *cur, ngx_uint_t *op,
             return NGX_ERROR;
         }
 
-        if (p + 2 + n + 8 > cur->last) {
+        if (p[1] > n * 8 || p + 2 + n + 8 > cur->last) {
             return NGX_ERROR;
         }
 
@@ -1449,23 +1540,27 @@ ngx_http_waf_ds_now_ms(void)
 
 
 static ngx_int_t
-ngx_http_waf_ds_locate(ngx_uint_t index, ngx_http_waf_dataset_t **ds,
-    ngx_http_waf_ds_slot_t **slot)
+ngx_http_waf_ds_locate(ngx_uint_t index, ngx_http_waf_shm_t **shm,
+    ngx_http_waf_dataset_t **ds, ngx_http_waf_ds_slot_t **slot)
 {
-    ngx_http_waf_shm_t        *shm;
     ngx_http_waf_main_conf_t  *wmcf;
 
-    shm  = ngx_http_waf_shm();
+    *shm = ngx_http_waf_shm();
     wmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_waf_module);
 
-    if (shm == NULL || wmcf == NULL || wmcf->datasets == NULL
+    if (*shm == NULL || wmcf == NULL || wmcf->datasets == NULL
         || index >= wmcf->datasets->nelts)
     {
         return NGX_ERROR;
     }
 
-    *ds   = &((ngx_http_waf_dataset_t *) wmcf->datasets->elts)[index];
-    *slot = &shm->datasets[(*ds)->index];
+    *ds = &((ngx_http_waf_dataset_t *) wmcf->datasets->elts)[index];
+
+    if ((*ds)->index >= NGX_HTTP_WAF_MAX_DATASETS) {
+        return NGX_ERROR;
+    }
+
+    *slot = &(*shm)->datasets[(*ds)->index];
 
     return NGX_OK;
 }
@@ -1487,17 +1582,18 @@ ngx_int_t
 ngx_http_waf_dataset_apply_package(ngx_uint_t index, ngx_str_t *data)
 {
     int64_t                    exp, now_ms;
-    uint64_t                   have, h;
+    uint64_t                   have, h, epoch;
     ngx_int_t                  rc;
     ngx_str_t                  key;
     uint32_t                   gen;
-    ngx_uint_t                 op, n, lost;
+    ngx_uint_t                 op, k, n, lost;
+    ngx_http_waf_shm_t        *shm;
     ngx_http_waf_dataset_t    *ds;
     ngx_http_waf_ds_slot_t    *slot;
     ngx_http_waf_ds_pack_t     head;
-    ngx_http_waf_ds_cursor_t   cur;
+    ngx_http_waf_ds_cursor_t   cur, scan;
 
-    if (ngx_http_waf_ds_locate(index, &ds, &slot) != NGX_OK) {
+    if (ngx_http_waf_ds_locate(index, &shm, &ds, &slot) != NGX_OK) {
         return NGX_HTTP_WAF_DS_MALFORMED;
     }
 
@@ -1517,17 +1613,35 @@ ngx_http_waf_dataset_apply_package(ngx_uint_t index, ngx_str_t *data)
         return NGX_HTTP_WAF_DS_FOREIGN;
     }
 
+    scan = cur;
+    n = 0;
+
+    while ((rc = ngx_http_waf_ds_pack_next(&scan, &op, &key, &exp)) == NGX_OK)
+    {
+        n++;
+    }
+
+    if (rc != NGX_DONE) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "waf: dataset \"%V\": package seq %uL is truncated "
+                      "after %ui records, nothing applied", &ds->name,
+                      head.seq, n);
+        return NGX_HTTP_WAF_DS_MALFORMED;
+    }
+
     now_ms = ngx_http_waf_ds_now_ms();
 
     ngx_rwlock_wlock(&slot->lock);
 
-    if (slot->epoch == 0 || head.epoch != slot->epoch) {
+    epoch = slot->epoch;
+
+    if (epoch == 0 || head.epoch != epoch) {
         ngx_rwlock_unlock(&slot->lock);
 
         ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
                       "waf: dataset \"%V\" got package of epoch %016xL, have "
                       "%016xL, snapshot required", &ds->name, head.epoch,
-                      slot->epoch);
+                      epoch);
         return NGX_HTTP_WAF_DS_FOREIGN;
     }
 
@@ -1546,48 +1660,56 @@ ngx_http_waf_dataset_apply_package(ngx_uint_t index, ngx_str_t *data)
         return NGX_HTTP_WAF_DS_GAP;
     }
 
-    gen  = ngx_http_waf_ds_live_gen(slot);
-    n    = 0;
+    slot->syncing = 1;
+    gen = ngx_http_waf_ds_live_gen(slot);
+
+    ngx_rwlock_unlock(&slot->lock);
+
+    have = 0;
     lost = 0;
+    rc   = NGX_OK;
 
-    for ( ;; ) {
-        rc = ngx_http_waf_ds_pack_next(&cur, &op, &key, &exp);
+    while (rc == NGX_OK) {
 
-        if (rc == NGX_DONE) {
-            break;
+        ngx_rwlock_wlock(&slot->lock);
+
+        for (k = 0; k < NGX_HTTP_WAF_DS_BATCH; k++) {
+            rc = ngx_http_waf_ds_pack_next(&cur, &op, &key, &exp);
+
+            if (rc != NGX_OK) {
+                break;
+            }
+
+            if (op == NGX_HTTP_WAF_PACK_REMOVE) {
+                (void) ngx_http_waf_ds_live_drop(shm, slot, &key);
+                continue;
+            }
+
+            if (op != NGX_HTTP_WAF_PACK_ADD) {
+                continue;
+            }
+
+            h = ngx_http_waf_ds_siphash(slot->key, key.data, key.len);
+
+            rc = ngx_http_waf_ds_live_put(shm, slot, &key,
+                                          ngx_http_waf_ds_expires(exp, now_ms),
+                                          h, gen);
+
+            if (rc == NGX_ERROR || rc == NGX_BUSY) {
+                lost++;
+            }
+
+            rc = NGX_OK;
         }
 
         if (rc != NGX_OK) {
-            ngx_rwlock_unlock(&slot->lock);
-
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "waf: dataset \"%V\": package seq %uL is truncated "
-                          "after %ui records", &ds->name, head.seq, n);
-            return NGX_HTTP_WAF_DS_MALFORMED;
+            slot->seq     = head.seq;
+            slot->syncing = 0;
+            have          = slot->live_hash;
         }
 
-        n++;
-
-        if (op == NGX_HTTP_WAF_PACK_REMOVE) {
-            (void) ngx_http_waf_ds_live_drop(slot, &key);
-            continue;
-        }
-
-        h = ngx_http_waf_ds_siphash(slot->key, key.data, key.len);
-
-        if (ngx_http_waf_ds_live_put(slot, &key,
-                                     ngx_http_waf_ds_expires(exp, now_ms),
-                                     h, gen) == NGX_ERROR)
-        {
-            lost++;
-        }
+        ngx_rwlock_unlock(&slot->lock);
     }
-
-    slot->seq     = head.seq;
-    slot->updated = ngx_time();
-    have          = slot->live_hash;
-
-    ngx_rwlock_unlock(&slot->lock);
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
                    "waf: dataset \"%V\" applied package seq %uL, %ui records",
@@ -1615,22 +1737,23 @@ ngx_int_t
 ngx_http_waf_dataset_apply_snapshot(ngx_uint_t index, ngx_str_t *data)
 {
     int64_t                    exp, now_ms;
-    uint64_t                   have, h;
+    uint64_t                   have, h, seq;
     ngx_int_t                  rc;
     ngx_str_t                  key;
     uint32_t                   gen;
-    ngx_uint_t                 op, n, k, lost, swept, entries;
+    ngx_uint_t                 op, n, k, adds, cap, lost, swept, entries;
     ngx_rbtree_node_t         *cursor;
+    ngx_http_waf_shm_t        *shm;
     ngx_http_waf_dataset_t    *ds;
     ngx_http_waf_ds_slot_t    *slot;
     ngx_http_waf_ds_pack_t     head;
-    ngx_http_waf_ds_cursor_t   cur;
+    ngx_http_waf_ds_cursor_t   start, cur;
 
-    if (ngx_http_waf_ds_locate(index, &ds, &slot) != NGX_OK) {
+    if (ngx_http_waf_ds_locate(index, &shm, &ds, &slot) != NGX_OK) {
         return NGX_HTTP_WAF_DS_MALFORMED;
     }
 
-    if (ngx_http_waf_ds_pack_head(data, &head, &cur) != NGX_OK
+    if (ngx_http_waf_ds_pack_head(data, &head, &start) != NGX_OK
         || head.kind != NGX_HTTP_WAF_PACK_SNAPSHOT)
     {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
@@ -1646,10 +1769,34 @@ ngx_http_waf_dataset_apply_snapshot(ngx_uint_t index, ngx_str_t *data)
         return NGX_HTTP_WAF_DS_FOREIGN;
     }
 
-    if (head.count > ds->max) {
+    cur  = start;
+    n    = 0;
+    adds = 0;
+
+    while ((rc = ngx_http_waf_ds_pack_next(&cur, &op, &key, &exp)) == NGX_OK) {
+        n++;
+
+        if (op == NGX_HTTP_WAF_PACK_ADD) {
+            adds++;
+        }
+    }
+
+    if (rc != NGX_DONE) {
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "waf: dataset \"%V\": snapshot object is truncated after "
+                      "%ui of %ui records, nothing applied", &ds->name, n,
+                      head.count);
+        return NGX_HTTP_WAF_DS_MALFORMED;
+    }
+
+    cap = (slot->live_max != 0) ? slot->live_max : NGX_HTTP_WAF_DS_LIVE_MAX;
+    cap = ngx_min(cap, ds->max);
+
+    if (head.count > cap || adds > cap) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                       "waf: dataset \"%V\" snapshot rejected: %ui entries "
-                      "exceed limit=%ui", &ds->name, head.count, ds->max);
+                      "exceed the limit of %ui, the current entries stay",
+                      &ds->name, ngx_max(head.count, adds), cap);
         return NGX_HTTP_WAF_DS_MALFORMED;
     }
 
@@ -1662,19 +1809,36 @@ ngx_http_waf_dataset_apply_snapshot(ngx_uint_t index, ngx_str_t *data)
         return NGX_HTTP_WAF_DS_BUSY;
     }
 
-    gen = ngx_http_waf_ds_live_begin(slot);
+    seq = slot->seq;
+
+    if (slot->epoch != 0 && head.epoch == slot->epoch && head.seq < seq) {
+        ngx_rwlock_unlock(&slot->lock);
+
+        ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
+                      "waf: dataset \"%V\" dropped a stale snapshot seq %uL, "
+                      "have seq %uL", &ds->name, head.seq, seq);
+        return NGX_HTTP_WAF_DS_STALE;
+    }
+
+    gen = ngx_http_waf_ds_live_begin(shm, slot);
 
     if (gen == 0) {
         ngx_rwlock_unlock(&slot->lock);
+
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "waf: dataset \"%V\" snapshot rejected: no room in the "
+                      "zone for its overlay", &ds->name);
         return NGX_HTTP_WAF_DS_MALFORMED;
     }
 
     slot->syncing = 1;
+
     ngx_rwlock_unlock(&slot->lock);
 
-    n    = 0;
-    lost = 0;
-    rc   = NGX_OK;
+    /* entries the snapshot keeps are marked, the rest leave before it loads */
+
+    cur = start;
+    rc  = NGX_OK;
 
     while (rc == NGX_OK) {
 
@@ -1687,34 +1851,12 @@ ngx_http_waf_dataset_apply_snapshot(ngx_uint_t index, ngx_str_t *data)
                 break;
             }
 
-            n++;
-
-            if (op != NGX_HTTP_WAF_PACK_ADD) {
-                continue;
-            }
-
-            h = ngx_http_waf_ds_siphash(head.key, key.data, key.len);
-
-            if (ngx_http_waf_ds_live_put(slot, &key,
-                                         ngx_http_waf_ds_expires(exp, now_ms),
-                                         h, gen) == NGX_ERROR)
-            {
-                lost++;
+            if (op == NGX_HTTP_WAF_PACK_ADD) {
+                ngx_http_waf_ds_live_mark(slot, &key, gen);
             }
         }
 
         ngx_rwlock_unlock(&slot->lock);
-    }
-
-    if (rc == NGX_ERROR) {
-        ngx_rwlock_wlock(&slot->lock);
-        slot->syncing = 0;
-        ngx_rwlock_unlock(&slot->lock);
-
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "waf: dataset \"%V\": snapshot object is truncated after "
-                      "%ui of %ui records", &ds->name, n, head.count);
-        return NGX_HTTP_WAF_DS_MALFORMED;
     }
 
     cursor = NULL;
@@ -1722,16 +1864,50 @@ ngx_http_waf_dataset_apply_snapshot(ngx_uint_t index, ngx_str_t *data)
 
     do {
         ngx_rwlock_wlock(&slot->lock);
-        rc = ngx_http_waf_ds_live_sweep(slot, gen, NGX_HTTP_WAF_DS_BATCH,
+        rc = ngx_http_waf_ds_live_sweep(shm, slot, gen, NGX_HTTP_WAF_DS_BATCH,
                                         &cursor, &swept);
         ngx_rwlock_unlock(&slot->lock);
     } while (rc == NGX_AGAIN);
+
+    cur  = start;
+    rc   = NGX_OK;
+    lost = 0;
+
+    while (rc == NGX_OK) {
+
+        ngx_rwlock_wlock(&slot->lock);
+
+        for (k = 0; k < NGX_HTTP_WAF_DS_BATCH; k++) {
+            rc = ngx_http_waf_ds_pack_next(&cur, &op, &key, &exp);
+
+            if (rc != NGX_OK) {
+                break;
+            }
+
+            if (op != NGX_HTTP_WAF_PACK_ADD) {
+                continue;
+            }
+
+            h = ngx_http_waf_ds_siphash(head.key, key.data, key.len);
+
+            rc = ngx_http_waf_ds_live_put(shm, slot, &key,
+                                          ngx_http_waf_ds_expires(exp, now_ms),
+                                          h, gen);
+
+            if (rc == NGX_ERROR || rc == NGX_BUSY) {
+                lost++;
+            }
+
+            rc = NGX_OK;
+        }
+
+        ngx_rwlock_unlock(&slot->lock);
+    }
 
     ngx_rwlock_wlock(&slot->lock);
 
     slot->epoch   = head.epoch;
     slot->seq     = head.seq;
-    slot->updated = ngx_time();
     ngx_memcpy(slot->key, head.key, 16);
     slot->syncing = 0;
 
@@ -1756,8 +1932,8 @@ ngx_http_waf_dataset_apply_snapshot(ngx_uint_t index, ngx_str_t *data)
     if (have != head.hash) {
         ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                       "waf: dataset \"%V\" snapshot hash mismatch: keeper "
-                      "%016xL, built %016xL; further divergence is logged, "
-                      "not resynced", &ds->name, head.hash, have);
+                      "%016xL, built %016xL; divergence within this epoch is "
+                      "logged, not resynced", &ds->name, head.hash, have);
         return NGX_HTTP_WAF_DS_DIVERGED;
     }
 
@@ -1770,11 +1946,12 @@ ngx_http_waf_dataset_verify(ngx_uint_t index, uint64_t epoch, uint64_t seq,
     uint64_t hash)
 {
     uint64_t                 have, my_seq, my_epoch;
-    ngx_uint_t               syncing;
+    ngx_uint_t               syncing, bad;
+    ngx_http_waf_shm_t      *shm;
     ngx_http_waf_dataset_t  *ds;
     ngx_http_waf_ds_slot_t  *slot;
 
-    if (ngx_http_waf_ds_locate(index, &ds, &slot) != NGX_OK) {
+    if (ngx_http_waf_ds_locate(index, &shm, &ds, &slot) != NGX_OK) {
         return NGX_HTTP_WAF_DS_MALFORMED;
     }
 
@@ -1783,6 +1960,7 @@ ngx_http_waf_dataset_verify(ngx_uint_t index, uint64_t epoch, uint64_t seq,
     my_seq   = slot->seq;
     have     = slot->live_hash;
     syncing  = slot->syncing;
+    bad      = slot->snap_bad;
     ngx_rwlock_unlock(&slot->lock);
 
     if (my_epoch == 0 || epoch != my_epoch) {
@@ -1808,6 +1986,18 @@ ngx_http_waf_dataset_verify(ngx_uint_t index, uint64_t epoch, uint64_t seq,
         return NGX_HTTP_WAF_DS_DIVERGED;
     }
 
+    if (bad) {
+        ngx_rwlock_wlock(&slot->lock);
+
+        if (slot->epoch == epoch && slot->seq == seq
+            && slot->live_hash == hash)
+        {
+            slot->snap_bad = 0;
+        }
+
+        ngx_rwlock_unlock(&slot->lock);
+    }
+
     return NGX_HTTP_WAF_DS_APPLIED;
 }
 
@@ -1816,10 +2006,11 @@ ngx_uint_t
 ngx_http_waf_dataset_snap_bad(ngx_uint_t index)
 {
     ngx_uint_t               bad;
+    ngx_http_waf_shm_t      *shm;
     ngx_http_waf_dataset_t  *ds;
     ngx_http_waf_ds_slot_t  *slot;
 
-    if (ngx_http_waf_ds_locate(index, &ds, &slot) != NGX_OK) {
+    if (ngx_http_waf_ds_locate(index, &shm, &ds, &slot) != NGX_OK) {
         return 0;
     }
 
@@ -1834,58 +2025,40 @@ ngx_http_waf_dataset_snap_bad(ngx_uint_t index)
 void
 ngx_http_waf_dataset_state(ngx_uint_t index, uint64_t *epoch, uint64_t *seq)
 {
-    ngx_http_waf_shm_t        *shm;
-    ngx_http_waf_dataset_t    *ds;
-    ngx_http_waf_ds_slot_t    *slot;
-    ngx_http_waf_main_conf_t  *wmcf;
+    ngx_http_waf_shm_t      *shm;
+    ngx_http_waf_dataset_t  *ds;
+    ngx_http_waf_ds_slot_t  *slot;
 
     *epoch = 0;
     *seq   = 0;
 
-    shm  = ngx_http_waf_shm();
-    wmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_waf_module);
-
-    if (shm == NULL || wmcf == NULL || wmcf->datasets == NULL
-        || index >= wmcf->datasets->nelts)
-    {
+    if (ngx_http_waf_ds_locate(index, &shm, &ds, &slot) != NGX_OK) {
         return;
     }
 
-    ds   = &((ngx_http_waf_dataset_t *) wmcf->datasets->elts)[index];
-    slot = &shm->datasets[ds->index];
-
-    ngx_shmtx_lock(&shm->shpool->mutex);
+    ngx_rwlock_rlock(&slot->lock);
     *epoch = slot->epoch;
     *seq   = slot->seq;
-    ngx_shmtx_unlock(&shm->shpool->mutex);
+    ngx_rwlock_unlock(&slot->lock);
 }
 
 
 ngx_msec_int_t
 ngx_http_waf_dataset_seen(ngx_uint_t index, ngx_uint_t touch,
-    ngx_uint_t *first_silence)
+    ngx_msec_t silence, ngx_uint_t *first_silence)
 {
-    ngx_msec_int_t             age;
-    ngx_http_waf_shm_t        *shm;
-    ngx_http_waf_dataset_t    *ds;
-    ngx_http_waf_ds_slot_t    *slot;
-    ngx_http_waf_main_conf_t  *wmcf;
+    ngx_msec_int_t           age;
+    ngx_http_waf_shm_t      *shm;
+    ngx_http_waf_dataset_t  *ds;
+    ngx_http_waf_ds_slot_t  *slot;
 
     if (first_silence != NULL) {
         *first_silence = 0;
     }
 
-    shm  = ngx_http_waf_shm();
-    wmcf = ngx_http_cycle_get_module_main_conf(ngx_cycle, ngx_http_waf_module);
-
-    if (shm == NULL || wmcf == NULL || wmcf->datasets == NULL
-        || index >= wmcf->datasets->nelts)
-    {
+    if (ngx_http_waf_ds_locate(index, &shm, &ds, &slot) != NGX_OK) {
         return 0;
     }
-
-    ds   = &((ngx_http_waf_dataset_t *) wmcf->datasets->elts)[index];
-    slot = &shm->datasets[ds->index];
 
     ngx_shmtx_lock(&shm->shpool->mutex);
 
@@ -1898,7 +2071,9 @@ ngx_http_waf_dataset_seen(ngx_uint_t index, ngx_uint_t touch,
         age = (slot->seen == 0) ? 0
                                 : (ngx_msec_int_t) (ngx_current_msec - slot->seen);
 
-        if (first_silence != NULL && !slot->silent && age > 0) {
+        if (first_silence != NULL && !slot->silent
+            && age > (ngx_msec_int_t) silence)
+        {
             slot->silent   = 1;
             *first_silence = 1;
         }
@@ -2058,10 +2233,11 @@ ngx_http_waf_dataset_notice(ngx_uint_t index, ngx_str_t *payload,
     ngx_int_t                rc, v, num;
     ngx_str_t                key, value;
     ngx_http_waf_jp_t        jp;
+    ngx_http_waf_shm_t      *shm;
     ngx_http_waf_dataset_t  *ds;
     ngx_http_waf_ds_slot_t  *slot;
 
-    if (ngx_http_waf_ds_locate(index, &ds, &slot) != NGX_OK) {
+    if (ngx_http_waf_ds_locate(index, &shm, &ds, &slot) != NGX_OK) {
         return NGX_ERROR;
     }
 
@@ -2189,16 +2365,6 @@ ngx_http_waf_dataset_notice(ngx_uint_t index, ngx_str_t *payload,
             continue;
         }
 
-        if (key.len == 7 && ngx_strncmp(key.data, "package", 7) == 0) {
-            if (ngx_http_waf_jp_string(&jp, &value) != NGX_OK
-                || ngx_http_waf_ds_copy(pool, &value, &n->package) != NGX_OK)
-            {
-                goto invalid;
-            }
-
-            continue;
-        }
-
         if (key.len == 6 && ngx_strncmp(key.data, "object", 6) == 0) {
             if (ngx_http_waf_jp_string(&jp, &value) != NGX_OK
                 || ngx_http_waf_ds_copy(pool, &value, &n->object) != NGX_OK)
@@ -2225,7 +2391,7 @@ ngx_http_waf_dataset_notice(ngx_uint_t index, ngx_str_t *payload,
 invalid:
 
     len  = ngx_min(payload->len, 96);
-    last = head + ngx_escape_json(head, payload->data, len);
+    last = (u_char *) ngx_escape_json(head, payload->data, len);
 
     ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
                   "waf: malformed dataset message at %uz of %uz: %s: \"%*s\"",
@@ -2237,14 +2403,12 @@ invalid:
 }
 
 
-
 static ngx_int_t
-ngx_http_waf_ds_entry_cidr(ngx_str_t *text, ngx_http_waf_ds_update_t *up,
-    uint64_t h)
+ngx_http_waf_ds_entry_cidr(ngx_str_t *text, ngx_array_t *r4, ngx_array_t *r6)
 {
     ngx_int_t              rc;
     ngx_cidr_t             cidr;
-    ngx_http_waf_ds_r4_t  *r4;
+    ngx_http_waf_ds_r4_t  *e4;
 
     rc = ngx_ptocidr(text, &cidr);
 
@@ -2252,42 +2416,64 @@ ngx_http_waf_ds_entry_cidr(ngx_str_t *text, ngx_http_waf_ds_update_t *up,
         return NGX_ERROR;
     }
 
-    if (cidr.family == AF_INET) {
-        r4 = ngx_array_push(up->r4);
-        if (r4 == NULL) {
-            return NGX_ERROR;
-        }
-
-        r4->start = ntohl(cidr.u.in.addr);
-        r4->end   = r4->start | ~ntohl(cidr.u.in.mask);
-        r4->h     = h;
-
-        return NGX_OK;
-    }
-
 #if (NGX_HAVE_INET6)
     if (cidr.family == AF_INET6) {
-        ngx_uint_t             i;
-        ngx_http_waf_ds_r6_t  *r6;
+        u_char                *a, *m;
+        ngx_uint_t             i, mapped;
+        ngx_http_waf_ds_r6_t  *e6;
 
-        r6 = ngx_array_push(up->r6);
-        if (r6 == NULL) {
+        a = cidr.u.in6.addr.s6_addr;
+        m = cidr.u.in6.mask.s6_addr;
+
+        mapped = (a[10] == 0xff && a[11] == 0xff
+                  && m[10] == 0xff && m[11] == 0xff);
+
+        for (i = 0; mapped && i < 10; i++) {
+            mapped = (a[i] == 0 && m[i] == 0xff);
+        }
+
+        if (!mapped) {
+            e6 = ngx_array_push(r6);
+            if (e6 == NULL) {
+                return NGX_ERROR;
+            }
+
+            for (i = 0; i < 16; i++) {
+                e6->start[i] = a[i];
+                e6->end[i]   = (u_char) (a[i] | ~m[i]);
+            }
+
+            return NGX_OK;
+        }
+
+        e4 = ngx_array_push(r4);
+        if (e4 == NULL) {
             return NGX_ERROR;
         }
 
-        for (i = 0; i < 16; i++) {
-            r6->start[i] = cidr.u.in6.addr.s6_addr[i];
-            r6->end[i]   = (u_char) (r6->start[i]
-                                     | ~cidr.u.in6.mask.s6_addr[i]);
-        }
-
-        r6->h = h;
+        e4->start = ((uint32_t) a[12] << 24) | ((uint32_t) a[13] << 16)
+                    | ((uint32_t) a[14] << 8) | (uint32_t) a[15];
+        e4->end   = e4->start
+                    | ~(((uint32_t) m[12] << 24) | ((uint32_t) m[13] << 16)
+                        | ((uint32_t) m[14] << 8) | (uint32_t) m[15]);
 
         return NGX_OK;
     }
 #endif
 
-    return NGX_ERROR;
+    if (cidr.family != AF_INET) {
+        return NGX_ERROR;
+    }
+
+    e4 = ngx_array_push(r4);
+    if (e4 == NULL) {
+        return NGX_ERROR;
+    }
+
+    e4->start = ntohl(cidr.u.in.addr);
+    e4->end   = e4->start | ~ntohl(cidr.u.in.mask);
+
+    return NGX_OK;
 }
 
 
@@ -2328,51 +2514,40 @@ ngx_http_waf_ds_sort_uniq(ngx_array_t *a,
 
 
 static void *
-ngx_http_waf_ds_build_cidr(ngx_http_waf_shm_t *shm,
-    ngx_http_waf_ds_update_t *up)
+ngx_http_waf_ds_build_cidr(ngx_http_waf_shm_t *shm, ngx_array_t *r4,
+    ngx_array_t *r6)
 {
     u_char                   *p;
     size_t                    size;
     uint32_t                  cover;
     ngx_uint_t                i, n4, n6;
-    ngx_http_waf_ds_r4_t     *r4;
-    ngx_http_waf_ds_r6_t     *r6;
+    ngx_http_waf_ds_r4_t     *e4;
+    ngx_http_waf_ds_r6_t     *e6;
     ngx_http_waf_cidr_set_t  *set;
 
-    n4 = up->r4->nelts;
-    n6 = up->r6->nelts;
-    r4 = up->r4->elts;
-    r6 = up->r6->elts;
+    n4 = r4->nelts;
+    n6 = r6->nelts;
+    e4 = r4->elts;
+    e6 = r6->elts;
 
-    size = ngx_align(sizeof(ngx_http_waf_cidr_set_t), sizeof(uint64_t))
-           + ngx_align(n4 * 3 * sizeof(uint32_t), sizeof(uint64_t))
-           + n6 * 3 * 16
-           + (n4 + n6) * sizeof(uint64_t);
+    size = ngx_align(sizeof(ngx_http_waf_cidr_set_t), NGX_ALIGNMENT)
+           + n4 * 2 * sizeof(uint32_t)
+           + n6 * 2 * 16;
 
-    set = ngx_slab_calloc_locked(shm->shpool, size);
+    set = ngx_slab_calloc(shm->shpool, size);
     if (set == NULL) {
         return NULL;
     }
 
+    set->h.type    = NGX_HTTP_WAF_DS_CIDR;
     set->h.entries = n4 + n6;
-    set->h.size    = size;
 
-    p = (u_char *) set
-        + ngx_align(sizeof(ngx_http_waf_cidr_set_t), sizeof(uint64_t));
+    p = (u_char *) set + ngx_align(sizeof(ngx_http_waf_cidr_set_t),
+                                   NGX_ALIGNMENT);
 
     set->v4_start = (uint32_t *) p;  p += n4 * sizeof(uint32_t);
-    set->v4_end   = (uint32_t *) p;  p += n4 * sizeof(uint32_t);
     set->v4_cover = (uint32_t *) p;  p += n4 * sizeof(uint32_t);
-
-    p = (u_char *) set
-        + ngx_align(sizeof(ngx_http_waf_cidr_set_t), sizeof(uint64_t))
-        + ngx_align(n4 * 3 * sizeof(uint32_t), sizeof(uint64_t));
-
-    set->v4_h     = (uint64_t *) p;  p += n4 * sizeof(uint64_t);
-    set->v6_h     = (uint64_t *) p;  p += n6 * sizeof(uint64_t);
-
     set->v6_start = p;               p += n6 * 16;
-    set->v6_end   = p;               p += n6 * 16;
     set->v6_cover = p;
 
     set->n4 = n4;
@@ -2381,28 +2556,22 @@ ngx_http_waf_ds_build_cidr(ngx_http_waf_shm_t *shm,
     cover = 0;
 
     for (i = 0; i < n4; i++) {
-        set->v4_start[i] = r4[i].start;
-        set->v4_end[i]   = r4[i].end;
-        set->v4_h[i]     = r4[i].h;
-        set->h.hash     ^= r4[i].h;
+        set->v4_start[i] = e4[i].start;
 
-        if (i == 0 || r4[i].end > cover) {
-            cover = r4[i].end;
+        if (i == 0 || e4[i].end > cover) {
+            cover = e4[i].end;
         }
 
         set->v4_cover[i] = cover;
     }
 
     for (i = 0; i < n6; i++) {
-        ngx_memcpy(set->v6_start + i * 16, r6[i].start, 16);
-        ngx_memcpy(set->v6_end + i * 16, r6[i].end, 16);
-        set->v6_h[i]  = r6[i].h;
-        set->h.hash  ^= r6[i].h;
+        ngx_memcpy(set->v6_start + i * 16, e6[i].start, 16);
 
-        if (i == 0 || ngx_memcmp(r6[i].end, set->v6_cover + (i - 1) * 16, 16)
-                          > 0)
+        if (i == 0
+            || ngx_memcmp(e6[i].end, set->v6_cover + (i - 1) * 16, 16) > 0)
         {
-            ngx_memcpy(set->v6_cover + i * 16, r6[i].end, 16);
+            ngx_memcpy(set->v6_cover + i * 16, e6[i].end, 16);
 
         } else {
             ngx_memcpy(set->v6_cover + i * 16, set->v6_cover + (i - 1) * 16,
@@ -2415,8 +2584,7 @@ ngx_http_waf_ds_build_cidr(ngx_http_waf_shm_t *shm,
 
 
 static void *
-ngx_http_waf_ds_build_str(ngx_http_waf_shm_t *shm,
-    ngx_http_waf_ds_update_t *up)
+ngx_http_waf_ds_build_str(ngx_http_waf_shm_t *shm, ngx_array_t *str)
 {
     u_char                  *p;
     size_t                   size, blob_len;
@@ -2424,8 +2592,8 @@ ngx_http_waf_ds_build_str(ngx_http_waf_shm_t *shm,
     ngx_uint_t               i, n, slot, table;
     ngx_http_waf_str_set_t  *set;
 
-    items = up->str->elts;
-    n     = up->str->nelts;
+    items = str->elts;
+    n     = str->nelts;
 
     table = 8;
 
@@ -2444,20 +2612,24 @@ ngx_http_waf_ds_build_str(ngx_http_waf_shm_t *shm,
         blob_len += 2 + items[i].len;
     }
 
-    size = ngx_align(sizeof(ngx_http_waf_str_set_t), sizeof(uint32_t))
+    if (blob_len >= 0xffffffff) {
+        return NULL;
+    }
+
+    size = ngx_align(sizeof(ngx_http_waf_str_set_t), NGX_ALIGNMENT)
            + table * sizeof(uint32_t)
            + blob_len;
 
-    set = ngx_slab_calloc_locked(shm->shpool, size);
+    set = ngx_slab_calloc(shm->shpool, size);
     if (set == NULL) {
         return NULL;
     }
 
-    set->h.size  = size;
-    set->mask    = table - 1;
+    set->h.type = NGX_HTTP_WAF_DS_STRING;
+    set->mask   = table - 1;
 
-    p = (u_char *) set
-        + ngx_align(sizeof(ngx_http_waf_str_set_t), sizeof(uint32_t));
+    p = (u_char *) set + ngx_align(sizeof(ngx_http_waf_str_set_t),
+                                   NGX_ALIGNMENT);
 
     set->table = (uint32_t *) p;  p += table * sizeof(uint32_t);
     set->blob  = p;
@@ -2468,9 +2640,6 @@ ngx_http_waf_ds_build_str(ngx_http_waf_shm_t *shm,
 
         ngx_memcpy(p, items[i].data, items[i].len);
 
-        set->h.hash ^= ngx_http_waf_ds_siphash(up->key, items[i].data,
-                                               items[i].len);
-
         (void) ngx_http_waf_ds_str_probe(set, p, items[i].len, &slot);
 
         set->table[slot] = (uint32_t) (p - 2 - set->blob) + 1;
@@ -2478,7 +2647,6 @@ ngx_http_waf_ds_build_str(ngx_http_waf_shm_t *shm,
         p += items[i].len;
     }
 
-    set->blob_len  = blob_len;
     set->h.entries = n;
 
     return set;

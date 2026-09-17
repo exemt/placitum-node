@@ -9,28 +9,61 @@
 #define NGX_HTTP_WAF_BREAKER_MIN_SAMPLES  20
 
 
+static ngx_http_waf_breaker_t *ngx_http_waf_breaker_get(ngx_uint_t index,
+    ngx_http_waf_inspector_t *insp);
 static void ngx_http_waf_breaker_open(ngx_http_waf_breaker_t *b,
     ngx_http_waf_inspector_t *insp, ngx_msec_t now);
 static void ngx_http_waf_breaker_close(ngx_http_waf_breaker_t *b,
     ngx_http_waf_inspector_t *insp, ngx_msec_t now);
 
 
+static ngx_http_waf_breaker_t *
+ngx_http_waf_breaker_get(ngx_uint_t index, ngx_http_waf_inspector_t *insp)
+{
+    uint32_t                 tag;
+    ngx_atomic_uint_t        old;
+    ngx_http_waf_shm_t      *shm;
+    ngx_http_waf_breaker_t  *b;
+
+    if (!insp->breaker || index >= NGX_HTTP_WAF_MAX_INSPECTORS) {
+        return NULL;
+    }
+
+    shm = ngx_http_waf_shm();
+
+    if (shm == NULL) {
+        return NULL;
+    }
+
+    b   = &shm->breakers[index];
+    tag = ngx_crc32_short(insp->name.data, insp->name.len);
+    old = b->tag;
+
+    /* the slot is keyed by position: another inspector there starts afresh */
+
+    if (old != (ngx_atomic_uint_t) tag
+        && ngx_atomic_cmp_set(&b->tag, old, (ngx_atomic_uint_t) tag))
+    {
+        b->state    = NGX_HTTP_WAF_BREAKER_CLOSED;
+        b->probe_at = 0;
+        b->epoch    = 0;
+        b->attempts = 0;
+        b->failures = 0;
+    }
+
+    return b;
+}
+
+
 ngx_int_t
 ngx_http_waf_breaker_allow(ngx_uint_t index, ngx_http_waf_inspector_t *insp)
 {
     ngx_msec_t               now, probe;
-    ngx_http_waf_shm_t      *shm;
     ngx_http_waf_breaker_t  *b;
 
-    shm = ngx_http_waf_shm();
+    b = ngx_http_waf_breaker_get(index, insp);
 
-    if (!insp->breaker || shm == NULL) {
-        return NGX_OK;
-    }
-
-    b = &shm->breakers[index];
-
-    if (b->state == NGX_HTTP_WAF_BREAKER_CLOSED) {
+    if (b == NULL || b->state == NGX_HTTP_WAF_BREAKER_CLOSED) {
         return NGX_OK;
     }
 
@@ -60,16 +93,14 @@ ngx_http_waf_breaker_result(ngx_uint_t index, ngx_http_waf_inspector_t *insp,
 {
     ngx_msec_t               now, epoch;
     ngx_uint_t               state, attempts, failures;
-    ngx_http_waf_shm_t      *shm;
     ngx_http_waf_breaker_t  *b;
 
-    shm = ngx_http_waf_shm();
+    b = ngx_http_waf_breaker_get(index, insp);
 
-    if (!insp->breaker || shm == NULL) {
+    if (b == NULL) {
         return;
     }
 
-    b   = &shm->breakers[index];
     now = ngx_current_msec;
 
     epoch = (ngx_msec_t) b->epoch;

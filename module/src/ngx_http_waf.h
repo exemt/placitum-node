@@ -366,7 +366,6 @@ typedef enum {
 
 typedef struct {
     ngx_str_t                  name;
-    ngx_str_t                  uuid;
     ngx_str_t                  subject;
 
     ngx_uint_t                 type;
@@ -393,6 +392,7 @@ typedef struct {
     ngx_uint_t                 object;
     ngx_str_t                  name;
     unsigned                   all:1;
+    unsigned                   binary:1;
 
     ngx_http_complex_value_t   value;
 
