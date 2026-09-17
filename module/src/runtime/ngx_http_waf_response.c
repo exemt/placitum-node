@@ -1221,7 +1221,6 @@ ngx_http_waf_response_journal_start(ngx_http_waf_ctx_t *ctx)
 
     ctx->started     = ngx_current_msec;
     ctx->state       = NGX_HTTP_WAF_ST_INIT;
-    ctx->ph->journal = 1;
 
     ctx->rsp_entered = 1;
     ctx->rsp_journal = 1;

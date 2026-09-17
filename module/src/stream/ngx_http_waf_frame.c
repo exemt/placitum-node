@@ -1648,7 +1648,6 @@ ngx_http_waf_frame_journal(ngx_http_waf_frame_t *fc,
     d->cleared += d->held;
     d->held     = 0;
 
-    ctx->ph->journal       = 1;
     ctx->ph->body_ready    = 1;
     ctx->ph->agent_settled = 1;
     ctx->state             = NGX_HTTP_WAF_ST_DONE;

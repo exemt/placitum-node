@@ -566,10 +566,6 @@ typedef struct {
 
 #define ngx_http_waf_ovr_on(part)  ((part)->named & ~(part)->off)
 
-#define ngx_http_waf_ovr_objects(part)                                       \
-    (ngx_http_waf_ovr_on(part) != 0 ? ngx_http_waf_ovr_on(part)              \
-                                    : (NGX_HTTP_WAF_OBJ_ALL & ~(part)->off))
-
 #define ngx_http_waf_ovr_excluded(part, obj)                                 \
     ((part)->set == NGX_HTTP_WAF_SET_ON                                      \
      && ((part)->off & NGX_HTTP_WAF_OBJ_BIT(obj)))
@@ -822,8 +818,6 @@ typedef struct {
     unsigned                   agent_after_body:1;
     unsigned                   attach_planned:1;
 
-    unsigned                   journal:1;
-
     unsigned                   logged:1;
 
     unsigned                   audit_deferred:1;
@@ -870,7 +864,6 @@ struct ngx_http_waf_ctx_s {
     ngx_str_t                  req_args;
 
     unsigned                   rsp_entered:1;
-    unsigned                   rsp_holding:1;
     unsigned                   rsp_settled:1;
     unsigned                   rsp_last:1;
     unsigned                   rsp_denied:1;

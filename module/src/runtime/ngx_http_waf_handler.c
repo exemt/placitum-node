@@ -259,8 +259,7 @@ ngx_http_waf_access(ngx_http_request_t *r)
         if (ngx_http_waf_wave_count(ctx) == 0
             || !ngx_http_waf_waves_pending(ctx))
         {
-            ctx->ph->journal = 1;
-            ctx->state       = NGX_HTTP_WAF_ST_DONE;
+            ctx->state = NGX_HTTP_WAF_ST_DONE;
             return ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_OVERRIDES);
         }
 
@@ -1408,10 +1407,6 @@ ngx_http_waf_local_deny(ngx_http_waf_ctx_t *ctx, ngx_str_t *rule,
     ctx->ph->code            = code;
     ctx->ph->verdict         = NGX_HTTP_WAF_V_DENY;
     ctx->state           = NGX_HTTP_WAF_ST_DONE;
-
-    if (!ngx_http_waf_phase_is_frame(ctx->phase)) {
-        ctx->ph->journal = 1;
-    }
 
     return ngx_http_waf_finish(ctx, NGX_HTTP_WAF_FINISH_APPLY);
 }
