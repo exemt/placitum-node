@@ -11,10 +11,14 @@ static ngx_uint_t ngx_http_waf_response_bypass(ngx_http_request_t *r,
 static ngx_int_t ngx_http_waf_response_outcome(ngx_http_waf_ctx_t *ctx,
                      ngx_int_t rc);
 static ngx_int_t ngx_http_waf_response_hold(ngx_http_waf_ctx_t *ctx);
+static ngx_int_t ngx_http_waf_response_stream(ngx_http_waf_ctx_t *ctx);
 static ngx_int_t ngx_http_waf_response_release(ngx_http_waf_ctx_t *ctx);
 static ngx_int_t ngx_http_waf_response_deny(ngx_http_waf_ctx_t *ctx,
                      ngx_int_t status);
 static ngx_int_t ngx_http_waf_hold_chain(ngx_http_waf_ctx_t *ctx,
+                     ngx_chain_t *in);
+static ngx_int_t ngx_http_waf_response_overlimit(ngx_http_waf_ctx_t *ctx);
+static ngx_int_t ngx_http_waf_stream_capture(ngx_http_waf_ctx_t *ctx,
                      ngx_chain_t *in);
 static ngx_uint_t ngx_http_waf_response_body_ready(ngx_http_waf_ctx_t *ctx);
 static ngx_int_t ngx_http_waf_response_body_place(ngx_http_waf_ctx_t *ctx);
@@ -31,7 +35,6 @@ static ngx_int_t ngx_http_waf_response_journal_start(ngx_http_waf_ctx_t *ctx);
 static ngx_int_t ngx_http_waf_response_journal_body(ngx_http_waf_ctx_t *ctx,
                      ngx_chain_t *in);
 static void ngx_http_waf_response_journal_finish(ngx_http_waf_ctx_t *ctx);
-static void ngx_http_waf_response_journal_resume(ngx_http_waf_ctx_t *ctx);
 static void ngx_http_waf_response_journal_cleanup(void *data);
 
 
@@ -65,12 +68,19 @@ ngx_http_waf_header_filter(ngx_http_request_t *r)
 
     ctx = ngx_http_waf_get_ctx(r);
 
-    if (ctx != NULL) {
-        ngx_http_waf_restore_accept_encoding(ctx);
+    /*
+     * Subrequests share the main request's ctx through a variable. The response
+     * phase is the main request's alone: touching ctx here would flush its
+     * deferred record and restore its headers on every subrequest.
+     */
+    if (ctx == NULL || r != r->main) {
+        return ngx_http_next_header_filter(r);
     }
 
-    if (ctx == NULL || ctx->rsp_entered) {
-        if (ctx != NULL && ctx->rsp_denied) {
+    ngx_http_waf_restore_accept_encoding(ctx);
+
+    if (ctx->rsp_entered) {
+        if (ctx->rsp_denied) {
             (void) ngx_http_waf_apply_debug(ctx);
         }
 
@@ -111,6 +121,8 @@ ngx_http_waf_header_filter(ngx_http_request_t *r)
 
     ngx_http_waf_phase_enter(ctx, NGX_HTTP_WAF_PHASE_RESPONSE);
 
+    ctx->ph->body_policy = NGX_HTTP_WAF_POLICY_UNSET;
+
     ctx->started = ngx_current_msec;
     ctx->state   = NGX_HTTP_WAF_ST_INIT;
 
@@ -123,11 +135,18 @@ ngx_http_waf_header_filter(ngx_http_request_t *r)
 static ngx_uint_t
 ngx_http_waf_response_bypass(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx)
 {
+    ngx_http_waf_phase_ctx_t  *ph = &ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST];
+
     if (r != r->main) {
         return 1;
     }
 
-    if (r->header_only) {
+    /*
+     * No body to hold: a HEAD request (known from the request line, before the
+     * header filter that sets header_only runs), a header-only response, or a
+     * status that carries no body.
+     */
+    if (r->header_only || (r->method & NGX_HTTP_HEAD)) {
         return 1;
     }
 
@@ -144,8 +163,13 @@ ngx_http_waf_response_bypass(ngx_http_request_t *r, ngx_http_waf_ctx_t *ctx)
         break;
     }
 
-    if (ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST].verdict == NGX_HTTP_WAF_V_DENY
-        || ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST].fail_blocked)
+    /*
+     * The module already answered the request itself: a deny page, a redirect,
+     * or a blocked fail. That answer is not the upstream's response phase.
+     */
+    if (ph->verdict == NGX_HTTP_WAF_V_DENY
+        || ph->verdict == NGX_HTTP_WAF_V_REDIRECT
+        || ph->fail_blocked)
     {
         return 1;
     }
@@ -305,7 +329,7 @@ ngx_http_waf_response_body_ready(ngx_http_waf_ctx_t *ctx)
     ngx_http_waf_loc_conf_t    *wlcf;
     ngx_http_waf_shoot_conf_t  *sh;
 
-    if (ctx->rsp_last) {
+    if (ctx->rsp_last || ctx->rsp_body_capped) {
         return 1;
     }
 
@@ -355,7 +379,14 @@ ngx_http_waf_response_outcome(ngx_http_waf_ctx_t *ctx, ngx_int_t rc)
             == NGX_HTTP_WAF_HOLD_MONITOR)
         {
             ctx->rsp_monitor = 1;
-            return ngx_http_waf_response_release(ctx);
+
+            /*
+             * Monitor: the response goes out now, the waves run behind it. When
+             * a wave still wants the body, the body filter keeps a copy for it
+             * as the bytes stream past -- releasing here would settle the phase
+             * and the wave would never start.
+             */
+            return ngx_http_waf_response_stream(ctx);
         }
 
         return ngx_http_waf_response_hold(ctx);
@@ -383,11 +414,31 @@ ngx_http_waf_response_hold(ngx_http_waf_ctx_t *ctx)
         return NGX_OK;
     }
 
-    ctx->rsp_holding = 1;
-
     r->buffered |= NGX_HTTP_WAF_BUFFERED;
 
     return NGX_OK;
+}
+
+
+/*
+ * Monitor: put the headers on the wire now and keep the phase open. The body
+ * filter streams each buffer to the client and, when a wave wants the body,
+ * copies a bounded window aside so the wave can run once the response is past.
+ */
+
+static ngx_int_t
+ngx_http_waf_response_stream(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_http_request_t  *r = ctx->request;
+
+    if (ctx->rsp_settled) {
+        return NGX_OK;
+    }
+
+    ctx->rsp_streaming = 1;
+    r->buffered &= ~NGX_HTTP_WAF_BUFFERED;
+
+    return ngx_http_next_header_filter(r);
 }
 
 
@@ -402,8 +453,8 @@ ngx_http_waf_response_release(ngx_http_waf_ctx_t *ctx)
         return NGX_OK;
     }
 
-    ctx->rsp_settled = 1;
-    ctx->rsp_holding = 0;
+    ctx->rsp_settled   = 1;
+    ctx->rsp_streaming = 0;
     r->buffered &= ~NGX_HTTP_WAF_BUFFERED;
 
     out            = ctx->hold;
@@ -433,9 +484,9 @@ ngx_http_waf_response_deny(ngx_http_waf_ctx_t *ctx, ngx_int_t status)
         return NGX_OK;
     }
 
-    ctx->rsp_settled = 1;
-    ctx->rsp_holding = 0;
-    ctx->rsp_denied  = 1;
+    ctx->rsp_settled   = 1;
+    ctx->rsp_streaming = 0;
+    ctx->rsp_denied    = 1;
 
     ctx->hold      = NULL;
     ctx->hold_last = &ctx->hold;
@@ -456,11 +507,6 @@ ngx_http_waf_response_resume(ngx_http_waf_ctx_t *ctx)
 {
     ngx_int_t            rc;
     ngx_http_request_t  *r = ctx->request;
-
-    if (ctx->rsp_journal) {
-        ngx_http_waf_response_journal_resume(ctx);
-        return;
-    }
 
     ctx->waiting = 0;
 
@@ -552,7 +598,7 @@ ngx_http_waf_response_rewrite(ngx_http_waf_ctx_t *ctx)
         return NGX_DECLINED;
     }
 
-    if (ctx->rsp_settled) {
+    if (ctx->rsp_settled || ctx->rsp_streaming) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "waf: inspector \"%V\" asked to rewrite a response "
                       "that was already released; skipped, ray %*s",
@@ -563,7 +609,16 @@ ngx_http_waf_response_rewrite(ngx_http_waf_ctx_t *ctx)
         return NGX_DECLINED;
     }
 
-    if (!ctx->rsp_last) {
+    /*
+     * A rewrite replaces the whole response, so it needs the whole response in
+     * hand (rsp_last) and a capture that is the whole body, not a prefix: an
+     * inspector that saw only the first bytes cannot vouch for the rest.
+     */
+    if (!ctx->rsp_last
+        || wlcf->shoot[NGX_HTTP_WAF_PHASE_RESPONSE]
+               .capture_limit[NGX_HTTP_WAF_OBJ_BODY]
+           != NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE)
+    {
         reply->rewrite_partial = 1;
 
         ngx_http_waf_rewrite_fail(ctx, found, "the capture is a prefix of "
@@ -793,12 +848,43 @@ ngx_http_waf_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         return ngx_http_waf_response_journal_body(ctx, in);
     }
 
+    /*
+     * Monitor: the bytes are already leaving. Copy a bounded window aside for
+     * a wave that wants the body, then pass the buffers through untouched.
+     */
+    if (ctx != NULL && r == r->main && ctx->rsp_streaming && !ctx->rsp_settled) {
+        ngx_int_t  rc;
+
+        if (in != NULL && ngx_http_waf_stream_capture(ctx, in) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        rc = ngx_http_next_body_filter(r, in);
+
+        if (ctx->rsp_wait_body
+            && !ctx->rsp_settled
+            && ngx_http_waf_response_body_ready(ctx))
+        {
+            (void) ngx_http_waf_response_body_place(ctx);
+        }
+
+        return rc;
+    }
+
     if (ctx == NULL || r != r->main || !ctx->rsp_entered || ctx->rsp_settled) {
         return ngx_http_next_body_filter(r, in);
     }
 
-    if (in != NULL && ngx_http_waf_hold_chain(ctx, in) != NGX_OK) {
-        return NGX_ERROR;
+    if (in != NULL) {
+        ngx_int_t  rc;
+
+        /* May settle the phase (over-limit deny); its result is returned
+         * up the filter chain, so it must not be coerced here. */
+        rc = ngx_http_waf_hold_chain(ctx, in);
+
+        if (rc != NGX_OK) {
+            return rc;
+        }
     }
 
     if (ctx->rsp_wait_body
@@ -806,6 +892,88 @@ ngx_http_waf_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         && ngx_http_waf_response_body_ready(ctx))
     {
         (void) ngx_http_waf_response_body_place(ctx);
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * Copies up to waf_body_limit bytes of the streaming response into the hold so
+ * a monitored wave can inspect them; the input buffers are left intact and go
+ * on to the client. The copy is a prefix -- monitor never delays delivery.
+ */
+
+static ngx_int_t
+ngx_http_waf_stream_capture(ngx_http_waf_ctx_t *ctx, ngx_chain_t *in)
+{
+    off_t                     size;
+    size_t                    take, cap;
+    u_char                   *p;
+    ngx_buf_t                *b;
+    ngx_chain_t              *cl, *copy;
+    ngx_http_request_t       *r = ctx->request;
+    ngx_http_waf_loc_conf_t  *wlcf;
+
+    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+    cap  = wlcf->body_limit[NGX_HTTP_WAF_PHASE_RESPONSE];
+
+    for (cl = in; cl != NULL; cl = cl->next) {
+
+        if (cl->buf->last_buf) {
+            ctx->rsp_last = 1;
+        }
+
+        size = ngx_buf_size(cl->buf);
+
+        if (size <= 0 || ctx->hold_size >= cap) {
+            continue;
+        }
+
+        take = (size_t) ngx_min(size, (off_t) (cap - ctx->hold_size));
+
+        b    = ngx_calloc_buf(r->pool);
+        copy = ngx_alloc_chain_link(r->pool);
+        p    = NULL;
+
+        if (b != NULL && copy != NULL && ngx_buf_in_memory(cl->buf)) {
+            p = ngx_pnalloc(r->pool, take);
+        }
+
+        if (b == NULL || copy == NULL
+            || (ngx_buf_in_memory(cl->buf) && p == NULL))
+        {
+            /* Out of memory: inspect what was captured, do not stall delivery. */
+            ctx->rsp_body_capped = 1;
+            return NGX_OK;
+        }
+
+        if (p != NULL) {
+            ngx_memcpy(p, cl->buf->pos, take);
+
+            b->start  = p;
+            b->pos    = p;
+            b->last   = p + take;
+            b->end    = p + take;
+            b->memory = 1;
+
+        } else {
+            b->in_file   = 1;
+            b->file      = cl->buf->file;
+            b->file_pos  = cl->buf->file_pos;
+            b->file_last = cl->buf->file_pos + (off_t) take;
+        }
+
+        copy->buf  = b;
+        copy->next = NULL;
+
+        *ctx->hold_last = copy;
+        ctx->hold_last  = &copy->next;
+        ctx->hold_size += take;
+
+        if (ctx->hold_size >= cap) {
+            ctx->rsp_body_capped = 1;
+        }
     }
 
     return NGX_OK;
@@ -856,7 +1024,11 @@ ngx_http_waf_hold_chain(ngx_http_waf_ctx_t *ctx, ngx_chain_t *in)
             b->end   = b->last = p + size;
             b->memory = 1;
             b->temporary = 0;
+        }
 
+        /* Count every held byte, file-backed included -- otherwise a static
+         * file or a cached response never reaches the hold limit at all. */
+        if (size > 0) {
             ctx->hold_size += (size_t) size;
         }
 
@@ -870,11 +1042,66 @@ ngx_http_waf_hold_chain(ngx_http_waf_ctx_t *ctx, ngx_chain_t *in)
         ctx->hold_last  = &cl->next;
     }
 
-    if (ctx->hold_size > wlcf->body_limit[NGX_HTTP_WAF_PHASE_RESPONSE]) {
+    if (!ctx->rsp_body_capped && !ctx->rsp_settled
+        && ctx->hold_size > wlcf->body_limit[NGX_HTTP_WAF_PHASE_RESPONSE])
+    {
+        return ngx_http_waf_response_overlimit(ctx);
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * The held response outgrew waf_body_limit before a verdict. Under gate the
+ * bytes have not left, so the policy still applies: block denies the response
+ * outright, trim inspects the prefix it did hold (marked truncated) and lets
+ * the tail stream once the wave settles, pass lets it through unchecked. When
+ * the capture asked for the whole body and the whole body will not fit, the
+ * object is simply unavailable and waf_exception <phase> body decides.
+ */
+
+static ngx_int_t
+ngx_http_waf_response_overlimit(ngx_http_waf_ctx_t *ctx)
+{
+    ngx_uint_t                  policy, whole;
+    ngx_int_t                   status;
+    ngx_http_request_t         *r = ctx->request;
+    ngx_http_waf_loc_conf_t    *wlcf;
+    ngx_http_waf_shoot_conf_t  *sh;
+
+    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+    sh   = &wlcf->shoot[NGX_HTTP_WAF_PHASE_RESPONSE];
+
+    whole = (sh->capture & NGX_HTTP_WAF_OBJ_BIT(NGX_HTTP_WAF_OBJ_BODY))
+            && sh->capture_limit[NGX_HTTP_WAF_OBJ_BODY]
+               == NGX_HTTP_WAF_CAPTURE_LIMIT_WHOLE;
+
+    policy = whole
+                 ? wlcf->exception[NGX_HTTP_WAF_PHASE_RESPONSE]
+                                  [NGX_HTTP_WAF_EXC_BODY]
+                 : wlcf->body_limit_policy[NGX_HTTP_WAF_PHASE_RESPONSE];
+
+    if (policy == NGX_HTTP_WAF_POLICY_TRIM) {
+
+        /* Inspect the prefix already held; the placement marks it truncated. */
+        ctx->rsp_body_capped = 1;
+
+        if (ctx->rsp_wait_body
+            && !ctx->rsp_settled
+            && ngx_http_waf_response_body_ready(ctx))
+        {
+            (void) ngx_http_waf_response_body_place(ctx);
+        }
+
+        return NGX_OK;
+    }
+
+    if (policy == NGX_HTTP_WAF_POLICY_PASS) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "waf: response of %uz bytes passed the %uz byte hold "
-                      "limit before the verdict; releasing it, ray %*s",
-                      ctx->hold_size,
+                      "limit before the verdict; passing it per policy, "
+                      "ray %*s", ctx->hold_size,
                       wlcf->body_limit[NGX_HTTP_WAF_PHASE_RESPONSE],
                       (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
 
@@ -882,7 +1109,26 @@ ngx_http_waf_hold_chain(ngx_http_waf_ctx_t *ctx, ngx_chain_t *in)
                    ? NGX_ERROR : NGX_OK;
     }
 
-    return NGX_OK;
+    /* block: nothing has gone out yet, so deny the response outright. */
+    ctx->ph->fail         = NGX_HTTP_WAF_CODE_FAIL_BODY;
+    ctx->ph->code         = NGX_HTTP_WAF_CODE_FAIL_BODY;
+    ctx->ph->fail_blocked = 1;
+    ctx->exception_response =
+        wlcf->exception_response[NGX_HTTP_WAF_PHASE_RESPONSE]
+                               [NGX_HTTP_WAF_EXC_BODY];
+
+    status = ngx_http_waf_fail_status(ctx);
+
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                  "waf: response of %uz bytes passed the %uz byte hold limit "
+                  "before the verdict; denying it per policy, ray %*s",
+                  ctx->hold_size,
+                  wlcf->body_limit[NGX_HTTP_WAF_PHASE_RESPONSE],
+                  (size_t) NGX_HTTP_WAF_RAY_HEX_LEN, ctx->ray_hex);
+
+    ngx_http_waf_log_verdict(ctx);
+
+    return ngx_http_waf_response_deny(ctx, status);
 }
 
 
@@ -902,7 +1148,11 @@ ngx_http_waf_response_journal_wanted(ngx_http_request_t *r,
         return 0;
     }
 
+    /* The module's own deny page, redirect or blocked fail is not the
+     * upstream's response, so it has no response record to journal. */
     if (ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST].verdict == NGX_HTTP_WAF_V_DENY
+        || ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST].verdict
+           == NGX_HTTP_WAF_V_REDIRECT
         || ctx->phases[NGX_HTTP_WAF_PHASE_REQUEST].fail_blocked)
     {
         return 0;
@@ -946,11 +1196,9 @@ ngx_http_waf_response_journal_start(ngx_http_waf_ctx_t *ctx)
         return ngx_http_next_header_filter(r);
     }
 
-    if (r->upstream != NULL && r->upstream->state != NULL) {
-        ctx->upstream_ms = r->upstream->state->response_time;
-    }
-
     ngx_http_waf_phase_enter(ctx, NGX_HTTP_WAF_PHASE_RESPONSE);
+
+    ctx->ph->body_policy = NGX_HTTP_WAF_POLICY_UNSET;
 
     ctx->started     = ngx_current_msec;
     ctx->state       = NGX_HTTP_WAF_ST_INIT;
@@ -1074,16 +1322,6 @@ ngx_http_waf_response_journal_finish(ngx_http_waf_ctx_t *ctx)
     ctx->ph->body_ready    = 1;
     ctx->ph->agent_settled = 1;
     ctx->state             = NGX_HTTP_WAF_ST_DONE;
-
-    ngx_http_waf_log_verdict(ctx);
-}
-
-
-static void
-ngx_http_waf_response_journal_resume(ngx_http_waf_ctx_t *ctx)
-{
-    ctx->waiting = 0;
-    ctx->state   = NGX_HTTP_WAF_ST_DONE;
 
     ngx_http_waf_log_verdict(ctx);
 }

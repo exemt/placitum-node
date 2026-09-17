@@ -11,8 +11,11 @@
  * Objects the agent takes that the exchange cannot serve ride with the audit
  * record: one memory file per record, its descriptor passed over the agent
  * socket next to the datagram. The exchange keeps the copy the inspectors saw;
- * the record carries the original at the size the agent asked for, so nothing
- * is written into the exchange twice and the request never waits for it.
+ * the record carries the object the agent asked for. Headers and the query
+ * string go whole -- the agent applies the name lists, then cuts -- and the
+ * body at the archive size. It is the original only when the archive asked for
+ * it; otherwise it is the slice under the capture masks, so nothing is written
+ * into the exchange twice and the request never waits for it.
  */
 
 static ngx_int_t ngx_http_waf_attach_one(ngx_http_waf_ctx_t *ctx, int fd,
@@ -43,19 +46,19 @@ ngx_http_waf_attach_write(int fd, u_char *data, size_t len)
 }
 
 
-ngx_int_t
+void
 ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx)
 {
-    off_t                      offset;
     ngx_uint_t                 i, keep, want, bit;
     ngx_http_waf_phase_ctx_t  *ph = ctx->ph;
 #if (NGX_LINUX)
+    off_t                      offset;
     int                        fd;
     ngx_int_t                  rc;
 #endif
 
     if (ph->attach_planned) {
-        return NGX_OK;
+        return;
     }
 
     ph->attach_planned = 1;
@@ -73,7 +76,7 @@ ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx)
     }
 
     if (want == 0) {
-        return NGX_OK;
+        return;
     }
 
 #if (NGX_LINUX)
@@ -85,7 +88,7 @@ ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx)
                       "waf: memfd_create() for the agent failed; %s stay "
                       "out of the archive", ngx_http_waf_obj_names(want));
         ph->archive &= ~want;
-        return NGX_OK;
+        return;
     }
 
     offset = 0;
@@ -99,25 +102,45 @@ ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx)
 
         rc = ngx_http_waf_attach_one(ctx, fd, i, &offset);
 
-        if (rc != NGX_OK) {
+        if (rc == NGX_OK) {
+            ph->attached |= bit;
+
+            if (i != NGX_HTTP_WAF_OBJ_BODY
+                && ngx_http_waf_archive_original(ctx, i))
+            {
+                ph->attach_raw |= bit;
+            }
+
+            continue;
+        }
+
+        /*
+         * The object did not ride along: a real failure (NGX_ERROR) may have
+         * left a partial write behind, so drop the file back to the last good
+         * offset -- otherwise the objects that follow would be described one
+         * span short. An empty object (NGX_DECLINED) is not a failure and is
+         * not logged: it simply has nothing to archive.
+         */
+
+        ph->archive &= ~bit;
+
+        if (rc == NGX_ERROR) {
             ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
                           "waf: %V could not be attached to the record and "
                           "stays out of the archive",
                           ngx_http_waf_obj_name(i));
-            ph->archive &= ~bit;
-            continue;
-        }
 
-        ph->attached |= bit;
-
-        if (i != NGX_HTTP_WAF_OBJ_BODY && ngx_http_waf_archive_original(ctx, i)) {
-            ph->attach_raw |= bit;
+            if (ftruncate(fd, offset) == -1
+                || lseek(fd, offset, SEEK_SET) == (off_t) -1)
+            {
+                break;
+            }
         }
     }
 
     if (ph->attached == 0) {
         (void) close(fd);
-        return NGX_OK;
+        return;
     }
 
     (void) fcntl(fd, F_ADD_SEALS,
@@ -125,18 +148,14 @@ ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx)
 
     ph->attach_fd = fd;
 
-    return NGX_OK;
+    return;
 
 #else
-
-    (void) offset;
 
     ngx_log_error(NGX_LOG_ERR, ctx->request->connection->log, 0,
                   "waf: record attachments need Linux; %s stay out of the "
                   "archive", ngx_http_waf_obj_names(want));
     ph->archive &= ~want;
-
-    return NGX_OK;
 
 #endif
 }
@@ -163,6 +182,10 @@ ngx_http_waf_attach_one(ngx_http_waf_ctx_t *ctx, int fd, ngx_uint_t obj,
     if (obj == NGX_HTTP_WAF_OBJ_BODY) {
         rc = ngx_http_waf_body_attach(ctx, fd, limit, loc);
 
+        if (rc == NGX_DECLINED) {
+            return NGX_DECLINED;
+        }
+
         if (rc != NGX_OK) {
             return NGX_ERROR;
         }
@@ -179,17 +202,19 @@ ngx_http_waf_attach_one(ngx_http_waf_ctx_t *ctx, int fd, ngx_uint_t obj,
                                        ngx_http_waf_archive_original(ctx, obj),
                                        &blob, &truncated);
 
-        if (rc != NGX_OK || blob.len == 0) {
+        if (rc != NGX_OK) {
             return NGX_ERROR;
+        }
+
+        if (blob.len == 0) {
+            return NGX_DECLINED;
         }
 
         if (ngx_http_waf_attach_write(fd, blob.data, blob.len) != NGX_OK) {
             return NGX_ERROR;
         }
 
-        loc->size      = (off_t) blob.len;
-        loc->complete  = truncated ? 0 : 1;
-        loc->truncated = truncated ? 1 : 0;
+        loc->size = (off_t) blob.len;
     }
 
     loc->offset = *offset;

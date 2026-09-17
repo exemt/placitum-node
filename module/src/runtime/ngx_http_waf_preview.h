@@ -16,5 +16,8 @@ size_t     ngx_http_waf_preview_body_budget(ngx_http_waf_ctx_t *ctx);
 void       ngx_http_waf_preview_write(ngx_http_waf_jw_t *jw,
                ngx_http_waf_ctx_t *ctx);
 
+size_t     ngx_http_waf_preview_text(ngx_http_waf_jw_t *jw, u_char *data,
+               size_t len, size_t room);
+
 
 #endif

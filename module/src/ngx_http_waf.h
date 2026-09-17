@@ -877,6 +877,9 @@ struct ngx_http_waf_ctx_s {
     unsigned                   rsp_monitor:1;
     unsigned                   rsp_wait_body:1;
 
+    unsigned                   rsp_streaming:1;
+    unsigned                   rsp_body_capped:1;
+
     unsigned                   rsp_journal:1;
     unsigned                   rsp_journal_done:1;
     size_t                     rsp_journal_need;
@@ -885,6 +888,10 @@ struct ngx_http_waf_ctx_s {
     unsigned                   rsp_fetch_done:1;
     unsigned                   rsp_rewritten:1;
     ngx_uint_t                 rsp_rewrite_index;
+
+    ngx_msec_t                 deferred_started;
+    ngx_msec_t                 deferred_now;
+    ngx_msec_t                 audit_now;
 
     void                      *form_op;
     unsigned                   form_fetched:1;
@@ -1368,7 +1375,7 @@ ngx_uint_t ngx_http_waf_result_status(ngx_http_waf_ctx_t *ctx);
 
 void       ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx);
 
-ngx_int_t  ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx);
+void       ngx_http_waf_attach_prepare(ngx_http_waf_ctx_t *ctx);
 void       ngx_http_waf_attach_close(ngx_http_waf_ctx_t *ctx);
 int        ngx_http_waf_attach_fd(ngx_http_waf_ctx_t *ctx);
 ngx_int_t  ngx_http_waf_attach_write(int fd, u_char *data, size_t len);

@@ -20,8 +20,6 @@ static ngx_uint_t ngx_http_waf_preview_pair(ngx_http_waf_jw_t *jw, size_t room,
     ngx_str_t *name, ngx_str_t *value, ngx_uint_t first, size_t item_max);
 static void ngx_http_waf_preview_dropped(ngx_http_waf_jw_t *jw,
     const char *field, ngx_uint_t dropped);
-static size_t ngx_http_waf_preview_text(ngx_http_waf_jw_t *jw, u_char *data,
-    size_t len, size_t room);
 static ngx_uint_t ngx_http_waf_preview_allowed(ngx_str_t *name,
     ngx_array_t *allow, ngx_array_t *deny);
 static ngx_uint_t ngx_http_waf_preview_listed(ngx_array_t *list,
@@ -508,7 +506,7 @@ ngx_http_waf_preview_dropped(ngx_http_waf_jw_t *jw, const char *field,
 }
 
 
-static size_t
+size_t
 ngx_http_waf_preview_text(ngx_http_waf_jw_t *jw, u_char *data, size_t len,
     size_t room)
 {

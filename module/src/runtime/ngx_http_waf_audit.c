@@ -20,9 +20,14 @@ static socklen_t           ngx_http_waf_agent_addrlen;
 
 static ngx_uint_t          ngx_http_waf_agent_dropped;
 static time_t              ngx_http_waf_agent_dropped_at;
+static time_t              ngx_http_waf_agent_toobig_at;
 
 static ssize_t ngx_http_waf_agent_send(ngx_http_waf_ctx_t *ctx, u_char *json,
     size_t len, int attach);
+
+
+/* Worst-case room a string of this many bytes needs once escaped into JSON. */
+#define ngx_http_waf_audit_room(len)   ((len) * 6 + 16)
 
 
 ngx_uint_t
@@ -92,8 +97,18 @@ ngx_http_waf_audit_keep(ngx_http_waf_ctx_t *ctx, ngx_http_waf_loc_conf_t *wlcf)
         return 1;
     }
 
+    /*
+     * Evidence is judged per record: a deny, a silent inspector or a non-empty
+     * store.archive is always written, whatever the die of the request record
+     * already showed. Otherwise the sampling decision is one per request.
+     */
+
+    if (ngx_http_waf_audit_evidence(ctx)) {
+        return 1;
+    }
+
     if (set == NGX_HTTP_WAF_SET_OFF) {
-        return ngx_http_waf_audit_evidence(ctx);
+        return 0;
     }
 
     if (ctx->audit_sampled) {
@@ -103,7 +118,7 @@ ngx_http_waf_audit_keep(ngx_http_waf_ctx_t *ctx, ngx_http_waf_loc_conf_t *wlcf)
     ctx->audit_sampled = 1;
     ctx->audit_keep    = 1;
 
-    if (wlcf->audit_sample >= 100 || ngx_http_waf_audit_evidence(ctx)) {
+    if (wlcf->audit_sample >= 100) {
         return 1;
     }
 
@@ -158,6 +173,11 @@ ngx_http_waf_audit_defer(ngx_http_waf_ctx_t *ctx)
 
     ctx->ph->audit_deferred = 1;
 
+    /* The request record is sent after the response phase decides when=; its
+     * clock is snapshotted here, while ctx->started is still the request's. */
+    ctx->deferred_started = ctx->started;
+    ctx->deferred_now     = ngx_current_msec;
+
     cln = ngx_http_cleanup_add(ctx->request, 0);
 
     if (cln != NULL) {
@@ -198,7 +218,7 @@ static ngx_uint_t
 ngx_http_waf_audit_status(ngx_http_waf_ctx_t *ctx)
 {
     if (ctx->ph->fail_blocked) {
-        return NGX_HTTP_SERVICE_UNAVAILABLE;
+        return (ngx_uint_t) ngx_http_waf_fail_status(ctx);
     }
 
     return ngx_http_waf_result_status(ctx);
@@ -314,7 +334,7 @@ ngx_http_waf_audit_frame(ngx_http_waf_jw_t *jw, ngx_http_waf_frame_audit_t *fa)
         n = ngx_min(fa->size, NGX_HTTP_WAF_AUDIT_FRAME_PREVIEW);
 
         ngx_http_waf_jw_lit(jw, ",\"payload_preview\":");
-        ngx_http_waf_jw_string(jw, fa->payload, n);
+        (void) ngx_http_waf_preview_text(jw, fa->payload, n, n * 6 + 2);
 
         if (n < fa->size) {
             ngx_http_waf_jw_lit(jw, ",\"payload_truncated\":true");
@@ -498,7 +518,9 @@ ngx_http_waf_audit_http(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
     ngx_http_waf_jw_lit(jw, ",\"status\":");
     ngx_http_waf_jw_int(jw, (ngx_int_t) ngx_http_waf_audit_status(ctx));
 
-    if (ctx->rsp_status != 0) {
+    /* The upstream code is the response record's; the request record predates
+     * the upstream answer and must not carry a status the request never had. */
+    if (ctx->phase == NGX_HTTP_WAF_PHASE_RESPONSE && ctx->rsp_status != 0) {
         ngx_http_waf_jw_lit(jw, ",\"upstream_status\":");
         ngx_http_waf_jw_int(jw, (ngx_int_t) ctx->rsp_status);
     }
@@ -644,7 +666,7 @@ ngx_http_waf_audit_entry(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx,
         if (state == NGX_HTTP_WAF_ENTRY_TIMEOUT && ctx->ph->wave_published != 0) {
             ngx_http_waf_jw_lit(jw, ",\"latency_ms\":");
             ngx_http_waf_jw_int(jw,
-                (ngx_int_t) (ngx_current_msec - ctx->ph->wave_published));
+                (ngx_int_t) (ctx->audit_now - ctx->ph->wave_published));
         }
     }
 
@@ -1098,7 +1120,7 @@ ngx_http_waf_audit_store(ngx_http_waf_jw_t *jw, ngx_http_waf_ctx_t *ctx)
         return;
     }
 
-    (void) ngx_http_waf_attach_prepare(ctx);
+    ngx_http_waf_attach_prepare(ctx);
 
     keep = ngx_http_waf_archive_mask(ctx);
 
@@ -1221,12 +1243,98 @@ ngx_http_waf_audit_exit_worker(ngx_cycle_t *cycle)
 }
 
 
+/*
+ * Room the untrusted, variable-length strings of a record need on top of the
+ * fixed skeleton: the request line, host, URI, content type, addresses, the
+ * route, every inspector name and profile, the exchange locators and the
+ * archive name lists. Each is escaped worst case (x6): a header value of
+ * control bytes must not push the record past its buffer and lose it whole.
+ */
+
+static size_t
+ngx_http_waf_audit_vartext(ngx_http_waf_ctx_t *ctx)
+{
+    size_t                      room, ct;
+    ngx_uint_t                  i, n, obj, kind, axis;
+    ngx_str_t                  *item;
+    ngx_array_t                *list;
+    ngx_http_request_t         *r = ctx->request;
+    ngx_http_core_srv_conf_t   *cscf;
+    ngx_http_core_loc_conf_t   *clcf;
+    ngx_http_waf_inspector_t   *insp;
+    ngx_http_waf_loc_conf_t    *wlcf;
+    ngx_http_waf_main_conf_t   *wmcf;
+    ngx_http_waf_shoot_conf_t  *sh;
+
+    wmcf = ngx_http_get_module_main_conf(r, ngx_http_waf_module);
+    wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
+    cscf = ngx_http_get_module_srv_conf(r, ngx_http_core_module);
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    ct = r->headers_out.content_type.len;
+
+    if (r->headers_in.content_type != NULL
+        && r->headers_in.content_type->value.len > ct)
+    {
+        ct = r->headers_in.content_type->value.len;
+    }
+
+    room = ngx_http_waf_audit_room(r->method_name.len)
+           + ngx_http_waf_audit_room(r->headers_in.server.len)
+           + ngx_http_waf_audit_room(r->uri.len)
+           + ngx_http_waf_audit_room(r->http_protocol.len)
+           + ngx_http_waf_audit_room(ct)
+           + ngx_http_waf_audit_room(r->connection->addr_text.len)
+           + ngx_http_waf_audit_room(NGX_SOCKADDR_STRLEN)
+           + ngx_http_waf_audit_room(cscf->server_name.len)
+           + ngx_http_waf_audit_room(clcf->name.len)
+           + ngx_http_waf_audit_room(wlcf->route_id.len)
+           + 1024;   /* tls version and sni, node id, fixed literals */
+
+    room += ngx_http_waf_store_size(ctx);
+
+    insp = wmcf->inspectors.elts;
+    n    = wmcf->inspectors.nelts;
+
+    for (i = 0; i < n; i++) {
+        room += ngx_http_waf_audit_room(insp[i].name.len)
+                + ngx_http_waf_audit_room(wlcf->profiles[i].len)
+                + NGX_HTTP_WAF_MUTATE_GROUPS_MAX
+                  * ngx_http_waf_audit_room(NGX_HTTP_WAF_MUTATE_NAME_MAX)
+                + 256;
+    }
+
+    sh = &wlcf->shoot[ctx->phase];
+
+    for (obj = 0; obj < NGX_HTTP_WAF_META_COUNT; obj++) {
+        for (kind = 0; kind < NGX_HTTP_WAF_LIST_COUNT; kind++) {
+            for (axis = 0; axis < NGX_HTTP_WAF_AXIS_COUNT; axis++) {
+
+                list = sh->lists[kind][obj][axis];
+                if (list == NULL) {
+                    continue;
+                }
+
+                item = list->elts;
+
+                for (i = 0; i < list->nelts; i++) {
+                    room += ngx_http_waf_audit_room(item[i].len);
+                }
+            }
+        }
+    }
+
+    return room;
+}
+
+
 void
 ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx)
 {
     u_char                    *json;
     size_t                     size;
     ngx_int_t                  deny_at;
+    ngx_msec_t                 started;
     ngx_http_waf_jw_t          jw;
     ngx_http_request_t        *r;
     ngx_http_waf_loc_conf_t   *wlcf;
@@ -1262,12 +1370,29 @@ ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx)
         return;
     }
 
+    /*
+     * A deferred request record is built after the response phase, which reset
+     * ctx->started and advanced the clock. Its latencies are the ones captured
+     * when the request verdict was applied, not the ones at flush time.
+     */
+
+    if (!frame && ctx->phase == NGX_HTTP_WAF_PHASE_REQUEST
+        && ctx->deferred_now != 0)
+    {
+        ctx->audit_now = ctx->deferred_now;
+        started        = ctx->deferred_started;
+
+    } else {
+        ctx->audit_now = ngx_current_msec;
+        started        = ctx->started;
+    }
+
     size = NGX_HTTP_WAF_AUDIT_JSON
            + ngx_http_waf_preview_room_ctx(ctx)
-           + wlcf->actions_max * (wlcf->action_max + 128)
+           + wlcf->actions_max * (wlcf->action_max + 512)
            + (frame ? 0 : NGX_HTTP_WAF_SESSIONS_MAX * NGX_HTTP_WAF_SESSION_JSON)
            + NGX_HTTP_WAF_MARKERS_JSON
-           + wlcf->route_id.len
+           + ngx_http_waf_audit_vartext(ctx)
            + (frame ? 256 + NGX_HTTP_WAF_AUDIT_FRAME_PREVIEW * 6 : 0);
 
     json = ngx_pnalloc(r->pool, size);
@@ -1347,7 +1472,7 @@ ngx_http_waf_audit_request(ngx_http_waf_ctx_t *ctx)
 
     ngx_http_waf_jw_lit(&jw, ",\"waf_latency_us\":");
     ngx_http_waf_jw_int(&jw,
-                        (ngx_int_t) (ngx_current_msec - ctx->started) * 1000);
+                        (ngx_int_t) (ctx->audit_now - started) * 1000);
     ngx_http_waf_jw_lit(&jw, "}");
 
     if (!ngx_http_waf_jw_ok(&jw)) {
@@ -1385,6 +1510,7 @@ ngx_http_waf_agent_send(ngx_http_waf_ctx_t *ctx, u_char *json, size_t len,
 {
     ssize_t          n;
     time_t           now;
+    ngx_err_t        err;
     struct iovec     iov;
     struct msghdr    msg;
 #if (NGX_LINUX)
@@ -1428,22 +1554,35 @@ ngx_http_waf_agent_send(ngx_http_waf_ctx_t *ctx, u_char *json, size_t len,
         return n;
     }
 
-    if (ngx_socket_errno == EMSGSIZE) {
-        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log,
-                      ngx_socket_errno,
-                      "waf: agent event of %uz bytes does not fit a "
-                      "datagram; lower the preview budgets", len);
+    err = ngx_socket_errno;
+    now = ngx_time();
+
+    if (err == EMSGSIZE) {
+
+        /* Not a queue: the record is too large. Configuration, not load, so
+         * one note a second is enough -- the flood would say the same thing. */
+        if (now != ngx_http_waf_agent_toobig_at) {
+            ngx_http_waf_agent_toobig_at = now;
+            ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, err,
+                          "waf: agent event of %uz bytes does not fit a "
+                          "datagram; lower the preview budgets", len);
+        }
+
         return -1;
     }
 
-    now = ngx_time();
     ngx_http_waf_agent_dropped++;
 
     if (now != ngx_http_waf_agent_dropped_at) {
-        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log,
-                      ngx_socket_errno,
-                      "waf: agent socket dropped %ui record(s) since the "
-                      "last note; the agent is not draining its socket",
+
+        /* ECONNREFUSED/ENOENT is the agent gone, EAGAIN/ENOBUFS a full queue:
+         * two different faults with two different cures. */
+        ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, err,
+                      (err == ECONNREFUSED || err == ENOENT)
+                          ? "waf: agent socket dropped %ui record(s) since the "
+                            "last note; the agent is not running"
+                          : "waf: agent socket dropped %ui record(s) since the "
+                            "last note; the agent is not draining its socket",
                       ngx_http_waf_agent_dropped);
 
         ngx_http_waf_agent_dropped    = 0;
@@ -1460,7 +1599,6 @@ ngx_http_waf_audit_session(ngx_http_waf_ctx_t *ctx,
 {
     u_char                    *json;
     size_t                     size;
-    ssize_t                    n;
     ngx_str_t                  why;
     ngx_http_waf_jw_t          jw;
     ngx_http_request_t        *r;
@@ -1479,7 +1617,7 @@ ngx_http_waf_audit_session(ngx_http_waf_ctx_t *ctx,
         return;
     }
 
-    size = NGX_HTTP_WAF_AUDIT_JSON + wlcf->route_id.len + 512;
+    size = NGX_HTTP_WAF_AUDIT_JSON + ngx_http_waf_audit_vartext(ctx) + 512;
 
     json = ngx_pnalloc(r->pool, size);
     if (json == NULL) {
@@ -1563,13 +1701,5 @@ ngx_http_waf_audit_session(ngx_http_waf_ctx_t *ctx,
         return;
     }
 
-    n = sendto(ngx_http_waf_agent_fd, json, ngx_http_waf_jw_len(&jw),
-               MSG_DONTWAIT,
-               (struct sockaddr *) &ngx_http_waf_agent_addr,
-               ngx_http_waf_agent_addrlen);
-
-    if (n == -1) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, ngx_socket_errno,
-                       "waf: agent session send dropped");
-    }
+    (void) ngx_http_waf_agent_send(ctx, json, ngx_http_waf_jw_len(&jw), -1);
 }
