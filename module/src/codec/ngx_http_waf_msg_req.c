@@ -139,8 +139,8 @@ ngx_http_waf_msg_request(ngx_http_waf_ctx_t *ctx, ngx_uint_t index,
 
     ngx_http_waf_vars_write(&jw, ctx, NGX_HTTP_WAF_VAR_MAX, insp->vars_mask);
 
-    ngx_http_waf_needs_write(&jw, ctx, insp);
-    ngx_http_waf_store_write(&jw, ctx, insp);
+    ngx_http_waf_needs_write(&jw, ctx);
+    ngx_http_waf_store_write(&jw, ctx);
 
     if (ctx->phase != NGX_HTTP_WAF_PHASE_REQUEST) {
         ngx_http_waf_store_write_phase(&jw, ctx, NGX_HTTP_WAF_PHASE_REQUEST,
@@ -388,7 +388,7 @@ ngx_http_waf_msg_req_validate(ngx_conf_t *cf, ngx_http_waf_main_conf_t *wmcf,
            + ngx_http_waf_msg_room(clcf->name.len)
            + ngx_http_waf_msg_room(profile)
            + ngx_http_waf_msg_prior_size(wmcf, wlcf)
-           + ngx_http_waf_store_max_size(wmcf, wlcf, client)
+           + ngx_http_waf_store_max_size(wmcf, client)
            + sizeof(",\"sessions\":[]")
            + NGX_HTTP_WAF_SESSIONS_MAX * NGX_HTTP_WAF_SESSION_JSON;
 

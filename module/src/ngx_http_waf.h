@@ -815,9 +815,6 @@ typedef struct {
     unsigned                   body_ready:1;
     unsigned                   body_discarded:1;
     unsigned                   body_placed:1;
-    unsigned                   body_in_put:1;
-    unsigned                   body_settled:1;
-    unsigned                   meta_in_put:1;
     unsigned                   meta_settled:1;
     unsigned                   store_cleanup:1;
     unsigned                   agent_settled:1;
@@ -865,6 +862,9 @@ struct ngx_http_waf_ctx_s {
     ngx_msec_t                 upstream_ms;
 
     ngx_array_t               *rsp_headers;
+
+    ngx_array_t               *req_headers;
+    ngx_str_t                  req_args;
 
     unsigned                   rsp_entered:1;
     unsigned                   rsp_holding:1;

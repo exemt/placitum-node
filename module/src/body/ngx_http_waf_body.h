@@ -53,7 +53,6 @@ struct ngx_http_waf_body_op_s {
     ngx_pool_t                *pool;
     ngx_log_t                 *log;
 
-    ngx_str_t                  rid;
     ngx_uint_t                 phase;
     ngx_uint_t                 obj;
 
@@ -66,8 +65,11 @@ struct ngx_http_waf_body_op_s {
 
     unsigned                   retain:1;
     unsigned                   hold:1;
+    unsigned                   in_call:1;
+    unsigned                   done:1;
 
     void                     (*handler)(ngx_http_waf_body_op_t *op);
+    void                     (*complete)(ngx_http_waf_body_op_t *op);
     void                      *data_ctx;
 };
 
@@ -76,6 +78,8 @@ typedef struct {
     ngx_str_t                  name;
     ngx_uint_t                 caps;
     off_t                      max_object;
+
+    off_t                    (*object_max)(void *conf);
 
     void                    *(*create_conf)(ngx_conf_t *cf);
     char                    *(*set_option)(ngx_conf_t *cf, void *conf,
@@ -164,7 +168,7 @@ void       ngx_http_waf_store_write_phase(ngx_http_waf_jw_t *jw,
 
 size_t     ngx_http_waf_needs_size(void);
 void       ngx_http_waf_needs_write(ngx_http_waf_jw_t *jw,
-               ngx_http_waf_ctx_t *ctx, ngx_http_waf_inspector_t *insp);
+               ngx_http_waf_ctx_t *ctx);
 
 ngx_uint_t ngx_http_waf_agent_needs_body(ngx_http_waf_ctx_t *ctx);
 
@@ -199,10 +203,10 @@ char      *ngx_http_waf_obj_names(ngx_uint_t mask);
 size_t     ngx_http_waf_store_size(ngx_http_waf_ctx_t *ctx);
 
 size_t     ngx_http_waf_store_max_size(ngx_http_waf_main_conf_t *wmcf,
-               ngx_http_waf_loc_conf_t *wlcf, size_t client_max);
+               size_t client_max);
 
 void       ngx_http_waf_store_write(ngx_http_waf_jw_t *jw,
-               ngx_http_waf_ctx_t *ctx, ngx_http_waf_inspector_t *insp);
+               ngx_http_waf_ctx_t *ctx);
 
 #define NGX_HTTP_WAF_LOC_BODY     0x01
 #define NGX_HTTP_WAF_LOC_ADDRESS  0x02

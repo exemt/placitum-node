@@ -13,6 +13,7 @@ static ngx_http_waf_body_driver_t  ngx_http_waf_drv_none = {
     NULL,
     NULL,
     NULL,
+    NULL,
     ngx_http_waf_drv_none_put,
     NULL,
     NULL

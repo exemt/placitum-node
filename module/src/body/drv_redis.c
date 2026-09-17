@@ -6,6 +6,7 @@
 #define NGX_HTTP_WAF_REDIS_IN_SIZE       1024
 #define NGX_HTTP_WAF_REDIS_OUT_INITIAL   (16 * 1024)
 #define NGX_HTTP_WAF_REDIS_OUT_SLACK     512
+#define NGX_HTTP_WAF_REDIS_PASSWORD_MAX  1024
 
 
 typedef struct ngx_http_waf_redis_conn_s   ngx_http_waf_redis_conn_t;
@@ -15,7 +16,6 @@ typedef struct ngx_http_waf_redis_entry_s  ngx_http_waf_redis_entry_t;
 struct ngx_http_waf_redis_entry_s {
     ngx_http_waf_body_op_t      *op;
     ngx_pool_cleanup_t          *cln;
-    ngx_http_waf_redis_conn_t   *conn;
     ngx_event_t                  timer;
     ngx_http_waf_redis_entry_t  *next;
 
@@ -61,7 +61,6 @@ typedef struct {
 
     ngx_http_waf_redis_conn_t   *conns;
     ngx_uint_t                   nconns;
-    ngx_uint_t                   next;
     ngx_log_t                   *log;
 } ngx_http_waf_redis_conf_t;
 
@@ -74,6 +73,7 @@ static ngx_int_t  ngx_http_waf_drv_redis_init_worker(ngx_cycle_t *cycle,
                       void *conf);
 static void       ngx_http_waf_drv_redis_exit_worker(ngx_cycle_t *cycle,
                       void *conf);
+static off_t      ngx_http_waf_drv_redis_object_max(void *conf);
 static ngx_int_t  ngx_http_waf_drv_redis_put(ngx_http_waf_body_op_t *op);
 static ngx_int_t  ngx_http_waf_drv_redis_del(ngx_http_waf_body_op_t *op);
 static ngx_int_t  ngx_http_waf_drv_redis_get(ngx_http_waf_body_op_t *op);
@@ -91,7 +91,12 @@ static ngx_int_t  ngx_http_waf_redis_hello(ngx_http_waf_redis_conn_t *conn);
 static ngx_int_t  ngx_http_waf_redis_parse(ngx_http_waf_redis_conn_t *conn);
 
 static ngx_http_waf_redis_conn_t *ngx_http_waf_redis_pick(
-                      ngx_http_waf_redis_conf_t *rcf);
+                      ngx_http_waf_redis_conf_t *rcf, ngx_str_t *hint);
+static ngx_int_t  ngx_http_waf_redis_command(ngx_http_waf_redis_conn_t *conn,
+                      ngx_str_t *argv, ngx_uint_t argc);
+static ngx_int_t  ngx_http_waf_redis_queue(ngx_http_waf_redis_conn_t *conn,
+                      ngx_str_t *argv, ngx_uint_t argc);
+static void       ngx_http_waf_redis_send(ngx_http_waf_redis_conn_t *conn);
 static ngx_http_waf_redis_entry_t *ngx_http_waf_redis_entry_get(
                       ngx_http_waf_redis_conn_t *conn);
 static void       ngx_http_waf_redis_entry_push(
@@ -109,9 +114,6 @@ static void       ngx_http_waf_redis_on_timeout(ngx_event_t *ev);
 static void       ngx_http_waf_redis_detach(void *data);
 static void       ngx_http_waf_redis_drain(ngx_http_waf_redis_conn_t *conn);
 
-static ngx_int_t  ngx_http_waf_redis_bulk(ngx_http_waf_redis_conn_t *conn,
-                      const u_char *data, size_t len);
-
 
 static ngx_http_waf_body_driver_t  ngx_http_waf_drv_redis = {
     ngx_string("redis"),
@@ -120,6 +122,7 @@ static ngx_http_waf_body_driver_t  ngx_http_waf_drv_redis = {
         |NGX_HTTP_WAF_BODY_CAP_TTL
         |NGX_HTTP_WAF_BODY_CAP_GET,
     512 * 1024 * 1024,
+    ngx_http_waf_drv_redis_object_max,
     ngx_http_waf_drv_redis_create_conf,
     ngx_http_waf_drv_redis_set_option,
     ngx_http_waf_drv_redis_validate,
@@ -202,7 +205,7 @@ ngx_http_waf_drv_redis_set_option(ngx_conf_t *cf, void *conf, ngx_str_t *key,
     if (key->len == 3 && ngx_strncmp(key->data, "max", 3) == 0) {
 
         n = (ngx_int_t) ngx_parse_size(value);
-        if (n == NGX_ERROR) {
+        if (n == NGX_ERROR || n == 0) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "waf: invalid max \"%V\"",
                                value);
             return NGX_CONF_ERROR;
@@ -229,7 +232,7 @@ ngx_http_waf_drv_redis_set_option(ngx_conf_t *cf, void *conf, ngx_str_t *key,
     if (key->len == 15 && ngx_strncmp(key->data, "connect_timeout", 15) == 0) {
 
         n = ngx_parse_time(value, 0);
-        if (n == NGX_ERROR) {
+        if (n == NGX_ERROR || n == 0) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "waf: invalid connect_timeout \"%V\"", value);
             return NGX_CONF_ERROR;
@@ -268,7 +271,7 @@ ngx_http_waf_drv_redis_set_option(ngx_conf_t *cf, void *conf, ngx_str_t *key,
     if (key->len == 14 && ngx_strncmp(key->data, "reconnect_wait", 14) == 0) {
 
         n = ngx_parse_time(value, 0);
-        if (n == NGX_ERROR) {
+        if (n == NGX_ERROR || n == 0) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                "waf: invalid reconnect_wait \"%V\"", value);
             return NGX_CONF_ERROR;
@@ -401,7 +404,7 @@ ngx_http_waf_redis_password_file(ngx_conf_t *cf, ngx_http_waf_redis_conf_t *rcf,
     ssize_t      n;
     ngx_fd_t     fd;
     ngx_file_t   file;
-    u_char       buf[256];
+    u_char       buf[NGX_HTTP_WAF_REDIS_PASSWORD_MAX + 3];
 
     ngx_memzero(&file, sizeof(ngx_file_t));
 
@@ -428,6 +431,13 @@ ngx_http_waf_redis_password_file(ngx_conf_t *cf, ngx_http_waf_redis_conf_t *rcf,
 
     len = (size_t) n;
 
+    if (len == sizeof(buf)) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: password in \"%V\" is longer than %d bytes",
+                           path, NGX_HTTP_WAF_REDIS_PASSWORD_MAX);
+        return NGX_CONF_ERROR;
+    }
+
     while (len > 0
            && (buf[len - 1] == LF || buf[len - 1] == CR
                || buf[len - 1] == ' '))
@@ -438,6 +448,13 @@ ngx_http_waf_redis_password_file(ngx_conf_t *cf, ngx_http_waf_redis_conf_t *rcf,
     if (len == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "waf: password file \"%V\" holds no password", path);
+        return NGX_CONF_ERROR;
+    }
+
+    if (len > NGX_HTTP_WAF_REDIS_PASSWORD_MAX) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "waf: password in \"%V\" is longer than %d bytes",
+                           path, NGX_HTTP_WAF_REDIS_PASSWORD_MAX);
         return NGX_CONF_ERROR;
     }
 
@@ -468,8 +485,9 @@ ngx_http_waf_drv_redis_validate(ngx_conf_t *cf, void *conf)
 
     if (rcf->servers->nelts > 1) {
         ngx_conf_log_error(NGX_LOG_NOTICE, cf, 0,
-                           "waf: body driver redis got %ui addresses; they are "
-                           "used as failover, not as shards",
+                           "waf: body driver redis got %ui addresses; the "
+                           "connections are spread over all of them at once, "
+                           "so they must serve the same data",
                            rcf->servers->nelts);
     }
 
@@ -560,11 +578,21 @@ ngx_http_waf_drv_redis_exit_worker(ngx_cycle_t *cycle, void *conf)
 }
 
 
+static off_t
+ngx_http_waf_drv_redis_object_max(void *conf)
+{
+    ngx_http_waf_redis_conf_t  *rcf = conf;
+
+    return rcf->max;
+}
+
+
 static ngx_int_t
 ngx_http_waf_drv_redis_put(ngx_http_waf_body_op_t *op)
 {
     u_char                       ms[NGX_INT64_LEN];
-    u_char                      *p;
+    ngx_str_t                    argv[5];
+    ngx_uint_t                   argc;
     ngx_msec_t                   ttl;
     ngx_pool_cleanup_t          *cln;
     ngx_http_waf_redis_conf_t   *rcf = op->store_conf;
@@ -573,19 +601,20 @@ ngx_http_waf_drv_redis_put(ngx_http_waf_body_op_t *op)
 
     op->status = NGX_ERROR;
 
-    ttl = op->retain ? rcf->retain_ttl : rcf->ttl;
+    ttl = (op->retain && rcf->ttl != 0) ? rcf->retain_ttl : rcf->ttl;
 
     if (op->len > rcf->max) {
         ngx_log_error(NGX_LOG_ERR, op->log, 0,
-                      "waf: body of %O bytes exceeds the store max %O",
+                      "waf: object of %O bytes exceeds the store max %O",
                       op->len, rcf->max);
         return NGX_OK;
     }
 
-    conn = ngx_http_waf_redis_pick(rcf);
+    conn = ngx_http_waf_redis_pick(rcf, NULL);
     if (conn == NULL) {
         ngx_log_error(NGX_LOG_ERR, op->log, 0,
-                      "waf: no ready redis connection to place the body");
+                      "waf: no ready redis connection to place %O bytes",
+                      op->len);
         return NGX_OK;
     }
 
@@ -606,35 +635,21 @@ ngx_http_waf_drv_redis_put(ngx_http_waf_body_op_t *op)
     entry->op  = op;
     entry->cln = cln;
 
+    ngx_str_set(&argv[0], "SET");
+    argv[1] = op->locator.key;
+    argv[2] = op->data;
+    argc    = 3;
+
     if (ttl != 0) {
-        p = ngx_sprintf(ms, "%M", ttl);
+        ngx_str_set(&argv[3], "PX");
+        argv[4].data = ms;
+        argv[4].len  = (size_t) (ngx_sprintf(ms, "%M", ttl) - ms);
+        argc = 5;
+    }
 
-        if (ngx_http_waf_link_out(&conn->link, (u_char *) "*5\r\n", 4) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, (u_char *) "SET", 3) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, op->locator.key.data,
-                                       op->locator.key.len) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, op->data.data, op->data.len)
-               != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, (u_char *) "PX", 2) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, ms, (size_t) (p - ms)) != NGX_OK)
-        {
-            ngx_http_waf_redis_entry_free(conn, entry);
-            cln->handler = NULL;
-            return NGX_OK;
-        }
-
-    } else {
-        if (ngx_http_waf_link_out(&conn->link, (u_char *) "*3\r\n", 4) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, (u_char *) "SET", 3) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, op->locator.key.data,
-                                       op->locator.key.len) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, op->data.data, op->data.len)
-               != NGX_OK)
-        {
-            ngx_http_waf_redis_entry_free(conn, entry);
-            cln->handler = NULL;
-            return NGX_OK;
-        }
+    if (ngx_http_waf_redis_command(conn, argv, argc) != NGX_OK) {
+        ngx_http_waf_redis_entry_free(conn, entry);
+        return NGX_OK;
     }
 
     entry->timer.handler = ngx_http_waf_redis_on_timeout;
@@ -644,7 +659,7 @@ ngx_http_waf_drv_redis_put(ngx_http_waf_body_op_t *op)
     ngx_add_timer(&entry->timer, rcf->op_timeout);
 
     ngx_http_waf_redis_entry_push(conn, entry);
-    ngx_http_waf_link_flush(&conn->link);
+    ngx_http_waf_redis_send(conn);
 
     op->locator.hint       = *conn->link.peer.name;
     op->locator.expires_at = (ttl != 0)
@@ -658,31 +673,21 @@ ngx_http_waf_drv_redis_put(ngx_http_waf_body_op_t *op)
 static ngx_int_t
 ngx_http_waf_drv_redis_del(ngx_http_waf_body_op_t *op)
 {
-    ngx_http_waf_redis_conf_t   *rcf = op->store_conf;
-    ngx_http_waf_redis_conn_t   *conn;
-    ngx_http_waf_redis_entry_t  *entry;
+    ngx_str_t                   argv[2];
+    ngx_http_waf_redis_conf_t  *rcf = op->store_conf;
+    ngx_http_waf_redis_conn_t  *conn;
 
-    conn = ngx_http_waf_redis_pick(rcf);
+    conn = ngx_http_waf_redis_pick(rcf, &op->locator.hint);
     if (conn == NULL) {
         return NGX_OK;
     }
 
-    entry = ngx_http_waf_redis_entry_get(conn);
-    if (entry == NULL) {
-        return NGX_OK;
-    }
+    ngx_str_set(&argv[0], "DEL");
+    argv[1] = op->locator.key;
 
-    if (ngx_http_waf_link_out(&conn->link, (u_char *) "*2\r\n", 4) != NGX_OK
-        || ngx_http_waf_redis_bulk(conn, (u_char *) "DEL", 3) != NGX_OK
-        || ngx_http_waf_redis_bulk(conn, op->locator.key.data,
-                                   op->locator.key.len) != NGX_OK)
-    {
-        ngx_http_waf_redis_entry_free(conn, entry);
-        return NGX_OK;
+    if (ngx_http_waf_redis_queue(conn, argv, 2) == NGX_OK) {
+        ngx_http_waf_redis_send(conn);
     }
-
-    ngx_http_waf_redis_entry_push(conn, entry);
-    ngx_http_waf_link_flush(&conn->link);
 
     return NGX_OK;
 }
@@ -691,6 +696,7 @@ ngx_http_waf_drv_redis_del(ngx_http_waf_body_op_t *op)
 static ngx_int_t
 ngx_http_waf_drv_redis_get(ngx_http_waf_body_op_t *op)
 {
+    ngx_str_t                    argv[2];
     ngx_pool_cleanup_t          *cln;
     ngx_http_waf_redis_conf_t   *rcf = op->store_conf;
     ngx_http_waf_redis_conn_t   *conn;
@@ -698,11 +704,11 @@ ngx_http_waf_drv_redis_get(ngx_http_waf_body_op_t *op)
 
     op->status = NGX_ERROR;
 
-    conn = ngx_http_waf_redis_pick(rcf);
+    conn = ngx_http_waf_redis_pick(rcf, NULL);
     if (conn == NULL) {
         ngx_log_error(NGX_LOG_ERR, op->log, 0,
-                      "waf: no ready redis connection to fetch the rewrite "
-                      "object");
+                      "waf: no ready redis connection to read \"%V\"",
+                      &op->locator.key);
         return NGX_OK;
     }
 
@@ -724,13 +730,11 @@ ngx_http_waf_drv_redis_get(ngx_http_waf_body_op_t *op)
     entry->cln  = cln;
     entry->bulk = 1;
 
-    if (ngx_http_waf_link_out(&conn->link, (u_char *) "*2\r\n", 4) != NGX_OK
-        || ngx_http_waf_redis_bulk(conn, (u_char *) "GET", 3) != NGX_OK
-        || ngx_http_waf_redis_bulk(conn, op->locator.key.data,
-                                   op->locator.key.len) != NGX_OK)
-    {
+    ngx_str_set(&argv[0], "GET");
+    argv[1] = op->locator.key;
+
+    if (ngx_http_waf_redis_command(conn, argv, 2) != NGX_OK) {
         ngx_http_waf_redis_entry_free(conn, entry);
-        cln->handler = NULL;
         return NGX_OK;
     }
 
@@ -741,17 +745,18 @@ ngx_http_waf_drv_redis_get(ngx_http_waf_body_op_t *op)
     ngx_add_timer(&entry->timer, rcf->get_timeout);
 
     ngx_http_waf_redis_entry_push(conn, entry);
-    ngx_http_waf_link_flush(&conn->link);
+    ngx_http_waf_redis_send(conn);
 
     return NGX_AGAIN;
 }
 
 
 static ngx_http_waf_redis_conn_t *
-ngx_http_waf_redis_pick(ngx_http_waf_redis_conf_t *rcf)
+ngx_http_waf_redis_pick(ngx_http_waf_redis_conf_t *rcf, ngx_str_t *hint)
 {
+    ngx_str_t                  *name;
     ngx_uint_t                  i;
-    ngx_http_waf_redis_conn_t  *best;
+    ngx_http_waf_redis_conn_t  *conn, *best;
 
     if (rcf->conns == NULL) {
         return NULL;
@@ -760,17 +765,114 @@ ngx_http_waf_redis_pick(ngx_http_waf_redis_conf_t *rcf)
     best = NULL;
 
     for (i = 0; i < rcf->nconns; i++) {
+        conn = &rcf->conns[i];
 
-        if (!rcf->conns[i].link.ready) {
+        if (!conn->link.ready) {
             continue;
         }
 
-        if (best == NULL || rcf->conns[i].inflight < best->inflight) {
-            best = &rcf->conns[i];
+        if (hint != NULL && hint->len != 0) {
+            name = conn->link.peer.name;
+
+            if (name == NULL
+                || name->len != hint->len
+                || ngx_strncmp(name->data, hint->data, hint->len) != 0)
+            {
+                continue;
+            }
+        }
+
+        if (best == NULL || conn->inflight < best->inflight) {
+            best = conn;
         }
     }
 
+    if (best == NULL && hint != NULL && hint->len != 0) {
+        return ngx_http_waf_redis_pick(rcf, NULL);
+    }
+
     return best;
+}
+
+
+/* A command cut short in the output buffer would shift every later reply. */
+
+static ngx_int_t
+ngx_http_waf_redis_command(ngx_http_waf_redis_conn_t *conn, ngx_str_t *argv,
+    ngx_uint_t argc)
+{
+    u_char      head[NGX_INT64_LEN + 4];
+    u_char     *p;
+    size_t      size;
+    ngx_uint_t  i;
+
+    size = (size_t) (ngx_sprintf(head, "*%ui\r\n", argc) - head);
+
+    for (i = 0; i < argc; i++) {
+        size += (size_t) (ngx_sprintf(head, "$%uz\r\n", argv[i].len) - head)
+                + argv[i].len + 2;
+    }
+
+    if (ngx_http_waf_link_reserve(&conn->link, size) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_sprintf(head, "*%ui\r\n", argc);
+    (void) ngx_http_waf_link_out(&conn->link, head, (size_t) (p - head));
+
+    for (i = 0; i < argc; i++) {
+        p = ngx_sprintf(head, "$%uz\r\n", argv[i].len);
+        (void) ngx_http_waf_link_out(&conn->link, head, (size_t) (p - head));
+
+        if (argv[i].len != 0) {
+            (void) ngx_http_waf_link_out(&conn->link, argv[i].data,
+                                         argv[i].len);
+        }
+
+        (void) ngx_http_waf_link_out(&conn->link, (u_char *) "\r\n", 2);
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_waf_redis_queue(ngx_http_waf_redis_conn_t *conn, ngx_str_t *argv,
+    ngx_uint_t argc)
+{
+    ngx_http_waf_redis_entry_t  *entry;
+
+    entry = ngx_http_waf_redis_entry_get(conn);
+    if (entry == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_waf_redis_command(conn, argv, argc) != NGX_OK) {
+        ngx_http_waf_redis_entry_free(conn, entry);
+        return NGX_ERROR;
+    }
+
+    ngx_http_waf_redis_entry_push(conn, entry);
+
+    return NGX_OK;
+}
+
+
+/*
+ * A send error drops the link and fails the queued operations; that must not
+ * happen inside put, get or del, so the write goes out from a posted event.
+ */
+
+static void
+ngx_http_waf_redis_send(ngx_http_waf_redis_conn_t *conn)
+{
+    ngx_connection_t  *c;
+
+    c = conn->link.peer.connection;
+
+    if (c != NULL) {
+        ngx_post_event(c->write, &ngx_posted_events);
+    }
 }
 
 
@@ -806,59 +908,36 @@ ngx_http_waf_redis_on_close(ngx_http_waf_link_t *link, ngx_uint_t was_ready)
 static ngx_int_t
 ngx_http_waf_redis_hello(ngx_http_waf_redis_conn_t *conn)
 {
-    u_char                      *p;
-    u_char                       num[NGX_INT_T_LEN];
-    ngx_http_waf_redis_conf_t   *rcf = conn->conf;
-    ngx_http_waf_redis_entry_t  *entry;
+    u_char                      num[NGX_INT_T_LEN];
+    ngx_str_t                   argv[3];
+    ngx_uint_t                  argc;
+    ngx_http_waf_redis_conf_t  *rcf = conn->conf;
 
     if (rcf->password.len != 0) {
-
-        entry = ngx_http_waf_redis_entry_get(conn);
-        if (entry == NULL) {
-            return NGX_ERROR;
-        }
+        ngx_str_set(&argv[0], "AUTH");
+        argc = 1;
 
         if (rcf->user.len != 0) {
-            if (ngx_http_waf_link_out(&conn->link, (u_char *) "*3\r\n", 4) != NGX_OK
-                || ngx_http_waf_redis_bulk(conn, (u_char *) "AUTH", 4) != NGX_OK
-                || ngx_http_waf_redis_bulk(conn, rcf->user.data, rcf->user.len)
-                   != NGX_OK
-                || ngx_http_waf_redis_bulk(conn, rcf->password.data,
-                                           rcf->password.len) != NGX_OK)
-            {
-                return NGX_ERROR;
-            }
-
-        } else {
-            if (ngx_http_waf_link_out(&conn->link, (u_char *) "*2\r\n", 4) != NGX_OK
-                || ngx_http_waf_redis_bulk(conn, (u_char *) "AUTH", 4) != NGX_OK
-                || ngx_http_waf_redis_bulk(conn, rcf->password.data,
-                                           rcf->password.len) != NGX_OK)
-            {
-                return NGX_ERROR;
-            }
+            argv[argc] = rcf->user;
+            argc++;
         }
 
-        ngx_http_waf_redis_entry_push(conn, entry);
+        argv[argc] = rcf->password;
+        argc++;
+
+        if (ngx_http_waf_redis_queue(conn, argv, argc) != NGX_OK) {
+            return NGX_ERROR;
+        }
     }
 
     if (rcf->db != 0) {
+        ngx_str_set(&argv[0], "SELECT");
+        argv[1].data = num;
+        argv[1].len  = (size_t) (ngx_sprintf(num, "%ui", rcf->db) - num);
 
-        entry = ngx_http_waf_redis_entry_get(conn);
-        if (entry == NULL) {
+        if (ngx_http_waf_redis_queue(conn, argv, 2) != NGX_OK) {
             return NGX_ERROR;
         }
-
-        p = ngx_sprintf(num, "%ui", rcf->db);
-
-        if (ngx_http_waf_link_out(&conn->link, (u_char *) "*2\r\n", 4) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, (u_char *) "SELECT", 6) != NGX_OK
-            || ngx_http_waf_redis_bulk(conn, num, (size_t) (p - num)) != NGX_OK)
-        {
-            return NGX_ERROR;
-        }
-
-        ngx_http_waf_redis_entry_push(conn, entry);
     }
 
     return NGX_OK;
@@ -986,8 +1065,10 @@ ngx_http_waf_redis_parse(ngx_http_waf_redis_conn_t *conn)
                 {
                     if (conn->head->op != NULL) {
                         ngx_log_error(NGX_LOG_ERR, rcf->log, 0,
-                                      "waf: rewrite object of %i bytes exceeds "
-                                      "the %O byte cap", n, conn->head->op->len);
+                                      "waf: redis object \"%V\" of %i bytes "
+                                      "exceeds the %O byte cap",
+                                      &conn->head->op->locator.key, n,
+                                      conn->head->op->len);
                     }
 
                     conn->skip     = (size_t) n + 2;
@@ -1047,7 +1128,6 @@ ngx_http_waf_redis_entry_get(ngx_http_waf_redis_conn_t *conn)
     entry->op   = NULL;
     entry->cln  = NULL;
     entry->next = NULL;
-    entry->conn = conn;
     entry->bulk = 0;
 
     ngx_memzero(&entry->timer, sizeof(ngx_event_t));
@@ -1211,7 +1291,8 @@ ngx_http_waf_redis_on_timeout(ngx_event_t *ev)
     entry->op = NULL;
 
     ngx_log_error(NGX_LOG_ERR, op->log, 0,
-                  "waf: redis did not answer within the op timeout");
+                  "waf: redis did not answer \"%V\" within %s",
+                  &op->locator.key, entry->bulk ? "get_timeout" : "op_timeout");
 
     op->status = NGX_ERROR;
 
@@ -1251,24 +1332,4 @@ ngx_http_waf_redis_drain(ngx_http_waf_redis_conn_t *conn)
     conn->bulk_size = 0;
     conn->bulk_need = 0;
     conn->bulk_got  = 0;
-}
-
-
-static ngx_int_t
-ngx_http_waf_redis_bulk(ngx_http_waf_redis_conn_t *conn, const u_char *data,
-    size_t len)
-{
-    u_char   head[NGX_INT64_LEN + 4];
-    u_char  *p;
-
-    p = ngx_sprintf(head, "$%uz\r\n", len);
-
-    if (ngx_http_waf_link_out(&conn->link, head, (size_t) (p - head)) != NGX_OK
-        || ngx_http_waf_link_out(&conn->link, data, len) != NGX_OK
-        || ngx_http_waf_link_out(&conn->link, (u_char *) "\r\n", 2) != NGX_OK)
-    {
-        return NGX_ERROR;
-    }
-
-    return NGX_OK;
 }
