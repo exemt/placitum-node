@@ -29,6 +29,8 @@ static ngx_int_t ngx_http_waf_var_node_id(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_waf_var_frame(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_http_waf_deny_response_t *ngx_http_waf_var_deny_entry(
+    ngx_http_waf_ctx_t *ctx);
 
 
 static ngx_http_variable_t  ngx_http_waf_variables[] = {
@@ -228,10 +230,14 @@ ngx_http_waf_var_deny_name(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    dr = ngx_http_waf_deny_entry_pub(ctx);
+    dr = ngx_http_waf_var_deny_entry(ctx);
 
     if (dr != NULL) {
         name = &dr->name;
+
+    } else if (ctx->ph->fail_blocked) {
+        v->not_found = 1;
+        return NGX_OK;
 
     } else {
         wlcf = ngx_http_get_module_loc_conf(r, ngx_http_waf_module);
@@ -263,7 +269,7 @@ ngx_http_waf_var_deny_status(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    dr = ngx_http_waf_deny_entry_pub(ctx);
+    dr = ngx_http_waf_var_deny_entry(ctx);
 
     p = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
     if (p == NULL) {
@@ -275,8 +281,12 @@ ngx_http_waf_var_deny_status(ngx_http_request_t *r,
     v->not_found    = 0;
     v->data         = p;
 
-    if (dr != NULL) {
+    if (ctx->ph->fail_blocked) {
+        v->len = ngx_sprintf(p, "%i", ngx_http_waf_fail_status(ctx)) - p;
+
+    } else if (dr != NULL && dr->type == NGX_HTTP_WAF_DENY_TYPE_HTTP) {
         v->len = ngx_sprintf(p, "%ui", dr->status) - p;
+
     } else {
         v->len = ngx_sprintf(p, "%ui", (ngx_uint_t) NGX_HTTP_FORBIDDEN) - p;
     }
@@ -299,7 +309,7 @@ ngx_http_waf_var_deny_message(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    dr = ngx_http_waf_deny_entry_pub(ctx);
+    dr = ngx_http_waf_var_deny_entry(ctx);
 
     if (dr == NULL || dr->message.len == 0) {
         v->not_found = 1;
@@ -327,12 +337,25 @@ ngx_http_waf_deny_detail(ngx_http_waf_ctx_t *ctx)
 }
 
 
+/* an exception deny without response= applies no catalog entry */
+
+static ngx_http_waf_deny_response_t *
+ngx_http_waf_var_deny_entry(ngx_http_waf_ctx_t *ctx)
+{
+    if (ctx->ph->fail_blocked && ctx->exception_response.len == 0) {
+        return NULL;
+    }
+
+    return ngx_http_waf_deny_entry_pub(ctx);
+}
+
+
 static ngx_uint_t
 ngx_http_waf_deny_param_on(ngx_http_waf_ctx_t *ctx, ngx_uint_t bit)
 {
     ngx_http_waf_deny_response_t  *dr;
 
-    dr = ngx_http_waf_deny_entry_pub(ctx);
+    dr = ngx_http_waf_var_deny_entry(ctx);
 
     if (dr == NULL || dr->params == 0) {
         return 1;
