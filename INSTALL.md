@@ -2,7 +2,7 @@
 
 English · [Русский](INSTALL.ru.md)
 
-A node is installed together with the rest of Placitum: without the bus, the exchange and the
+A node is installed together with the rest of Placitum: without the bus, the buffer and the
 controller it is of little use. Usually `placitum-core` installs it with one command. This document
 is for installing a node separately, for example a second node for a running installation.
 
@@ -11,8 +11,8 @@ is for installing a node separately, for example a second node for a running ins
 | Component | Required | Why |
 | --- | --- | --- |
 | NATS with JetStream | yes | inspector waves, audit, logs, configuration from KV, presence |
-| Exchange Redis | for `waf_capture`, `waf_archive` and body previews | body, headers and query string for the time of a wave |
-| Internal Redis | recommended | generation blobs from the controller; without it they are read from the exchange |
+| Buffer Redis | for `waf_capture`, `waf_archive` and body previews | body, headers and query string for the time of a wave |
+| Internal Redis | recommended | generation blobs from the controller; without it they are read from the buffer |
 | Controller | yes | sends the configuration; until it does, the node answers with a stub |
 | S3-compatible storage | for `waf_archive` | archive of bodies, headers and query strings |
 | Inspectors | the ones the routes name | the module detects nothing itself |
@@ -48,7 +48,7 @@ file.
 | `WAF_AGENT_LOG` | `info` | starting log level; the panel changes it live |
 | `WAF_NGINX_DEBUG` | `off` | `on` runs the master from `nginx-debug`, so that `error_log debug` shows core events and not only module lines; read at container start |
 | `WAF_NATS_URL` | `nats://127.0.0.1:4222` | bus |
-| `WAF_REDIS_URL`, `WAF_REDIS_INTERNAL_URL` | from `agent.conf` | exchange and internal Redis |
+| `WAF_REDIS_URL`, `WAF_REDIS_INTERNAL_URL` | from `agent.conf` | buffer and internal Redis |
 | `WAF_NODE_KEY` | from `agent.conf` | installation private key: secrets of the generation are decrypted with it |
 | `WAF_DATA_DIR` | `/var/lib/waf/agent` | agent state: the applied generation, queues |
 | `WAF_STORE_DIR` | `/var/lib/waf/store` | where the files of the generation (certificates, keys) are written |
@@ -65,7 +65,7 @@ the environment of a process is visible to its neighbours on the machine and end
 [agent/agent.conf](agent/agent.conf) is a working example with comments: blocks `node`, `nats`,
 `redis`, `s3`, `archive` and `nginx`. One file serves every node of an installation, and the
 environment sets what differs. The `redis` block has the same form as in the inspectors: `url` is the
-exchange, `internal` the internal Redis. The controller can override the S3 endpoint, region, buckets
+buffer, `internal` the internal Redis. The controller can override the S3 endpoint, region, buckets
 and archive pace through KV (`policy/agent-conf`), but never the credentials.
 
 ## Docker Compose

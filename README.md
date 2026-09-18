@@ -12,7 +12,7 @@ inspectors, separate processes that can be written in any language.
 ```
 client ──► nginx + ngx_http_waf_module ──► application
                │  inspector waves over the bus (NATS)
-               │  body, headers and query string in the exchange, by locator
+               │  body, headers and query string in the buffer, by locator
                ▼
             node agent ──► audit and logs to the bus, archive to S3,
                            configuration from KV, presence on WAF_STATUS
@@ -31,7 +31,7 @@ client ──► nginx + ngx_http_waf_module ──► application
 
 1. `waf_inspect` on a route names the inspectors and their waves. The inspectors of one wave are
    asked in parallel; the next wave starts after the previous one and sees its answers.
-2. What the inspectors need (`waf_capture`: headers, query string, body) goes to the exchange
+2. What the inspectors need (`waf_capture`: headers, query string, body) goes to the buffer
    (Redis), and the message carries a locator instead of the bytes.
 3. An inspector answers `allow`, `score`, `redirect`, `deny` or `error`, and may add
    requests to its neighbours. `deny`, or a score sum that reaches `waf_score_deny`, ends the
