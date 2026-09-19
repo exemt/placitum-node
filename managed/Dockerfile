@@ -57,7 +57,7 @@ ARG REVISION=unknown
 LABEL org.opencontainers.image.title="placitum/node" \
       org.opencontainers.image.description="Placitum protected node: nginx with the WAF module and the node agent" \
       org.opencontainers.image.source="https://github.com/exemt/placitum-node" \
-      org.opencontainers.image.licenses="LicenseRef-Placitum" \
+      org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 

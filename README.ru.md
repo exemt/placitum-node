@@ -127,5 +127,7 @@ docker build -f module/Dockerfile --target artifact --output type=local,dest=./o
 
 ## Лицензия
 
-[Placitum License Agreement](LICENSE.md). Перевод на русский лежит в [LICENSE.ru.md](LICENSE.ru.md),
-юридическую силу имеет английский текст.
+[Apache License 2.0](LICENSE), уведомление об авторстве — в [NOTICE](NOTICE). Репозиторий входит в
+открытое ядро Placitum. Инспекторы лицензируются отдельно: в репозитории каждого инспектора лежит
+Placitum License Agreement. Выпуски, сделанные до этой смены, выходили на условиях Placitum License
+Agreement 1.1.
