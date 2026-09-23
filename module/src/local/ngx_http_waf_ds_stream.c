@@ -55,6 +55,10 @@ static ngx_int_t ngx_http_waf_ds_stream_fetch(ngx_http_waf_ds_stream_t *st,
                      ngx_str_t *key, ngx_uint_t kind, uint64_t seq);
 static void      ngx_http_waf_ds_stream_fetched(ngx_http_waf_body_op_t *op);
 static void      ngx_http_waf_ds_stream_catch_up(ngx_http_waf_ds_stream_t *st);
+static void      ngx_http_waf_ds_stream_notice(ngx_http_waf_ds_stream_t *st,
+                     ngx_uint_t index, ngx_http_waf_ds_notice_t *n);
+static void      ngx_http_waf_ds_stream_inline(ngx_http_waf_ds_stream_t *st,
+                     ngx_uint_t index, ngx_http_waf_ds_notice_t *n);
 static void      ngx_http_waf_ds_stream_timer(ngx_event_t *ev);
 static void      ngx_http_waf_ds_stream_watch(ngx_http_waf_ds_stream_t *st);
 static void      ngx_http_waf_ds_stream_settle(ngx_http_waf_ds_stream_t *st);
@@ -323,43 +327,50 @@ ngx_http_waf_ds_stream_timer(ngx_event_t *ev)
 void
 ngx_http_waf_ds_stream_message(ngx_uint_t index, ngx_str_t *payload)
 {
-    uint64_t                   epoch, seq;
-    ngx_int_t                  rc;
     ngx_pool_t                *pool;
-    ngx_http_waf_ds_stream_t  *st;
     ngx_http_waf_ds_notice_t   n;
 
     if (index >= ngx_http_waf_ds_nstreams || payload->len == 0) {
         return;
     }
 
-    st = &ngx_http_waf_ds_streams[index];
+    /* the pool holds the notice, an inline package included, until it is
+     * dealt with */
 
     pool = ngx_create_pool(1024, ngx_cycle->log);
     if (pool == NULL) {
         return;
     }
 
-    if (ngx_http_waf_dataset_notice(index, payload, pool, &n) != NGX_OK) {
-        ngx_destroy_pool(pool);
-        return;
+    if (ngx_http_waf_dataset_notice(index, payload, pool, &n) == NGX_OK) {
+        ngx_http_waf_ds_stream_notice(&ngx_http_waf_ds_streams[index], index,
+                                      &n);
     }
 
     ngx_destroy_pool(pool);
+}
+
+
+static void
+ngx_http_waf_ds_stream_notice(ngx_http_waf_ds_stream_t *st, ngx_uint_t index,
+    ngx_http_waf_ds_notice_t *n)
+{
+    uint64_t   epoch, seq;
+    ngx_int_t  rc;
 
     (void) ngx_http_waf_dataset_seen(index, 1, 0, NULL);
 
-    if (n.op != NGX_HTTP_WAF_DS_OP_DIFF && n.op != NGX_HTTP_WAF_DS_OP_TICK) {
+    if (n->op != NGX_HTTP_WAF_DS_OP_DIFF && n->op != NGX_HTTP_WAF_DS_OP_TICK) {
         return;
     }
 
     ngx_http_waf_dataset_state(index, &epoch, &seq);
 
-    if (n.epoch != st->want_epoch || n.seq > st->want) {
-        st->want_epoch    = n.epoch;
-        st->want          = n.seq;
-        st->want_hash     = n.hash;
-        st->want_has_hash = n.has_hash;
+    if (n->epoch != st->want_epoch || n->seq > st->want) {
+        st->want_epoch    = n->epoch;
+        st->want          = n->seq;
+        st->want_hash     = n->hash;
+        st->want_has_hash = n->has_hash;
     }
 
     if (st->state == NGX_HTTP_WAF_DS_ST_SNAPSHOT
@@ -368,11 +379,11 @@ ngx_http_waf_ds_stream_message(ngx_uint_t index, ngx_str_t *payload)
         return;
     }
 
-    if (epoch == 0 || n.epoch != epoch) {
+    if (epoch == 0 || n->epoch != epoch) {
         if (epoch != 0) {
             ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0,
                           "waf: dataset \"%V\" got epoch %016xL, have %016xL, "
-                          "snapshot required", &st->ds->name, n.epoch, epoch);
+                          "snapshot required", &st->ds->name, n->epoch, epoch);
         }
 
         if (ngx_http_waf_ds_stream_snapshot(st, 1) != NGX_OK) {
@@ -388,19 +399,76 @@ ngx_http_waf_ds_stream_message(ngx_uint_t index, ngx_str_t *payload)
         ngx_http_waf_ds_stream_settle(st);
     }
 
-    if (n.seq > seq) {
+    if (n->seq > seq) {
+
+        if (n->op == NGX_HTTP_WAF_DS_OP_DIFF && n->body.len != 0
+            && n->seq == seq + 1)
+        {
+            ngx_http_waf_ds_stream_inline(st, index, n);
+            return;
+        }
+
         ngx_http_waf_ds_stream_catch_up(st);
         return;
     }
 
-    if (n.op == NGX_HTTP_WAF_DS_OP_TICK && n.seq == seq && n.has_hash) {
-        rc = ngx_http_waf_dataset_verify(index, n.epoch, n.seq, n.hash);
+    if (n->op == NGX_HTTP_WAF_DS_OP_TICK && n->seq == seq && n->has_hash) {
+        rc = ngx_http_waf_dataset_verify(index, n->epoch, n->seq, n->hash);
 
         if (rc == NGX_HTTP_WAF_DS_FOREIGN
             || (rc == NGX_HTTP_WAF_DS_DIVERGED
                 && !ngx_http_waf_dataset_snap_bad(index)))
         {
             (void) ngx_http_waf_ds_stream_snapshot(st, 1);
+        }
+    }
+}
+
+
+/*
+ * The package came inside the frame and the mirror is exactly one step
+ * behind it: applied on the spot, without a read from waf_sets_store.
+ * Whatever the package cannot settle -- a neighbour worker got there first,
+ * a gap it opened, a divergence, a foreign epoch -- goes the usual way,
+ * the same as after a read from the store.
+ */
+static void
+ngx_http_waf_ds_stream_inline(ngx_http_waf_ds_stream_t *st, ngx_uint_t index,
+    ngx_http_waf_ds_notice_t *n)
+{
+    ngx_int_t  rc;
+
+    rc = ngx_http_waf_dataset_apply_package(index, &n->body);
+
+    switch (rc) {
+
+    case NGX_HTTP_WAF_DS_APPLIED:
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                       "waf: dataset \"%V\" applied inline package seq %uL",
+                       &st->ds->name, n->seq);
+        /* fall through */
+
+    case NGX_HTTP_WAF_DS_STALE:
+    case NGX_HTTP_WAF_DS_GAP:
+        ngx_http_waf_ds_stream_catch_up(st);
+        return;
+
+    case NGX_HTTP_WAF_DS_BUSY:
+        ngx_http_waf_ds_stream_settle(st);
+        return;
+
+    case NGX_HTTP_WAF_DS_DIVERGED:
+
+        if (ngx_http_waf_dataset_snap_bad(index)) {
+            ngx_http_waf_ds_stream_catch_up(st);
+            return;
+        }
+
+        /* fall through */
+
+    default:
+        if (ngx_http_waf_ds_stream_snapshot(st, 1) != NGX_OK) {
+            ngx_http_waf_ds_stream_settle(st);
         }
     }
 }

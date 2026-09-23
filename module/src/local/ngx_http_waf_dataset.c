@@ -2224,6 +2224,47 @@ ngx_http_waf_ds_copy(ngx_pool_t *pool, ngx_str_t *src, ngx_str_t *dst)
 }
 
 
+/*
+ * The package carried inside a diff frame: base64 of the same WAFS object
+ * keeper put in the store.  A body that does not decode is dropped, not
+ * refused: the frame still names the package, and the stream reads it from
+ * waf_sets_store as it would any other.
+ */
+static ngx_int_t
+ngx_http_waf_ds_inline(ngx_pool_t *pool, ngx_http_waf_dataset_t *ds,
+    ngx_str_t *src, ngx_str_t *dst)
+{
+    ngx_str_null(dst);
+
+    if (src->len == 0) {
+        return NGX_OK;
+    }
+
+    if (src->len > NGX_HTTP_WAF_DS_INLINE_MAX) {
+        ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                      "waf: dataset \"%V\": inline package of %uz bytes is "
+                      "over %uz, reading it from waf_sets_store instead",
+                      &ds->name, src->len,
+                      (size_t) NGX_HTTP_WAF_DS_INLINE_MAX);
+        return NGX_OK;
+    }
+
+    dst->data = ngx_pnalloc(pool, ngx_base64_decoded_length(src->len));
+    if (dst->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_decode_base64(dst, src) != NGX_OK) {
+        ngx_log_error(NGX_LOG_WARN, ngx_cycle->log, 0,
+                      "waf: dataset \"%V\": inline package is not base64, "
+                      "reading it from waf_sets_store instead", &ds->name);
+        ngx_str_null(dst);
+    }
+
+    return NGX_OK;
+}
+
+
 ngx_int_t
 ngx_http_waf_dataset_notice(ngx_uint_t index, ngx_str_t *payload,
     ngx_pool_t *pool, ngx_http_waf_ds_notice_t *n)
@@ -2370,6 +2411,18 @@ ngx_http_waf_dataset_notice(ngx_uint_t index, ngx_str_t *payload,
                 || ngx_http_waf_ds_copy(pool, &value, &n->object) != NGX_OK)
             {
                 goto invalid;
+            }
+
+            continue;
+        }
+
+        if (key.len == 6 && ngx_strncmp(key.data, "inline", 6) == 0) {
+            if (ngx_http_waf_jp_string(&jp, &value) != NGX_OK) {
+                goto invalid;
+            }
+
+            if (ngx_http_waf_ds_inline(pool, ds, &value, &n->body) != NGX_OK) {
+                return NGX_ERROR;
             }
 
             continue;

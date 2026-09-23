@@ -15,6 +15,9 @@ typedef struct {
 
 #define NGX_HTTP_WAF_DS_ENTRY_MAX      4096
 
+/* base64 of a package carried inside a diff frame */
+#define NGX_HTTP_WAF_DS_INLINE_MAX     (64 * 1024)
+
 #define NGX_HTTP_WAF_DS_RETIRED        4
 
 
@@ -200,6 +203,7 @@ typedef struct {
     uint64_t                   hash;
     ngx_uint_t                 has_hash;
     ngx_str_t                  object;
+    ngx_str_t                  body;
     ngx_str_t                  reply;
     ngx_uint_t                 count;
     ngx_uint_t                 ttl;
