@@ -2,12 +2,12 @@
 
 English · [Русский](README.ru.md)
 
-Placitum protected node: nginx with `ngx_http_waf_module` and the node agent in one image.
+Placitum protection node: nginx with `ngx_http_waf_module` and the node agent in one image.
 
 The module takes the traffic and agrees on a decision for every request and response with external
 inspectors over a message bus. The agent next to it applies the configuration and ships the audit,
-the archive, the logs and the node presence. There is no detection logic here: it lives in the
-inspectors, separate processes that can be written in any language.
+the archive, the logs and the node presence. The checks themselves are done by the inspectors,
+separate processes that can be written in any language.
 
 ```
 client ──► nginx + ngx_http_waf_module ──► application
@@ -132,5 +132,5 @@ What the node needs, the agent settings and the checks are in [INSTALL.md](INSTA
 
 [Apache License 2.0](LICENSE); the attribution notice is in [NOTICE](NOTICE). This repository is
 part of the Placitum open core. The inspectors are licensed separately: each inspector repository
-carries the Placitum License Agreement. Releases made before this change came under the Placitum
+carries the Placitum License Agreement. Versions up to 1.0.1 were released under the Placitum
 License Agreement 1.1.
